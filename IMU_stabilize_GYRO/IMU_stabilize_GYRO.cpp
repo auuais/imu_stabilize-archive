@@ -2,7 +2,7 @@
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/core/utils/logger.hpp>
-#include <librealsense2/rs.hpp>
+//#include <librealsense2/rs.hpp>
 #include <iostream>
 #include <cmath>
 #include <mutex>
@@ -54,68 +54,6 @@ std::pair<double, double> compute_roll_pitch(T ax, T ay, T az) {
     double roll = atan2(ay, az);
     double pitch = atan2(-ax, sqrt(ay * ay + az * az));
     return { roll * 180.0 / M_PI, pitch * 180.0 / M_PI };
-}
-
-// === IMU Orientation Updater ===
-// 
-// 
-// This can be ignored as in the final application this orientation calculation will be done by the MCU
-// For Test scenario, fixed dummy values can be used instead of this function. 
-// 
-// 
-// This function runs in a separate thread, continuously collecting gyroscope and accelerometer data
-// from the RealSense pipeline. It computes the current orientation (roll, pitch, yaw) using a complementary filter.
-// The angles are stabilized with correction for gyroscope drift.
-void imu_orientation_updater(rs2::pipeline& pipeline) {
-    const double alpha = 0.98, beta = 1.0; // Complementary filter weights
-    const double GYRO_DRIFT_X = -0.002843, GYRO_DRIFT_Y = 0.000743, GYRO_DRIFT_Z = -0.001002; // Empirical gyro drift
-
-    double yaw_reset = 0.0, prev_ts = 0.0;
-    bool initialized = false;
-
-    while (true) {
-        try {
-            // Wait for new IMU frames
-            rs2::frameset frames = pipeline.wait_for_frames(1000);
-            rs2::motion_frame accel = frames.first_or_default(RS2_STREAM_ACCEL);
-            rs2::motion_frame gyro = frames.first_or_default(RS2_STREAM_GYRO);
-            if (!accel || !gyro) continue;
-
-            auto a = accel.get_motion_data();
-            auto g = gyro.get_motion_data();
-            double ts = gyro.get_timestamp();
-
-            // First frame: initialize timestamp
-            if (!initialized) {
-                prev_ts = ts;
-                initialized = true;
-                continue;
-            }
-
-            double dt = (ts - prev_ts) / 1000.0;
-            prev_ts = ts;
-            if (dt <= 0 || dt > 0.01) continue; // Ignore unrealistic timestamps
-
-            // Calculate roll and pitch from accelerometer
-            auto acc_angles = compute_roll_pitch(-a.y, a.x, -a.z);
-            double roll_acc = acc_angles.first;
-            double pitch_acc = acc_angles.second;
-
-            std::lock_guard<std::mutex> lock(orientation_mutex);
-            double gx_deg = (g.x - GYRO_DRIFT_X) * 180.0 / M_PI;
-            double gy_deg = (g.y - GYRO_DRIFT_Y) * 180.0 / M_PI;
-            double gz_deg = (g.z - GYRO_DRIFT_Z) * 180.0 / M_PI;
-
-            // Apply complementary filter
-            roll = normalize_angle(alpha * (roll + gx_deg * dt) + (1 - alpha) * roll_acc);
-            pitch = normalize_angle(alpha * (pitch + gy_deg * dt) + (1 - alpha) * pitch_acc);
-            yaw = normalize_angle(beta * (yaw + gz_deg * dt) + (1 - beta) * yaw_reset);
-        }
-        catch (...) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            continue;
-        }
-    }
 }
 
 // === Interpolation Function ===
@@ -267,26 +205,8 @@ cv::Mat centerCropOnly(const cv::Mat& frame, float crop_scale_h, float crop_scal
 }
 
 
-
-// === MAIN FUNCTION ===
 int main() {
-    // Set OpenCV logging level to suppress verbose logs
-    cv::utils::logging::setLogLevel(cv::utils::logging::LOG_LEVEL_ERROR);
 
-    // Configure and start RealSense pipeline for IMU (gyro + accel)
-    rs2::pipeline pipeline;
-    rs2::config config;
-    config.enable_stream(RS2_STREAM_ACCEL, RS2_FORMAT_MOTION_XYZ32F, 250);
-    config.enable_stream(RS2_STREAM_GYRO, RS2_FORMAT_MOTION_XYZ32F, 400);
-    std::thread imu_thread;
-
-    try {
-        pipeline.start(config);
-        imu_thread = std::thread(imu_orientation_updater, std::ref(pipeline)); // Start IMU update thread
-    }
-    catch (const rs2::error& e) {
-        std::cerr << "Failed to start RealSense pipeline: " << e.what() << std::endl;
-    }
 
     // Setup camera intrinsic and distortion parameters for undistortion
     cv::Mat K = (cv::Mat_<double>(3, 3) << fx_original, 0, cx_original, 0, fy_original, cy_original, 0, 0, 1);
@@ -297,92 +217,76 @@ int main() {
     cx = static_cast<float>(newK.at<double>(0, 2));
     cy = static_cast<float>(newK.at<double>(1, 2));
 
-    // Generate remapping matrices for cylindrical projection
+    // Generate cylindrical remap maps
     std::vector<cv::Mat> map_x_list(2), map_y_list(2);
-    for (int i = 0; i < 2; ++i)
-        generateCylindricalRemap(map_x_list[i], map_y_list[i], camera_width, camera_height, cylindrical_fov_deg);
+    generateCylindricalRemap(map_x_list[0], map_y_list[0], camera_width, camera_height);
+    generateCylindricalRemap(map_x_list[1], map_y_list[1], camera_width, camera_height);
 
-    // Open camera streams
-    std::vector<cv::VideoCapture> cameras(2);
-    int camera_indices[] = { 3, 0 }; // Replace with your actual camera IDs
-    for (int i = 0; i < 2; ++i) {
-        cameras[i].open(camera_indices[i]);
-        cameras[i].set(cv::CAP_PROP_FRAME_WIDTH, camera_width);
-        cameras[i].set(cv::CAP_PROP_FRAME_HEIGHT, camera_height);
-    }
+    // Open multiple cameras
+    /*std::vector<cv::VideoCapture> cameras(2);
+    cameras[0].open(2);
+    cameras[1].open(0);
+    for (auto& cam : cameras) {
+        cam.set(cv::CAP_PROP_FRAME_WIDTH, camera_width);
+        cam.set(cv::CAP_PROP_FRAME_HEIGHT, camera_height);
+    }*/
 
-    // Create display windows
     cv::namedWindow("Panorama", cv::WINDOW_NORMAL);
-    cv::resizeWindow("Panorama", camera_width * 2, camera_height);
+    cv::resizeWindow("Panorama", camera_width * 2, camera_height); // Resize to expected panorama size
     cv::namedWindow("Original", cv::WINDOW_NORMAL);
     cv::resizeWindow("Original", camera_width * 2, camera_height);
 
-    while (true) {
-        // === STEP 1: Capture frames from both cameras ===
-        std::vector<cv::Mat> frames(2);
-        for (int i = 0; i < 2; ++i) {
-            cameras[i] >> frames[i];
-            if (frames[i].empty()) {
-                std::cerr << "Camera " << i << " failed to capture." << std::endl;
-                return -1;
-            }
-        }
 
-        // === STEP 2: Copy latest IMU orientation values safely ===
-        double roll_copy, pitch_copy, yaw_copy;
-        {
-            std::lock_guard<std::mutex> lock(orientation_mutex);
-            roll_copy = roll;
-            pitch_copy = pitch;
-            yaw_copy = yaw;
-        }
-
-        std::vector<cv::Mat> stabilized_frames, original_frames;
-        std::vector<std::string> annotations;
-
-        // === STEP 3: Process each camera frame ===
-        for (int cam_idx = 0; cam_idx < 2; ++cam_idx) {
-            // Convert IMU RPY to current camera orientation with offsets
-            auto rpy_corrected = convert_rpy_sys1_to_sys(roll_copy, pitch_copy, yaw_offset_cam[cam_idx], pitch_offset_cam[cam_idx]);
-            double roll_corr = rpy_corrected[0];
-            double pitch_corr = rpy_corrected[1];
-            int y_shift = static_cast<int>(pitch_to_translation_factor * pitch_corr);
-
-            // === STEP 4: Undistort and stabilize image ===
-            cv::Mat undistorted = manualUndistort(frames[cam_idx]);
-            cv::Mat f_orig = centerCropOnly(undistorted.clone(), original_crop_height_scale, original_crop_width_scale);
-
-            // Apply affine stabilization + cylindrical remap + cropping
-            cv::Mat affine = applyManualAffine(undistorted, roll_corr, static_cast<float>(y_shift));
-            cv::Mat projected = cylindricalRemap(affine, map_x_list[cam_idx], map_y_list[cam_idx]);
-            cv::Mat cropped = centerCropOnly(projected, panorama_crop_height_scale, panorama_crop_width_scale);
-
-            stabilized_frames.push_back(cropped);
-            original_frames.push_back(f_orig);
-
-            std::ostringstream oss;
-            oss << "Cam" << cam_idx + 1 << " - R:" << roll_corr << " P:" << pitch_corr << " Y:" << yaw_copy;
-            annotations.push_back(oss.str());
-        }
-
-        // === STEP 5: Concatenate and show result ===
-        cv::Mat panorama, original;
-        cv::hconcat(stabilized_frames, panorama);
-        cv::hconcat(original_frames, original);
-
-        for (size_t i = 0; i < annotations.size(); ++i) {
-            cv::putText(panorama, annotations[i], cv::Point(30, 40 + static_cast<int>(i) * 40), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(255, 255, 0), 2);
-        }
-
-        cv::imshow("Panorama", panorama);
-        cv::imshow("Original", original);
-        if (cv::waitKey(1) == 'q') break; // Exit loop on 'q'
+    std::vector<cv::Mat> frames = { cv::imread("cam0.png"), cv::imread("cam1.png") };
+    if (frames[0].empty() || frames[1].empty()) {
+        std::cerr << "Failed to load cam0.png or cam1.png" << std::endl;
+        return -1;
     }
 
-    // === STEP 6: Cleanup ===
-    for (auto& cam : cameras) cam.release();
+    float roll_copy = 5.0f, pitch_copy = -0.75f, yaw_copy = 0.0f; //Fixed Roll,pitch,yaw (These values will be calculated at MCU)
+
+
+    std::vector<cv::Mat> stabilized_frames, original_frames;
+    std::vector<std::string> annotations;
+
+    for (int cam_idx = 0; cam_idx < 2; ++cam_idx) {
+        auto rpy_corrected = convert_rpy_sys1_to_sys(roll_copy, pitch_copy, cam_idx * 60.0, cam_idx * 0.5);
+        double roll_corr = rpy_corrected[0];
+        double pitch_corr = rpy_corrected[1];
+        int y_shift = static_cast<int>(pitch_to_translation_factor * pitch_corr);
+
+        cv::Mat undistorted = manualUndistort(frames[cam_idx]);
+        cv::Mat f_orig = centerCropOnly(undistorted.clone(), 0.54f, 0.615f);
+
+        cv::Mat affine = applyManualAffine(undistorted, roll_corr, static_cast<float>(y_shift));
+        cv::Mat projected = cylindricalRemap(affine, map_x_list[cam_idx], map_y_list[cam_idx]);
+        cv::Mat cropped = centerCropOnly(projected, 0.5f, 0.615f);
+
+        stabilized_frames.push_back(cropped);
+        original_frames.push_back(f_orig);
+
+        std::ostringstream oss;
+        oss << "Cam" << cam_idx + 1 << " - R:" << roll_corr << " P:" << pitch_corr << " Y:" << yaw_copy;
+        annotations.push_back(oss.str());
+    }
+
+    cv::Mat panorama, original;
+    cv::hconcat(stabilized_frames, panorama);
+    cv::hconcat(original_frames, original);
+
+    for (size_t i = 0; i < annotations.size(); ++i) {
+        cv::putText(panorama, annotations[i], cv::Point(30, 40 + static_cast<int>(i) * 40), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(255, 255, 0), 2);
+    }
+
+    cv::imshow("Panorama", panorama);
+    cv::imshow("Original", original);
+    cv::waitKey(0);
+
+
+    /*for (auto& cam : cameras) cam.release();
     if (imu_thread.joinable()) imu_thread.detach();
-    cv::destroyAllWindows();
+    cv::destroyAllWindows();*/
     return 0;
 }
+
 
