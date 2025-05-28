@@ -27,13 +27,13 @@ const float distortion_p1 = -0.001558f;
 const float distortion_p2 = -0.002416f;
 
 // === Cylindrical Remap & Offset Settings ===
-const float cylindrical_fov_deg = 60.0f;
+const float cylindrical_fov_deg = 77.0f;
 const float yaw_offset_cam[] = { 0.0f, 60.0f };
 const float pitch_offset_cam[] = { 0.0f, 0.5f };
-const float panorama_crop_height_scale = 0.5f;
-const float panorama_crop_width_scale = 0.615f;
-const float original_crop_height_scale = 0.54f;
-const float original_crop_width_scale = 0.615f;
+const float panorama_crop_height_scale = 0.615f;
+const float panorama_crop_width_scale = 0.54f;
+const float original_crop_height_scale = 0.7f;
+const float original_crop_width_scale = 0.54f;
 
 // === Translation Factors ===
 const float pitch_to_translation_factor = -17.44153917818162f;
@@ -206,9 +206,7 @@ cv::Mat centerCropOnly(const cv::Mat& frame, float crop_scale_h, float crop_scal
 
 
 int main() {
-
-
-    // Setup camera intrinsic and distortion parameters for undistortion
+    // Setup camera intrinsic and distortion parameters
     cv::Mat K = (cv::Mat_<double>(3, 3) << fx_original, 0, cx_original, 0, fy_original, cy_original, 0, 0, 1);
     cv::Mat dist = (cv::Mat_<double>(1, 5) << distortion_k1, distortion_k2, distortion_p1, distortion_p2, distortion_k3);
     cv::Mat newK = cv::getOptimalNewCameraMatrix(K, dist, cv::Size(camera_width, camera_height), 1);
@@ -217,56 +215,58 @@ int main() {
     cx = static_cast<float>(newK.at<double>(0, 2));
     cy = static_cast<float>(newK.at<double>(1, 2));
 
-    // Generate cylindrical remap maps
-    std::vector<cv::Mat> map_x_list(2), map_y_list(2);
-    generateCylindricalRemap(map_x_list[0], map_y_list[0], camera_width, camera_height);
-    generateCylindricalRemap(map_x_list[1], map_y_list[1], camera_width, camera_height);
+    const int num_cams = 6;
+    std::vector<std::string> filenames = {
+        "cam0.jpg", "cam1.jpg", "cam2.jpg", "cam3.jpg", "cam4.jpg", "cam5.jpg"
+    };
+    std::vector<float> yaw_offset_cam = { 0.0f, 60.0f, 120.0f, 180.0f, 240.0f, 300.0f };
+    std::vector<float> pitch_offset_cam = { -0.5f, 0.0f, 0.5f, 0.25f, -4.0f, -0.5f };
+    std::vector<float> roll_offset_cam = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
 
-    // Open multiple cameras
-    /*std::vector<cv::VideoCapture> cameras(2);
-    cameras[0].open(2);
-    cameras[1].open(0);
-    for (auto& cam : cameras) {
-        cam.set(cv::CAP_PROP_FRAME_WIDTH, camera_width);
-        cam.set(cv::CAP_PROP_FRAME_HEIGHT, camera_height);
-    }*/
+    // Create cylindrical remaps for each cam
+    std::vector<cv::Mat> map_x_list(num_cams), map_y_list(num_cams);
+    for (int i = 0; i < num_cams; ++i)
+        generateCylindricalRemap(map_x_list[i], map_y_list[i], camera_width, camera_height, cylindrical_fov_deg, 0.0f);
 
-    cv::namedWindow("Panorama", cv::WINDOW_NORMAL);
-    cv::resizeWindow("Panorama", camera_width * 2, camera_height); // Resize to expected panorama size
-    cv::namedWindow("Original", cv::WINDOW_NORMAL);
-    cv::resizeWindow("Original", camera_width * 2, camera_height);
-
-
-    std::vector<cv::Mat> frames = { cv::imread("cam0.png"), cv::imread("cam1.png") };
-    if (frames[0].empty() || frames[1].empty()) {
-        std::cerr << "Failed to load cam0.png or cam1.png" << std::endl;
-        return -1;
+    // Read images
+    std::vector<cv::Mat> frames(num_cams);
+    for (int i = 0; i < num_cams; ++i) {
+        frames[i] = cv::imread(filenames[i]);
+        if (frames[i].empty()) {
+            std::cerr << "Failed to load " << filenames[i] << std::endl;
+            return -1;
+        }
     }
 
-    float roll_copy = 5.0f, pitch_copy = -0.75f, yaw_copy = 0.0f; //Fixed Roll,pitch,yaw (These values will be calculated at MCU)
-
+    float roll_ref = 5.25f, pitch_ref = -0.75f, yaw_ref = 0.0f;
 
     std::vector<cv::Mat> stabilized_frames, original_frames;
     std::vector<std::string> annotations;
 
-    for (int cam_idx = 0; cam_idx < 2; ++cam_idx) {
-        auto rpy_corrected = convert_rpy_sys1_to_sys(roll_copy, pitch_copy, cam_idx * 60.0, cam_idx * 0.5);
+    for (int cam_idx = 0; cam_idx < num_cams; ++cam_idx) {
+        auto rpy_corrected = convert_rpy_sys1_to_sys(
+            roll_ref, pitch_ref,
+            yaw_offset_cam[cam_idx],
+            pitch_offset_cam[cam_idx],
+            roll_offset_cam[cam_idx]
+        );
+
         double roll_corr = rpy_corrected[0];
         double pitch_corr = rpy_corrected[1];
         int y_shift = static_cast<int>(pitch_to_translation_factor * pitch_corr);
 
         cv::Mat undistorted = manualUndistort(frames[cam_idx]);
-        cv::Mat f_orig = centerCropOnly(undistorted.clone(), 0.54f, 0.615f);
+        cv::Mat f_orig = centerCropOnly(undistorted.clone(), original_crop_height_scale, original_crop_width_scale);
 
         cv::Mat affine = applyManualAffine(undistorted, roll_corr, static_cast<float>(y_shift));
         cv::Mat projected = cylindricalRemap(affine, map_x_list[cam_idx], map_y_list[cam_idx]);
-        cv::Mat cropped = centerCropOnly(projected, 0.5f, 0.615f);
+        cv::Mat cropped = centerCropOnly(projected, panorama_crop_height_scale, panorama_crop_width_scale);
 
         stabilized_frames.push_back(cropped);
         original_frames.push_back(f_orig);
 
         std::ostringstream oss;
-        oss << "Cam" << cam_idx + 1 << " - R:" << roll_corr << " P:" << pitch_corr << " Y:" << yaw_copy;
+        oss << "Cam" << cam_idx << " - R:" << roll_corr << " P:" << pitch_corr << " Y:" << yaw_ref;
         annotations.push_back(oss.str());
     }
 
@@ -275,18 +275,29 @@ int main() {
     cv::hconcat(original_frames, original);
 
     for (size_t i = 0; i < annotations.size(); ++i) {
-        cv::putText(panorama, annotations[i], cv::Point(30, 40 + static_cast<int>(i) * 40), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(255, 255, 0), 2);
+        cv::putText(
+            panorama,
+            annotations[i],
+            cv::Point(30, 50 + static_cast<int>(i) * 40), // stacked vertically
+            cv::FONT_HERSHEY_SIMPLEX,
+            0.8,
+            cv::Scalar(255, 255, 0),
+            2
+        );
     }
 
+
+    cv::namedWindow("Panorama", cv::WINDOW_NORMAL);
+    cv::resizeWindow("Panorama", panorama.cols, panorama.rows);
     cv::imshow("Panorama", panorama);
+
+    cv::namedWindow("Original", cv::WINDOW_NORMAL);
+    cv::resizeWindow("Original", original.cols, original.rows);
     cv::imshow("Original", original);
+
     cv::waitKey(0);
-
-
-    /*for (auto& cam : cameras) cam.release();
-    if (imu_thread.joinable()) imu_thread.detach();
-    cv::destroyAllWindows();*/
     return 0;
 }
+
 
 
