@@ -205,6 +205,41 @@ cv::Vec3f convert_rpy_Sensor_to_cam(double roll_sys1, double pitch_sys1, double 
     return cv::Vec3f(rollX * 180.0 / M_PI, pitchX * 180.0 / M_PI, yawX * 180.0 / M_PI);
 }
 
+cv::Mat manualHConcat(const std::vector<cv::Mat>& frames) {
+    if (frames.empty()) return cv::Mat();
+
+    int total_width = 0;
+    int height = frames[0].rows;
+    int type = frames[0].type();
+
+    // Calculate total width
+    for (const auto& img : frames) {
+        if (img.rows != height || img.type() != type) {
+            std::cerr << "Error: All images must have same height and type.\n";
+            return cv::Mat();
+        }
+        total_width += img.cols;
+    }
+
+    // Create blank output image
+    cv::Mat result(height, total_width, type, cv::Scalar(0));
+
+    // Copy each image into the correct horizontal slot
+    int current_x = 0;
+    for (const auto& img : frames) {
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < img.cols; ++x) {
+                result.at<cv::Vec3b>(y, current_x + x) = img.at<cv::Vec3b>(y, x);
+            }
+        }
+        current_x += img.cols;
+    }
+
+    return result;
+}
+
+
+
 cv::Mat manualCrop(const cv::Mat& frame, int start_x, int start_y, int crop_w, int crop_h) {
     cv::Mat cropped(crop_h, crop_w, frame.type(), cv::Scalar(0, 0, 0));
 
@@ -388,8 +423,9 @@ int main() {
     }
 
     cv::Mat panorama, original;
-    cv::hconcat(stabilized_frames, panorama);
-    cv::hconcat(original_frames, original);
+    panorama = manualHConcat(stabilized_frames);
+    original = manualHConcat(original_frames);
+
 
     for (size_t i = 0; i < annotations.size(); ++i) {
         cv::putText(
