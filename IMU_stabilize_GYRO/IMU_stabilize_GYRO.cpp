@@ -205,6 +205,24 @@ cv::Vec3f convert_rpy_Sensor_to_cam(double roll_sys1, double pitch_sys1, double 
     return cv::Vec3f(rollX * 180.0 / M_PI, pitchX * 180.0 / M_PI, yawX * 180.0 / M_PI);
 }
 
+cv::Mat manualCrop(const cv::Mat& frame, int start_x, int start_y, int crop_w, int crop_h) {
+    cv::Mat cropped(crop_h, crop_w, frame.type(), cv::Scalar(0, 0, 0));
+
+    for (int y = 0; y < crop_h; ++y) {
+        for (int x = 0; x < crop_w; ++x) {
+            int src_x = start_x + x;
+            int src_y = start_y + y;
+
+            // Safety check for bounds
+            if (src_x >= 0 && src_x < frame.cols && src_y >= 0 && src_y < frame.rows) {
+                cropped.at<cv::Vec3b>(y, x) = frame.at<cv::Vec3b>(src_y, src_x);
+            }
+        }
+    }
+
+    return cropped;
+}
+
 // === Center Crop Function ===
 // Extracts a centered sub-region from the input image based on height and width scaling factors.
 cv::Mat centerCropOnly(const cv::Mat& frame, float crop_scale_h, float crop_scale_w) {
@@ -213,7 +231,8 @@ cv::Mat centerCropOnly(const cv::Mat& frame, float crop_scale_h, float crop_scal
     int crop_w = static_cast<int>(w * crop_scale_w);
     int start_y = (h - crop_h) / 2;
     int start_x = (w - crop_w) / 2;
-    return frame(cv::Rect(start_x, start_y, crop_w, crop_h)).clone();
+    return manualCrop(frame, start_x, start_y, crop_w, crop_h);
+
 }
 
 std::wstring StringToWString(const std::string& str)
@@ -248,6 +267,10 @@ std::string SaveImageFilePath(const std::wstring& captureDir, const std::wstring
     std::wstring widePath(buffer);
     return WStringToUtf8(widePath);
 }
+
+
+
+
 
 int main() {
     wchar_t szPath[MAX_PATH] = L"";
