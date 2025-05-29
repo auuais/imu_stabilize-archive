@@ -7,6 +7,18 @@
 #include <cmath>
 #include <mutex>
 #include <thread>
+#include <Windows.h>
+#include <Shlwapi.h>  // PathRemoveFileSpecW
+#include <string>
+#include <filesystem>
+#include "ini_manager.h"
+#include <string>
+#include <vector>
+#include <locale>
+#include <codecvt>  // C++17 이전에만 사용 가능
+
+#pragma comment(lib, "Shlwapi.lib")
+#pragma comment(lib, "User32.lib")
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -204,8 +216,87 @@ cv::Mat centerCropOnly(const cv::Mat& frame, float crop_scale_h, float crop_scal
     return frame(cv::Rect(start_x, start_y, crop_w, crop_h)).clone();
 }
 
+std::wstring StringToWString(const std::string& str)
+{
+    if (str.empty()) return {};
+    int size_needed = MultiByteToWideChar(CP_UTF8, 0, str.data(), (int)str.size(), NULL, 0);
+    std::wstring result(size_needed, 0);
+    MultiByteToWideChar(CP_UTF8, 0, str.data(), (int)str.size(), &result[0], size_needed);
+    return result;
+}
+
+std::string WStringToUtf8(const std::wstring& wstr)
+{
+    if (wstr.empty()) return {};
+    int size = WideCharToMultiByte(CP_UTF8, 0, wstr.data(), (int)wstr.length(), nullptr, 0, nullptr, nullptr);
+    std::string result(size, 0);
+    WideCharToMultiByte(CP_UTF8, 0, wstr.data(), (int)wstr.length(), &result[0], size, nullptr, nullptr);
+    return result;
+}
+
+std::string SaveImageFilePath(const std::wstring& captureDir, const std::wstring&prefix)
+{
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+
+    wchar_t buffer[512];
+    swprintf_s(buffer, 512, L"%s\\%04d%02d%02d_%02d%02d%02d_%s.bmp",
+        captureDir.c_str(),
+        st.wYear, st.wMonth, st.wDay,
+        st.wHour, st.wMinute, st.wSecond, prefix.c_str());
+
+    std::wstring widePath(buffer);
+    return WStringToUtf8(widePath);
+}
 
 int main() {
+    wchar_t szPath[MAX_PATH] = L"";
+    GetModuleFileNameW(NULL, szPath, MAX_PATH);
+
+    // 2. filesystem으로 경로 파싱
+    std::filesystem::path exePath(szPath);
+
+    // 3. 확장자를 .ini로 변경
+    std::filesystem::path iniPath = exePath;
+    iniPath.replace_extension(L".ini");
+	INIManager iniManager(iniPath);
+
+    PathRemoveFileSpecW(szPath);
+    std::wstring dirCapture = std::wstring(szPath) + L"\\Capture";
+    CreateDirectoryW(dirCapture.c_str(), NULL);  // 이미 존재하면 무시
+
+	// 4. ini 파일에서 설정 읽기
+    const int num_cams = 6;
+    std::vector<std::string> filenames;
+    for (int i = 0; i < num_cams; ++i) {
+        std::wstring key = L"file_" + std::to_wstring(i);
+        std::wstring val = iniManager.ReadString(L"images", key, L"");
+        filenames.push_back(WStringToUtf8(val));
+    }
+
+    std::vector<float> yaw_offset_cam = iniManager.ReadFloatArray(L"offset", L"yaw");
+    std::vector<float> pitch_offset_cam = iniManager.ReadFloatArray(L"offset", L"pitch");
+    std::vector<float> roll_offset_cam = iniManager.ReadFloatArray(L"offset", L"roll");
+
+    // 파일 경로 출력
+    std::cout << "[image list]" << std::endl;
+    for (size_t i = 0; i < filenames.size(); ++i) {
+        std::cout << "  file_" << i << ": " << filenames[i] << std::endl;
+    }
+
+    // 오프셋 출력 함수 (재사용 가능)
+    auto printOffsets = [](const std::string& label, const std::vector<float>& values) {
+        std::cout << "\n[" << label << "]" << std::endl;
+        for (size_t i = 0; i < values.size(); ++i) {
+            std::cout << "  " << label << "_" << i << ": " << values[i] << std::endl;
+        }
+        };
+
+    printOffsets("yaw_offset_cam", yaw_offset_cam);
+    printOffsets("pitch_offset_cam", pitch_offset_cam);
+    printOffsets("roll_offset_cam", roll_offset_cam);
+
+    std::cout << "\n........Processing........" << std::endl;
     // Setup camera intrinsic and distortion parameters
     cv::Mat K = (cv::Mat_<double>(3, 3) << fx_original, 0, cx_original, 0, fy_original, cy_original, 0, 0, 1);
     cv::Mat dist = (cv::Mat_<double>(1, 5) << distortion_k1, distortion_k2, distortion_p1, distortion_p2, distortion_k3);
@@ -213,15 +304,7 @@ int main() {
     fx = static_cast<float>(newK.at<double>(0, 0));
     fy = static_cast<float>(newK.at<double>(1, 1));
     cx = static_cast<float>(newK.at<double>(0, 2));
-    cy = static_cast<float>(newK.at<double>(1, 2));
-
-    const int num_cams = 6;
-    std::vector<std::string> filenames = {
-        "cam0.jpg", "cam1.jpg", "cam2.jpg", "cam3.jpg", "cam4.jpg", "cam5.jpg"
-    };
-    std::vector<float> yaw_offset_cam = { 0.0f, 60.0f, 120.0f, 180.0f, 240.0f, 300.0f };
-    std::vector<float> pitch_offset_cam = { -0.5f, 0.0f, 0.5f, 0.25f, -4.0f, -0.5f };
-    std::vector<float> roll_offset_cam = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    cy = static_cast<float>(newK.at<double>(1, 2));    
 
     // Create cylindrical remaps for each cam
     std::vector<cv::Mat> map_x_list(num_cams), map_y_list(num_cams);
@@ -286,16 +369,15 @@ int main() {
         );
     }
 
+    std::string original_path = SaveImageFilePath(dirCapture, L"original");
+    std::string result_path = SaveImageFilePath(dirCapture, L"panorama");
 
-    cv::namedWindow("Panorama", cv::WINDOW_NORMAL);
-    cv::resizeWindow("Panorama", panorama.cols, panorama.rows);
-    cv::imshow("Panorama", panorama);
+    cv::imwrite(original_path, original);
+    cv::imwrite(result_path, panorama);
 
-    cv::namedWindow("Original", cv::WINDOW_NORMAL);
-    cv::resizeWindow("Original", original.cols, original.rows);
-    cv::imshow("Original", original);
+	std::string msg = "\n[Save files]\n" + original_path + "\n" + result_path ;
+    std::cout << msg << std::endl;
 
-    cv::waitKey(0);
     return 0;
 }
 
