@@ -171,7 +171,7 @@ cv::Mat cylindricalRemap(const cv::Mat& img, const cv::Mat& map_x, const cv::Mat
 // === Convert Roll-Pitch-Yaw from One System to Another ===
 // Converts RPY angles from one system (e.g., Cam1) to another (e.g., Cam2) using offset correction.
 // It builds rotation matrices from Euler angles and combines them to derive new RPY values.
-cv::Vec3f convert_rpy_sys1_to_sys(double roll_sys1, double pitch_sys1, double yaw_offset, double pitch_offset = 0.0, double roll_offset = 0.0) {
+cv::Vec3f convert_rpy_Sensor_to_cam(double roll_sys1, double pitch_sys1, double yaw_offset, double pitch_offset = 0.0, double roll_offset = 0.0) {
     double roll_rad = roll_sys1 * M_PI / 180.0, pitch_rad = pitch_sys1 * M_PI / 180.0;
     double roll_offset_rad = roll_offset * M_PI / 180.0, pitch_offset_rad = pitch_offset * M_PI / 180.0;
     double yaw_offset_rad = yaw_offset * M_PI / 180.0;
@@ -296,7 +296,7 @@ int main() {
     printOffsets("pitch_offset_cam", pitch_offset_cam);
     printOffsets("roll_offset_cam", roll_offset_cam);
 
-    std::cout << "\n........Processing........" << std::endl;
+    //std::cout << "\n........Processing........" << std::endl;
     // Setup camera intrinsic and distortion parameters
     cv::Mat K = (cv::Mat_<double>(3, 3) << fx_original, 0, cx_original, 0, fy_original, cy_original, 0, 0, 1);
     cv::Mat dist = (cv::Mat_<double>(1, 5) << distortion_k1, distortion_k2, distortion_p1, distortion_p2, distortion_k3);
@@ -321,27 +321,38 @@ int main() {
         }
     }
 
-    float roll_ref = 5.25f, pitch_ref = -0.75f, yaw_ref = 0.0f;
+    float roll_Sensor = iniManager.ReadFloat(L"Sensor_Orientation", L"roll", 5.25f);
+    float pitch_Sensor = iniManager.ReadFloat(L"Sensor_Orientation", L"pitch", -0.75f);
+    float yaw_Sensor = iniManager.ReadFloat(L"Sensor_Orientation", L"yaw", 0.0f);
+
+    std::cout << "\n[Sensor_Orientation]" << std::endl;
+    std::cout << "  roll_Sensor: " << roll_Sensor << std::endl;
+    std::cout << "  pitch_Sensor: " << pitch_Sensor << std::endl;
+    std::cout << "  yaw_Sensor: " << yaw_Sensor << std::endl;
+
+
+    std::cout << "\n........Processing........" << std::endl;
+
 
     std::vector<cv::Mat> stabilized_frames, original_frames;
     std::vector<std::string> annotations;
 
     for (int cam_idx = 0; cam_idx < num_cams; ++cam_idx) {
-        auto rpy_corrected = convert_rpy_sys1_to_sys(
-            roll_ref, pitch_ref,
+        auto rpy_cam_transformed = convert_rpy_Sensor_to_cam(
+            roll_Sensor, pitch_Sensor,
             yaw_offset_cam[cam_idx],
             pitch_offset_cam[cam_idx],
             roll_offset_cam[cam_idx]
         );
 
-        double roll_corr = rpy_corrected[0];
-        double pitch_corr = rpy_corrected[1];
-        int y_shift = static_cast<int>(pitch_to_translation_factor * pitch_corr);
+        double roll_cam = rpy_cam_transformed[0];
+        double pitch_cam = rpy_cam_transformed[1];
+        int y_shift = static_cast<int>(pitch_to_translation_factor * pitch_cam);
 
         cv::Mat undistorted = manualUndistort(frames[cam_idx]);
         cv::Mat f_orig = centerCropOnly(undistorted.clone(), original_crop_height_scale, original_crop_width_scale);
 
-        cv::Mat affine = applyManualAffine(undistorted, roll_corr, static_cast<float>(y_shift));
+        cv::Mat affine = applyManualAffine(undistorted, roll_cam, static_cast<float>(y_shift));
         cv::Mat projected = cylindricalRemap(affine, map_x_list[cam_idx], map_y_list[cam_idx]);
         cv::Mat cropped = centerCropOnly(projected, panorama_crop_height_scale, panorama_crop_width_scale);
 
@@ -349,7 +360,7 @@ int main() {
         original_frames.push_back(f_orig);
 
         std::ostringstream oss;
-        oss << "Cam" << cam_idx << " - R:" << roll_corr << " P:" << pitch_corr << " Y:" << yaw_ref;
+        oss << "Cam" << cam_idx << " - R:" << roll_cam << " P:" << pitch_cam << " Y:" << yaw_Sensor;
         annotations.push_back(oss.str());
     }
 
