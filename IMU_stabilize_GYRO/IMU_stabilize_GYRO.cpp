@@ -1,273 +1,543 @@
-﻿// SVN_block
+﻿#define _CRT_SECURE_NO_WARNINGS
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
 
-#include <opencv2/opencv.hpp>
-#include <opencv2/core/utils/logger.hpp>
-//#include <librealsense2/rs.hpp>
-#include <iostream>
-#include <cmath>
-#include <mutex>
-#include <thread>
-#include <Windows.h>
+//for data read from file
+/////////////////////////////////////////////////
+
 #include <Shlwapi.h>  // PathRemoveFileSpecW
-#include <string>
+#pragma comment(lib, "Shlwapi.lib")
 #include <filesystem>
 #include "ini_manager.h"
-#include <string>
-#include <vector>
-#include <locale>
-#include <codecvt>  // C++17 이전에만 사용 가능
 
-#pragma comment(lib, "Shlwapi.lib")
-#pragma comment(lib, "User32.lib")
+//////////////////////////////////////////////
+
+
+
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
-// === Camera & Calibration Constants ===
-const int camera_width = 1920;
-const int camera_height = 1080;
-const float fx_original = 1204.505857f;
-const float fy_original = 1204.505857f;
-const float cx_original = camera_width / 2.0f;
-const float cy_original = camera_height / 2.0f;
+#define WIDTH 1920
+#define HEIGHT 1080
+#define FX 1204.505857f
+#define FY 1204.505857f
+#define CX (WIDTH / 2.0f)
+#define CY (HEIGHT / 2.0f)
+#define K1 -0.343698f
+#define K2 0.105503f
+#define K3 0.0f
+#define P1 -0.001558f
+#define P2 -0.002416f
+#define NUM_CAMS 6
+#define BUFFER_LINES 15
+#define OVERLAP_RATIO 0.1f
+#define NON_OVERLAP_WIDTH (int)(WIDTH * (1.0f - OVERLAP_RATIO))
+#define PANORAMA_WIDTH (int)(6 * WIDTH - 5 * WIDTH * OVERLAP_RATIO)
+#define PITCH_TO_TRANSLATION_FACTOR -17.44153917818162f
+#define YAW_TO_TRANSLATION_FACTOR 17.84f
 
-const float distortion_k1 = -0.343698f;
-const float distortion_k2 = 0.105503f;
-const float distortion_k3 = 0.0f;
-const float distortion_p1 = -0.001558f;
-const float distortion_p2 = -0.002416f;
-
-// === Cylindrical Remap & Offset Settings ===
-const float cylindrical_fov_deg = 77.0f;
-const float yaw_offset_cam[] = { 0.0f, 60.0f };
-const float pitch_offset_cam[] = { 0.0f, 0.5f };
-const float panorama_crop_height_scale = 0.615f;
-const float panorama_crop_width_scale = 0.54f;
+const float cylindrical_fov_deg = 60.0f;
+const float panorama_crop_height_scale = 0.80f;
+const float panorama_crop_width_scale = 0.8f;
 const float original_crop_height_scale = 0.7f;
 const float original_crop_width_scale = 0.54f;
 
-// === Translation Factors ===
-const float pitch_to_translation_factor = -17.44153917818162f;
-const float yaw_to_translation_factor = 17.84f;
+float fx = FX, fy = FY, cx = CX, cy = CY;
 
-float fx = fx_original, fy = fy_original, cx = cx_original, cy = cy_original;
+// precomputed undistortion reprojection matrix parameters
+float fx_new = 864.452f;
+float fy_new = 860.023f;
+float cx_new = 947.559f;
+float cy_new = 534.965f;
 
-std::mutex orientation_mutex;
-double roll = 0.0, pitch = 0.0, yaw = 0.0;
 
-double normalize_angle(double angle) {
-    return fmod((angle + 180.0), 360.0) - 180.0;
+#pragma pack(push, 1)
+typedef struct {
+    unsigned short bfType;
+    unsigned int   bfSize;
+    unsigned short bfReserved1;
+    unsigned short bfReserved2;
+    unsigned int   bfOffBits;
+} CustomBitmapFileHeader;
+
+
+typedef struct {
+    unsigned int   biSize;
+    int            biWidth;
+    int            biHeight;
+    unsigned short biPlanes;
+    unsigned short biBitCount;
+    unsigned int   biCompression;
+    unsigned int   biSizeImage;
+    int            biXPelsPerMeter;
+    int            biYPelsPerMeter;
+    unsigned int   biClrUsed;
+    unsigned int   biClrImportant;
+} CustomBitmapInfoHeader;
+#pragma pack(pop)
+
+
+typedef struct {
+    int width;
+    int height;
+    int channels;
+    unsigned char* data; 
+} Image;
+
+
+#define PIXEL(img, y, x, c) ((img)->data[((y) * (img)->width + (x)) * (img)->channels + (c)])
+
+
+static unsigned char saturate_cast(float val) {
+    if (val < 0) return 0;
+    if (val > 255) return 255;
+    return (unsigned char)(val + 0.5f);
 }
 
-template<typename T>
-std::pair<double, double> compute_roll_pitch(T ax, T ay, T az) {
-    if (az == 0.0) az = 1e-6;
-    double roll = atan2(ay, az);
-    double pitch = atan2(-ax, sqrt(ay * ay + az * az));
-    return { roll * 180.0 / M_PI, pitch * 180.0 / M_PI };
+
+Image* readBMP(const char* filename) {
+    FILE* fp = fopen(filename, "rb");
+    CustomBitmapFileHeader fileHeader;
+    CustomBitmapInfoHeader infoHeader;
+
+    fread(&fileHeader, sizeof(BITMAPFILEHEADER), 1, fp);
+    fread(&infoHeader, sizeof(BITMAPINFOHEADER), 1, fp);
+
+    Image* img = (Image*)malloc(sizeof(Image));
+    img->width = infoHeader.biWidth;
+    img->height = abs(infoHeader.biHeight);
+    img->channels = 3;
+    int row_padded = ((img->width * 3 + 3) / 4) * 4;
+    img->data = (unsigned char*)malloc(img->width * img->height * 3);
+    fseek(fp, fileHeader.bfOffBits, SEEK_SET);
+    for (int i = 0; i < img->height; i++) {
+        fread(img->data + i * img->width * 3, 1, img->width * 3, fp);
+        fseek(fp, row_padded - img->width * 3, SEEK_CUR);
+    }
+    fclose(fp);
+    return img;
+}
+
+
+void free_image(Image* img) {
+    if (img) {
+        if (img->data) free(img->data);
+        free(img);
+    }
+}
+
+
+int writeBMP(const char* filename, const Image* img) {
+    FILE* fp = fopen(filename, "wb");
+    int row_padded = ((img->width * 3 + 3) / 4) * 4;
+    int fileSize = 54 + row_padded * img->height;
+    unsigned char bmpfileheader[14] = { 'B','M', 0,0,0,0, 0,0, 0,0, 54,0,0,0 };
+    unsigned char bmpinfoheader[40] = { 0 };
+    unsigned char bmppad[3] = { 0,0,0 };
+    bmpfileheader[2] = (unsigned char)(fileSize);
+    bmpfileheader[3] = (unsigned char)(fileSize >> 8);
+    bmpfileheader[4] = (unsigned char)(fileSize >> 16);
+    bmpfileheader[5] = (unsigned char)(fileSize >> 24);
+    bmpinfoheader[0] = 40;
+    bmpinfoheader[4] = (unsigned char)(img->width);
+    bmpinfoheader[5] = (unsigned char)(img->width >> 8);
+    bmpinfoheader[6] = (unsigned char)(img->width >> 16);
+    bmpinfoheader[7] = (unsigned char)(img->width >> 24);
+    bmpinfoheader[8] = (unsigned char)(img->height);
+    bmpinfoheader[9] = (unsigned char)(img->height >> 8);
+    bmpinfoheader[10] = (unsigned char)(img->height >> 16);
+    bmpinfoheader[11] = (unsigned char)(img->height >> 24);
+    bmpinfoheader[12] = 1;
+    bmpinfoheader[14] = 24;
+    fwrite(bmpfileheader, 1, 14, fp);
+    fwrite(bmpinfoheader, 1, 40, fp);
+    for (int i = 0; i < img->height; i++) {
+        fwrite(img->data + i * img->width * 3, 1, img->width * 3, fp);
+        fwrite(bmppad, 1, row_padded - img->width * 3, fp);
+    }
+    fclose(fp);
+    return 1;
 }
 
 // === Interpolation Function ===
-// Bilinear interpolation used during remapping to get smooth pixel values between known pixel coordinates.
-cv::Vec3b interpolation(const cv::Mat& img, float x, float y) {
-    int x0 = static_cast<int>(std::floor(x));
-    int y0 = static_cast<int>(std::floor(y));
+void interpolation(const Image* img, float x, float y, unsigned char* result) {
+    int x0 = (int)floorf(x);
+    int y0 = (int)floorf(y);
     float dx = x - x0;
     float dy = y - y0;
-    if (x0 < 0 || x0 >= img.cols - 1 || y0 < 0 || y0 >= img.rows - 1)
-        return cv::Vec3b(0, 0, 0);
-    cv::Vec3b p00 = img.at<cv::Vec3b>(y0, x0);
-    cv::Vec3b p10 = img.at<cv::Vec3b>(y0, x0 + 1);
-    cv::Vec3b p01 = img.at<cv::Vec3b>(y0 + 1, x0);
-    cv::Vec3b p11 = img.at<cv::Vec3b>(y0 + 1, x0 + 1);
-    cv::Vec3b result;
+
+    for (int c = 0; c < 3; ++c) result[c] = 0;
+
+    if (x0 < 0 || x0 >= img->width - 1 || y0 < 0 || y0 >= img->height - 1) return;
+
     for (int c = 0; c < 3; ++c) {
-        float val = (1 - dx) * (1 - dy) * p00[c] + dx * (1 - dy) * p10[c] + (1 - dx) * dy * p01[c] + dx * dy * p11[c];
-        result[c] = cv::saturate_cast<uchar>(val);
+        float p00 = PIXEL(img, y0, x0, c);
+        float p10 = PIXEL(img, y0, x0 + 1, c);
+        float p01 = PIXEL(img, y0 + 1, x0, c);
+        float p11 = PIXEL(img, y0 + 1, x0 + 1, c);
+        float val = (1 - dx) * (1 - dy) * p00 + dx * (1 - dy) * p10 + (1 - dx) * dy * p01 + dx * dy * p11;
+        result[c] = (unsigned char)(val > 255 ? 255 : (val < 0 ? 0 : val));
     }
-    return result;
 }
 
-// === Manual Undistortion ===
-// Removes lens distortion from the input image using the camera intrinsics and distortion coefficients.
-cv::Mat manualUndistort(const cv::Mat& img) {
-    cv::Mat output(camera_height, camera_width, img.type(), cv::Scalar(0, 0, 0));
-    for (int v = 0; v < camera_height; ++v) {
-        for (int u = 0; u < camera_width; ++u) {
-            float x = (u - cx) / fx;
-            float y = (v - cy) / fy;
+
+
+
+// === Manual Undistortion Function ===
+Image* Undistort(const Image* img) {
+    Image* output = (Image*)malloc(sizeof(Image));
+    output->width = img->width;
+    output->height = img->height;
+    output->channels = 3;
+    output->data = (unsigned char*)calloc(img->width * img->height * 3, sizeof(unsigned char));
+
+    for (int v = 0; v < img->height; ++v) {
+        for (int u = 0; u < img->width; ++u) {
+            float x = (u - cx_new) / fx_new;
+            float y = (v - cy_new) / fy_new;
             float r2 = x * x + y * y;
-            float radial = 1 + distortion_k1 * r2 + distortion_k2 * r2 * r2 + distortion_k3 * r2 * r2 * r2;
-            float dx = 2 * distortion_p1 * x * y + distortion_p2 * (r2 + 2 * x * x);
-            float dy = distortion_p1 * (r2 + 2 * y * y) + 2 * distortion_p2 * x * y;
+
+            float radial = 1 + K1 * r2 + K2 * r2 * r2 + K3 * r2 * r2 * r2;
+            float dx = 2 * P1 * x * y + P2 * (r2 + 2 * x * x);
+            float dy = P1 * (r2 + 2 * y * y) + 2 * P2 * x * y;
+
             float x_dist = x * radial + dx;
             float y_dist = y * radial + dy;
-            float u_d = x_dist * fx_original + cx_original;
-            float v_d = y_dist * fy_original + cy_original;
-            output.at<cv::Vec3b>(v, u) = interpolation(img, u_d, v_d);
+
+            float u_d = x_dist * fx + cx;
+            float v_d = y_dist * fy + cy;
+
+            unsigned char pixel[3];
+            interpolation(img, u_d, v_d, pixel);
+
+            for (int c = 0; c < 3; ++c) {
+                PIXEL(output, v, u, c) = pixel[c];
+            }
         }
     }
     return output;
 }
 
-// === Affine Transformation ===
-// Applies rotation and vertical translation to simulate stabilization.
-cv::Mat applyManualAffine(const cv::Mat& img, float angle_deg, float translate_y) {
-    int w = img.cols, h = img.rows;
+
+
+
+
+// === Affine Transformation Function ===
+Image* affineTransform(const Image* img, float angle_deg, float translate_y) {
+    int w = img->width, h = img->height;
     float angle_rad = angle_deg * M_PI / 180.0f;
-    float cos_a = std::cos(angle_rad);
-    float sin_a = std::sin(angle_rad);
+    float cos_a = cosf(angle_rad);
+    float sin_a = sinf(angle_rad);
     float cx_center = w / 2.0f, cy_center = h / 2.0f;
-    cv::Mat output(h, w, img.type(), cv::Scalar(0, 0, 0));
+
+    Image* output = (Image*)malloc(sizeof(Image));
+    output->width = w;
+    output->height = h;
+    output->channels = 3;
+    output->data = (unsigned char*)calloc(w * h * 3, sizeof(unsigned char));
+
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
-            float dx = x - cx_center, dy = y - cy_center - translate_y;
+            float dx = x - cx_center;
+            float dy = y - cy_center - translate_y;
             float src_x = cos_a * dx + sin_a * dy + cx_center;
             float src_y = -sin_a * dx + cos_a * dy + cy_center;
-            output.at<cv::Vec3b>(y, x) = interpolation(img, src_x, src_y);
+            unsigned char pixel[3];
+            interpolation(img, src_x, src_y, pixel);
+            for (int c = 0; c < 3; ++c) {
+                PIXEL(output, y, x, c) = pixel[c];
+            }
         }
     }
+    printf("Affine applied with angle=%.2f, shift=%.2f\n", angle_deg, translate_y);
+
     return output;
 }
 
 // === Cylindrical Projection Map Generator ===
-// Precomputes maps for remapping a rectilinear image to cylindrical coordinates based on field of view.
-void generateCylindricalRemap(cv::Mat& map_x, cv::Mat& map_y, int width, int height, float fov_deg = 60.0f, float angle_deg = 0.0f) {
-    float fov_rad = fov_deg * M_PI / 180.0f, angle_rad = angle_deg * M_PI / 180.0f;
-    float fx_proj = width / (2.0f * std::tan(fov_rad / 2.0f));
-    float fy_proj = fx_proj;
-    float cx_proj = width / 2.0f, cy_proj = height / 2.0f;
-    map_x = cv::Mat(height, width, CV_32FC1);
-    map_y = cv::Mat(height, width, CV_32FC1);
-    for (int y = 0; y < height; ++y) {
-        for (int x = 0; x < width; ++x) {
-            float theta = (x - cx_proj) / fx_proj + angle_rad;
-            float h_ = (y - cy_proj) / fy_proj;
-            float X = std::sin(theta), Y = h_, Z = std::cos(theta);
-            float x_ = fx_proj * X / Z + cx_proj;
-            float y_ = fy_proj * Y / Z + cy_proj;
-            map_x.at<float>(y, x) = x_;
-            map_y.at<float>(y, x) = y_;
+void generateCylindricalRemap(Image** map_x, Image** map_y, int width, int height, float fov_deg, float x_shift)
+{
+    float fov_rad = fov_deg * (M_PI / 180.0f);
+    float focal_length = width / (2.0f * tanf(fov_rad / 2.0f));
+    float cx_cyl = width / 2.0f;
+    float cy_cyl = height / 2.0f;
+
+    *map_x = (Image*)malloc(sizeof(Image));
+    *map_y = (Image*)malloc(sizeof(Image));
+
+    (*map_x)->width = width;
+    (*map_x)->height = height;
+    (*map_x)->channels = 1;
+    (*map_x)->data = (unsigned char*)malloc(width * height * sizeof(float));
+
+    (*map_y)->width = width;
+    (*map_y)->height = height;
+    (*map_y)->channels = 1;
+    (*map_y)->data = (unsigned char*)malloc(width * height * sizeof(float));
+
+    for (int y = 0; y < height; ++y)
+    {
+        for (int x = 0; x < width; ++x)
+        {
+            float theta = (x - cx_cyl + x_shift) / focal_length;
+            float h = (y - cy_cyl) / focal_length;
+
+            float x_source = sinf(theta);
+            float y_source = h;
+            float z_source = cosf(theta);
+
+            float src_x = fx * (x_source / z_source) + cx;
+            float src_y = fy * (y_source / z_source) + cy;
+
+            int index = y * width + x;
+            ((float*)(*map_x)->data)[index] = src_x;
+            ((float*)(*map_y)->data)[index] = src_y;
         }
     }
 }
 
-// === Cylindrical Remapping ===
-// Uses precomputed cylindrical maps (map_x, map_y) to remap the input image
-// to a cylindrical projection. This method enhances visual consistency in panorama stitching.
-cv::Mat cylindricalRemap(const cv::Mat& img, const cv::Mat& map_x, const cv::Mat& map_y) {
-    cv::Mat output(img.rows, img.cols, img.type(), cv::Scalar(0, 0, 0));
-    for (int y = 0; y < img.rows; ++y) {
-        for (int x = 0; x < img.cols; ++x) {
-            float src_x = map_x.at<float>(y, x);
-            float src_y = map_y.at<float>(y, x);
-            output.at<cv::Vec3b>(y, x) = interpolation(img, src_x, src_y);
+
+void generateInverseCylindricalRemap(Image** map_x, Image** map_y, int width, int height, float fov_deg, float x_shift) {
+    float fov_rad = fov_deg * (M_PI / 180.0f);
+    float focal_length = width / (2.0f * tanf(fov_rad / 2.0f));  // same as before
+    float cx_cyl = width / 2.0f;
+    float cy_cyl = height / 2.0f;
+
+    *map_x = (Image*)malloc(sizeof(Image));
+    *map_y = (Image*)malloc(sizeof(Image));
+
+    (*map_x)->width = width;
+    (*map_x)->height = height;
+    (*map_x)->channels = 1;
+    (*map_x)->data = (unsigned char*)malloc(width * height * sizeof(float));
+
+    (*map_y)->width = width;
+    (*map_y)->height = height;
+    (*map_y)->channels = 1;
+    (*map_y)->data = (unsigned char*)malloc(width * height * sizeof(float));
+
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            // Planar coordinates
+            float x_plane = x - CX;  // adjust according to real cx
+            float y_plane = y - CY;
+
+            // Back-project into 3D direction (unnormalized)
+            float X = x_plane / FX;
+            float Y = y_plane / FY;
+            float Z = 1.0f;
+
+            // Convert to cylindrical (theta, h)
+            float theta = atan2f(X, Z);
+            float h = Y / sqrtf(X * X + Z * Z + Y * Y);  // normalized height
+
+            // Now map to cylindrical image coordinates
+            float x_cyl = focal_length * theta + cx_cyl - x_shift;
+            float y_cyl = focal_length * h + cy_cyl;
+
+            int idx = y * width + x;
+            ((float*)(*map_x)->data)[idx] = x_cyl;
+            ((float*)(*map_y)->data)[idx] = y_cyl;
+        }
+    }
+}
+
+
+// === Cylindrical Remapping Function ===
+Image* cylindricalRemap(const Image* img, const Image* map_x, const Image* map_y) {
+    Image* output = (Image*)malloc(sizeof(Image));
+    output->width = img->width;
+    output->height = img->height;
+    output->channels = img->channels;
+    output->data = (unsigned char*)calloc(img->width * img->height * img->channels, sizeof(unsigned char));
+
+    for (int y = 0; y < img->height; ++y) {
+        for (int x = 0; x < img->width; ++x) {
+            int index = y * img->width + x;
+            float src_x = ((float*)map_x->data)[index];
+            float src_y = ((float*)map_y->data)[index];
+
+            unsigned char pixel[3];
+            interpolation(img, src_x, src_y, pixel);
+
+            for (int c = 0; c < 3; ++c) {
+                PIXEL(output, y, x, c) = pixel[c];
+            }
         }
     }
     return output;
 }
 
-// === Convert Roll-Pitch-Yaw from One System to Another ===
-// Converts RPY angles from one system (e.g., Cam1) to another (e.g., Cam2) using offset correction.
-// It builds rotation matrices from Euler angles and combines them to derive new RPY values.
-cv::Vec3f convert_rpy_Sensor_to_cam(double roll_sys1, double pitch_sys1, double yaw_offset, double pitch_offset = 0.0, double roll_offset = 0.0) {
-    double roll_rad = roll_sys1 * M_PI / 180.0, pitch_rad = pitch_sys1 * M_PI / 180.0;
-    double roll_offset_rad = roll_offset * M_PI / 180.0, pitch_offset_rad = pitch_offset * M_PI / 180.0;
-    double yaw_offset_rad = yaw_offset * M_PI / 180.0;
 
-    // Build rotation from system 1 angles (Roll * Pitch)
-    cv::Matx33d Rx = { 1, 0, 0, 0, cos(roll_rad), -sin(roll_rad), 0, sin(roll_rad), cos(roll_rad) };
-    cv::Matx33d Ry = { cos(pitch_rad), 0, sin(pitch_rad), 0, 1, 0, -sin(pitch_rad), 0, cos(pitch_rad) };
-    cv::Matx33d R_sys1 = Rx * Ry;
-
-    // Build rotation from offsets (Yaw * Pitch * Roll)
-    cv::Matx33d R_roll_offset = { 1, 0, 0, 0, cos(roll_offset_rad), -sin(roll_offset_rad), 0, sin(roll_offset_rad), cos(roll_offset_rad) };
-    cv::Matx33d R_pitch_offset = { cos(pitch_offset_rad), 0, sin(pitch_offset_rad), 0, 1, 0, -sin(pitch_offset_rad), 0, cos(pitch_offset_rad) };
-    cv::Matx33d R_yaw_offset = { cos(yaw_offset_rad), -sin(yaw_offset_rad), 0, sin(yaw_offset_rad), cos(yaw_offset_rad), 0, 0, 0, 1 };
-    cv::Matx33d R_offset = R_yaw_offset * R_pitch_offset * R_roll_offset;
-
-    // Final transformed rotation matrix
-    cv::Matx33d R_sysX = R_sys1 * R_offset;
-
-    // Convert back to Euler angles (Roll-Pitch-Yaw) using XYZ convention
-    double pitchX = asin(-R_sysX(2, 0));
-    double cy = cos(pitchX), rollX, yawX;
-    if (std::abs(cy) > 1e-6) {
-        rollX = atan2(R_sysX(2, 1), R_sysX(2, 2));
-        yawX = atan2(R_sysX(1, 0), R_sysX(0, 0));
-    }
-    else {
-        rollX = 0;
-        yawX = atan2(-R_sysX(0, 1), R_sysX(1, 1));
-    }
-
-    return cv::Vec3f(rollX * 180.0 / M_PI, pitchX * 180.0 / M_PI, yawX * 180.0 / M_PI);
-}
-
-cv::Mat manualHConcat(const std::vector<cv::Mat>& frames) {
-    if (frames.empty()) return cv::Mat();
-
-    int total_width = 0;
-    int height = frames[0].rows;
-    int type = frames[0].type();
-
-    // Calculate total width
-    for (const auto& img : frames) {
-        if (img.rows != height || img.type() != type) {
-            std::cerr << "Error: All images must have same height and type.\n";
-            return cv::Mat();
-        }
-        total_width += img.cols;
-    }
-
-    // Create blank output image
-    cv::Mat result(height, total_width, type, cv::Scalar(0));
-
-    // Copy each image into the correct horizontal slot
-    int current_x = 0;
-    for (const auto& img : frames) {
-        for (int y = 0; y < height; ++y) {
-            for (int x = 0; x < img.cols; ++x) {
-                result.at<cv::Vec3b>(y, current_x + x) = img.at<cv::Vec3b>(y, x);
-            }
-        }
-        current_x += img.cols;
-    }
-
-    return result;
-}
-
-
-
-cv::Mat manualCrop(const cv::Mat& frame, int start_x, int start_y, int crop_w, int crop_h) {
-    cv::Mat cropped(crop_h, crop_w, frame.type(), cv::Scalar(0, 0, 0));
+// === Manual Crop Function ===
+Image* cropFrame(const Image* img, int start_x, int start_y, int crop_w, int crop_h) {
+    Image* cropped = (Image*)malloc(sizeof(Image));
+    cropped->width = crop_w;
+    cropped->height = crop_h;
+    cropped->channels = img->channels;
+    cropped->data = (unsigned char*)calloc(crop_w * crop_h * img->channels, sizeof(unsigned char));
 
     for (int y = 0; y < crop_h; ++y) {
         for (int x = 0; x < crop_w; ++x) {
             int src_x = start_x + x;
             int src_y = start_y + y;
-
-            // Safety check for bounds
-            if (src_x >= 0 && src_x < frame.cols && src_y >= 0 && src_y < frame.rows) {
-                cropped.at<cv::Vec3b>(y, x) = frame.at<cv::Vec3b>(src_y, src_x);
+            if (src_x >= 0 && src_x < img->width && src_y >= 0 && src_y < img->height) {
+                for (int c = 0; c < img->channels; ++c) {
+                    PIXEL(cropped, y, x, c) = PIXEL(img, src_y, src_x, c);
+                }
             }
         }
     }
-
     return cropped;
 }
 
 // === Center Crop Function ===
-// Extracts a centered sub-region from the input image based on height and width scaling factors.
-cv::Mat centerCropOnly(const cv::Mat& frame, float crop_scale_h, float crop_scale_w) {
-    int h = frame.rows, w = frame.cols;
-    int crop_h = static_cast<int>(h * crop_scale_h);
-    int crop_w = static_cast<int>(w * crop_scale_w);
-    int start_y = (h - crop_h) / 2;
-    int start_x = (w - crop_w) / 2;
-    return manualCrop(frame, start_x, start_y, crop_w, crop_h);
+Image* cropFrameHW(const Image* img, float crop_scale_h, float crop_scale_w) {
+    int crop_h = (int)(img->height * crop_scale_h);
+    int crop_w = (int)(img->width * crop_scale_w);
+    int start_y = (img->height - crop_h) / 2;
+    int start_x = (img->width - crop_w) / 2;
+    return cropFrame(img, start_x, start_y, crop_w, crop_h);
+}
 
+Image* featherBlendConcat(const std::vector<Image*>& frames, int overlap) {
+    if (frames.empty()) return NULL;
+
+    int height = frames[0]->height;
+    int channels = frames[0]->channels;
+    int total_width = frames[0]->width;
+
+    for (int i = 1; i < frames.size(); ++i)
+        total_width += (frames[i]->width - overlap);
+
+    Image* result = (Image*)malloc(sizeof(Image));
+    result->width = total_width;
+    result->height = height;
+    result->channels = channels;
+    result->data = (unsigned char*)calloc(total_width * height * channels, sizeof(unsigned char));
+
+    int current_x = 0;
+    for (int i = 0; i < frames.size(); ++i) {
+        Image* img = frames[i];
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < img->width; ++x) {
+                int out_x = current_x + x;
+
+                if (i > 0 && x < overlap) {
+                    float alpha = (float)x / (float)overlap;
+                    for (int c = 0; c < channels; ++c) {
+                        unsigned char prev = PIXEL(result, y, out_x, c);
+                        unsigned char curr = PIXEL(img, y, x, c);
+                        PIXEL(result, y, out_x, c) = (unsigned char)((1 - alpha) * prev + alpha * curr);
+                    }
+                }
+                else {
+                    for (int c = 0; c < channels; ++c) {
+                        PIXEL(result, y, out_x, c) = PIXEL(img, y, x, c);
+                    }
+                }
+            }
+        }
+        current_x += (img->width - overlap);
+    }
+
+    return result;
+}
+
+
+
+void convert_rpy_sensor_to_cam(
+    double roll_sys1, double pitch_sys1, double yaw_offset,
+    double pitch_offset, double roll_offset,
+    float* roll_deg_out, float* pitch_deg_out, float* yaw_deg_out
+) {
+    // Convert to radians
+    double roll_rad = roll_sys1 * M_PI / 180.0;
+    double pitch_rad = pitch_sys1 * M_PI / 180.0;
+    double roll_offset_rad = roll_offset * M_PI / 180.0;
+    double pitch_offset_rad = pitch_offset * M_PI / 180.0;
+    double yaw_offset_rad = yaw_offset * M_PI / 180.0;
+
+    // Rotation matrix Rx (roll)
+    double Rx[3][3] = {
+        {1, 0, 0},
+        {0, cos(roll_rad), -sin(roll_rad)},
+        {0, sin(roll_rad),  cos(roll_rad)}
+    };
+
+    // Rotation matrix Ry (pitch)
+    double Ry[3][3] = {
+        {cos(pitch_rad), 0, sin(pitch_rad)},
+        {0, 1, 0},
+        {-sin(pitch_rad), 0, cos(pitch_rad)}
+    };
+
+    // R_sys1 = Rx * Ry
+    double R_sys1[3][3];
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            R_sys1[i][j] = Rx[i][0] * Ry[0][j] + Rx[i][1] * Ry[1][j] + Rx[i][2] * Ry[2][j];
+
+    // Rotation matrices for offsets
+    double R_roll_offset[3][3] = {
+        {1, 0, 0},
+        {0, cos(roll_offset_rad), -sin(roll_offset_rad)},
+        {0, sin(roll_offset_rad),  cos(roll_offset_rad)}
+    };
+    double R_pitch_offset[3][3] = {
+        {cos(pitch_offset_rad), 0, sin(pitch_offset_rad)},
+        {0, 1, 0},
+        {-sin(pitch_offset_rad), 0, cos(pitch_offset_rad)}
+    };
+    double R_yaw_offset[3][3] = {
+        {cos(yaw_offset_rad), -sin(yaw_offset_rad), 0},
+        {sin(yaw_offset_rad),  cos(yaw_offset_rad), 0},
+        {0, 0, 1}
+    };
+
+    // R_offset = R_yaw * R_pitch * R_roll
+    double R_temp[3][3], R_offset[3][3];
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            R_temp[i][j] = R_yaw_offset[i][0] * R_pitch_offset[0][j] +
+            R_yaw_offset[i][1] * R_pitch_offset[1][j] +
+            R_yaw_offset[i][2] * R_pitch_offset[2][j];
+
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            R_offset[i][j] = R_temp[i][0] * R_roll_offset[0][j] +
+            R_temp[i][1] * R_roll_offset[1][j] +
+            R_temp[i][2] * R_roll_offset[2][j];
+
+    // Final rotation R_sysX = R_sys1 * R_offset
+    double R_sysX[3][3];
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            R_sysX[i][j] = R_sys1[i][0] * R_offset[0][j] +
+            R_sys1[i][1] * R_offset[1][j] +
+            R_sys1[i][2] * R_offset[2][j];
+
+    // Extract Euler angles
+    double pitchX = asin(-R_sysX[2][0]);
+    double cy = cos(pitchX);
+    double rollX, yawX;
+
+    if (fabs(cy) > 1e-6) {
+        rollX = atan2(R_sysX[2][1], R_sysX[2][2]);
+        yawX = atan2(R_sysX[1][0], R_sysX[0][0]);
+    }
+    else {
+        rollX = 0;
+        yawX = atan2(-R_sysX[0][1], R_sysX[1][1]);
+    }
+
+    *roll_deg_out = (float)(rollX * 180.0 / M_PI);
+    *pitch_deg_out = (float)(pitchX * 180.0 / M_PI);
+    *yaw_deg_out = (float)(yawX * 180.0 / M_PI);
 }
 
 std::wstring StringToWString(const std::string& str)
@@ -288,7 +558,7 @@ std::string WStringToUtf8(const std::wstring& wstr)
     return result;
 }
 
-std::string SaveImageFilePath(const std::wstring& captureDir, const std::wstring&prefix)
+std::string SaveImageFilePath(const std::wstring& captureDir, const std::wstring& prefix)
 {
     SYSTEMTIME st;
     GetLocalTime(&st);
@@ -303,30 +573,25 @@ std::string SaveImageFilePath(const std::wstring& captureDir, const std::wstring
     return WStringToUtf8(widePath);
 }
 
-
-
-
-
 int main() {
+    
+    Image* map_x, * map_y;
+    generateCylindricalRemap(&map_x, &map_y, WIDTH, HEIGHT, cylindrical_fov_deg, 0.0f);
+    
     wchar_t szPath[MAX_PATH] = L"";
     GetModuleFileNameW(NULL, szPath, MAX_PATH);
 
-    // 2. filesystem으로 경로 파싱
     std::filesystem::path exePath(szPath);
-
-    // 3. 확장자를 .ini로 변경
     std::filesystem::path iniPath = exePath;
     iniPath.replace_extension(L".ini");
-	INIManager iniManager(iniPath);
+    INIManager iniManager(iniPath);
 
     PathRemoveFileSpecW(szPath);
     std::wstring dirCapture = std::wstring(szPath) + L"\\Capture";
-    CreateDirectoryW(dirCapture.c_str(), NULL);  // 이미 존재하면 무시
+    CreateDirectoryW(dirCapture.c_str(), NULL);
 
-	// 4. ini 파일에서 설정 읽기
-    const int num_cams = 6;
     std::vector<std::string> filenames;
-    for (int i = 0; i < num_cams; ++i) {
+    for (int i = 0; i < NUM_CAMS; ++i) {
         std::wstring key = L"file_" + std::to_wstring(i);
         std::wstring val = iniManager.ReadString(L"images", key, L"");
         filenames.push_back(WStringToUtf8(val));
@@ -336,120 +601,92 @@ int main() {
     std::vector<float> pitch_offset_cam = iniManager.ReadFloatArray(L"offset", L"pitch");
     std::vector<float> roll_offset_cam = iniManager.ReadFloatArray(L"offset", L"roll");
 
-    // 파일 경로 출력
-    std::cout << "[image list]" << std::endl;
-    for (size_t i = 0; i < filenames.size(); ++i) {
-        std::cout << "  file_" << i << ": " << filenames[i] << std::endl;
-    }
-
-    // 오프셋 출력 함수 (재사용 가능)
-    auto printOffsets = [](const std::string& label, const std::vector<float>& values) {
-        std::cout << "\n[" << label << "]" << std::endl;
-        for (size_t i = 0; i < values.size(); ++i) {
-            std::cout << "  " << label << "_" << i << ": " << values[i] << std::endl;
-        }
-        };
-
-    printOffsets("yaw_offset_cam", yaw_offset_cam);
-    printOffsets("pitch_offset_cam", pitch_offset_cam);
-    printOffsets("roll_offset_cam", roll_offset_cam);
-
-    //std::cout << "\n........Processing........" << std::endl;
-    // Setup camera intrinsic and distortion parameters
-    cv::Mat K = (cv::Mat_<double>(3, 3) << fx_original, 0, cx_original, 0, fy_original, cy_original, 0, 0, 1);
-    cv::Mat dist = (cv::Mat_<double>(1, 5) << distortion_k1, distortion_k2, distortion_p1, distortion_p2, distortion_k3);
-    cv::Mat newK = cv::getOptimalNewCameraMatrix(K, dist, cv::Size(camera_width, camera_height), 1);
-    fx = static_cast<float>(newK.at<double>(0, 0));
-    fy = static_cast<float>(newK.at<double>(1, 1));
-    cx = static_cast<float>(newK.at<double>(0, 2));
-    cy = static_cast<float>(newK.at<double>(1, 2));    
-
-    // Create cylindrical remaps for each cam
-    std::vector<cv::Mat> map_x_list(num_cams), map_y_list(num_cams);
-    for (int i = 0; i < num_cams; ++i)
-        generateCylindricalRemap(map_x_list[i], map_y_list[i], camera_width, camera_height, cylindrical_fov_deg, 0.0f);
-
-    // Read images
-    std::vector<cv::Mat> frames(num_cams);
-    for (int i = 0; i < num_cams; ++i) {
-        frames[i] = cv::imread(filenames[i]);
-        if (frames[i].empty()) {
-            std::cerr << "Failed to load " << filenames[i] << std::endl;
-            return -1;
-        }
-    }
-
     float roll_Sensor = iniManager.ReadFloat(L"Sensor_Orientation", L"roll", 5.25f);
     float pitch_Sensor = iniManager.ReadFloat(L"Sensor_Orientation", L"pitch", -0.75f);
     float yaw_Sensor = iniManager.ReadFloat(L"Sensor_Orientation", L"yaw", 0.0f);
 
-    std::cout << "\n[Sensor_Orientation]" << std::endl;
-    std::cout << "  roll_Sensor: " << roll_Sensor << std::endl;
-    std::cout << "  pitch_Sensor: " << pitch_Sensor << std::endl;
-    std::cout << "  yaw_Sensor: " << yaw_Sensor << std::endl;
+    printf("\n........Processing........\n");
 
 
-    std::cout << "\n........Processing........" << std::endl;
+    std::vector<Image*> frames(NUM_CAMS);
+    std::vector<Image*> stabilized_frames;
+    std::vector<Image*> original_frames;
 
 
-    std::vector<cv::Mat> stabilized_frames, original_frames;
-    std::vector<std::string> annotations;
 
-    for (int cam_idx = 0; cam_idx < num_cams; ++cam_idx) {
-        auto rpy_cam_transformed = convert_rpy_Sensor_to_cam(
+
+    for (int cam_idx = 0; cam_idx < NUM_CAMS; ++cam_idx) {
+        float roll_cam = 0, pitch_cam = 0, yaw_cam = 0;
+        convert_rpy_sensor_to_cam(
             roll_Sensor, pitch_Sensor,
             yaw_offset_cam[cam_idx],
             pitch_offset_cam[cam_idx],
-            roll_offset_cam[cam_idx]
+            roll_offset_cam[cam_idx],
+            &roll_cam, &pitch_cam, &yaw_cam
         );
 
-        double roll_cam = rpy_cam_transformed[0];
-        double pitch_cam = rpy_cam_transformed[1];
-        int y_shift = static_cast<int>(pitch_to_translation_factor * pitch_cam);
+        int y_shift = (int)(PITCH_TO_TRANSLATION_FACTOR * pitch_cam);
+        frames[cam_idx] = readBMP(filenames[cam_idx].c_str());
 
-        cv::Mat undistorted = manualUndistort(frames[cam_idx]);
-        cv::Mat f_orig = centerCropOnly(undistorted.clone(), original_crop_height_scale, original_crop_width_scale);
+        if (!frames[cam_idx]) {
+            printf("[ERROR] Failed to read image for camera %d: %s\n", cam_idx, filenames[cam_idx].c_str());
+            continue;
+        }
 
-        cv::Mat affine = applyManualAffine(undistorted, roll_cam, static_cast<float>(y_shift));
-        cv::Mat projected = cylindricalRemap(affine, map_x_list[cam_idx], map_y_list[cam_idx]);
-        cv::Mat cropped = centerCropOnly(projected, panorama_crop_height_scale, panorama_crop_width_scale);
+        printf("[INFO] Camera %d: Width = %d, Height = %d\n",
+            cam_idx, frames[cam_idx]->width, frames[cam_idx]->height);
+
+        //Image* undistorted = Undistort(frames[cam_idx]);
+        Image* f_orig = frames[cam_idx]; //cropFrameHW(frames[cam_idx], original_crop_height_scale, original_crop_width_scale);
+        
+
+        
+        // The frame processing pipeline 
+        Image* undistorted = Undistort(frames[cam_idx]);
+        Image* projected = cylindricalRemap(undistorted, map_x, map_y);
+        Image* affine = affineTransform(projected, -roll_cam, -(float)y_shift);
+        Image* cropped = cropFrameHW(affine, panorama_crop_height_scale, panorama_crop_width_scale);
 
         stabilized_frames.push_back(cropped);
         original_frames.push_back(f_orig);
 
-        std::ostringstream oss;
-        oss << "Cam" << cam_idx << " - R:" << roll_cam << " P:" << pitch_cam << " Y:" << yaw_Sensor;
-        annotations.push_back(oss.str());
+        //// Save each original frame
+        //wchar_t label[32];
+        //swprintf_s(label, L"original_cam%d", cam_idx);
+        //std::string frame_path = SaveImageFilePath(dirCapture, label);
+        //writeBMP(frame_path.c_str(), f_orig);
+        //printf("[Saved Original] %s\n", frame_path.c_str());
+
+        //// Save each undistorted frame
+        //
+        //swprintf_s(label, L"affine_cam%d", cam_idx);
+        //std::string frame_path2 = SaveImageFilePath(dirCapture, label);
+        //writeBMP(frame_path2.c_str(), affine);
+        //printf("[Saved undistorted] %s\n", frame_path2.c_str());
+
+        
+        free(undistorted->data); free(undistorted);
+        free(affine->data); free(affine);
+        free(projected->data); free(projected);
     }
 
-    cv::Mat panorama, original;
-    panorama = manualHConcat(stabilized_frames);
-    original = manualHConcat(original_frames);
 
 
-    for (size_t i = 0; i < annotations.size(); ++i) {
-        cv::putText(
-            panorama,
-            annotations[i],
-            cv::Point(30, 50 + static_cast<int>(i) * 40), // stacked vertically
-            cv::FONT_HERSHEY_SIMPLEX,
-            0.8,
-            cv::Scalar(255, 255, 0),
-            2
-        );
-    }
+    Image* panorama = featherBlendConcat(stabilized_frames, 100);
+
+
+    Image* original = featherBlendConcat(original_frames,576);
 
     std::string original_path = SaveImageFilePath(dirCapture, L"original");
     std::string result_path = SaveImageFilePath(dirCapture, L"panorama");
 
-    cv::imwrite(original_path, original);
-    cv::imwrite(result_path, panorama);
+    writeBMP(original_path.c_str(), original);
+    writeBMP(result_path.c_str(), panorama);
 
-	std::string msg = "\n[Save files]\n" + original_path + "\n" + result_path ;
-    std::cout << msg << std::endl;
+    printf("\n[Save files]\n%s\n%s\n", original_path.c_str(), result_path.c_str());
+
+    free(map_x->data); free(map_x);
+    free(map_y->data); free(map_y);
 
     return 0;
 }
-
-
-
