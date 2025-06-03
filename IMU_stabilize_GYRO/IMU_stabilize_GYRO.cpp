@@ -21,38 +21,19 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-#define WIDTH 1920
-#define HEIGHT 1080
-#define FX 1204.505857f
-#define FY 1204.505857f
-#define CX (WIDTH / 2.0f)
-#define CY (HEIGHT / 2.0f)
-#define K1 -0.343698f
-#define K2 0.105503f
-#define K3 0.0f
-#define P1 -0.001558f
-#define P2 -0.002416f
-#define NUM_CAMS 6
-#define BUFFER_LINES 15
-#define OVERLAP_RATIO 0.1f
-#define NON_OVERLAP_WIDTH (int)(WIDTH * (1.0f - OVERLAP_RATIO))
-#define PANORAMA_WIDTH (int)(6 * WIDTH - 5 * WIDTH * OVERLAP_RATIO)
-#define PITCH_TO_TRANSLATION_FACTOR -17.44153917818162f
-#define YAW_TO_TRANSLATION_FACTOR 17.84f
+// === Global Parameters ===
+int WIDTH, HEIGHT, NUM_CAMS, BUFFER_LINES;
+float fx, fy, cx, cy;
+float K1, K2, K3, P1, P2;
+float fx_new = 864.452f, fy_new = 860.023f, cx_new = 947.559f, cy_new = 534.965f;  // keep default if not overridden
 
-const float cylindrical_fov_deg = 60.0f;
-const float panorama_crop_height_scale = 0.80f;
-const float panorama_crop_width_scale = 0.8f;
-const float original_crop_height_scale = 0.7f;
-const float original_crop_width_scale = 0.54f;
+float cylindrical_fov_deg;
+float panorama_crop_height_scale, panorama_crop_width_scale;
+float original_crop_height_scale, original_crop_width_scale;
+float PITCH_TO_TRANSLATION_FACTOR, YAW_TO_TRANSLATION_FACTOR;
+float OVERLAP_RATIO;
+int NON_OVERLAP_WIDTH, PANORAMA_WIDTH;
 
-float fx = FX, fy = FY, cx = CX, cy = CY;
-
-// precomputed undistortion reprojection matrix parameters
-float fx_new = 864.452f;
-float fy_new = 860.023f;
-float cx_new = 947.559f;
-float cy_new = 534.965f;
 
 
 #pragma pack(push, 1)
@@ -301,50 +282,6 @@ void generateCylindricalRemap(Image** map_x, Image** map_y, int width, int heigh
 }
 
 
-void generateInverseCylindricalRemap(Image** map_x, Image** map_y, int width, int height, float fov_deg, float x_shift) {
-    float fov_rad = fov_deg * (M_PI / 180.0f);
-    float focal_length = width / (2.0f * tanf(fov_rad / 2.0f));  // same as before
-    float cx_cyl = width / 2.0f;
-    float cy_cyl = height / 2.0f;
-
-    *map_x = (Image*)malloc(sizeof(Image));
-    *map_y = (Image*)malloc(sizeof(Image));
-
-    (*map_x)->width = width;
-    (*map_x)->height = height;
-    (*map_x)->channels = 1;
-    (*map_x)->data = (unsigned char*)malloc(width * height * sizeof(float));
-
-    (*map_y)->width = width;
-    (*map_y)->height = height;
-    (*map_y)->channels = 1;
-    (*map_y)->data = (unsigned char*)malloc(width * height * sizeof(float));
-
-    for (int y = 0; y < height; ++y) {
-        for (int x = 0; x < width; ++x) {
-            // Planar coordinates
-            float x_plane = x - CX;  // adjust according to real cx
-            float y_plane = y - CY;
-
-            // Back-project into 3D direction (unnormalized)
-            float X = x_plane / FX;
-            float Y = y_plane / FY;
-            float Z = 1.0f;
-
-            // Convert to cylindrical (theta, h)
-            float theta = atan2f(X, Z);
-            float h = Y / sqrtf(X * X + Z * Z + Y * Y);  // normalized height
-
-            // Now map to cylindrical image coordinates
-            float x_cyl = focal_length * theta + cx_cyl - x_shift;
-            float y_cyl = focal_length * h + cy_cyl;
-
-            int idx = y * width + x;
-            ((float*)(*map_x)->data)[idx] = x_cyl;
-            ((float*)(*map_y)->data)[idx] = y_cyl;
-        }
-    }
-}
 
 
 // === Cylindrical Remapping Function ===
@@ -575,17 +512,62 @@ std::string SaveImageFilePath(const std::wstring& captureDir, const std::wstring
 
 int main() {
     
-    Image* map_x, * map_y;
-    generateCylindricalRemap(&map_x, &map_y, WIDTH, HEIGHT, cylindrical_fov_deg, 0.0f);
     
+    
+    // Get base path
     wchar_t szPath[MAX_PATH] = L"";
     GetModuleFileNameW(NULL, szPath, MAX_PATH);
 
+    // Convert to std::filesystem::path
     std::filesystem::path exePath(szPath);
-    std::filesystem::path iniPath = exePath;
-    iniPath.replace_extension(L".ini");
-    INIManager iniManager(iniPath);
+    std::filesystem::path imuIniPath = exePath;
+    std::filesystem::path paramsIniPath = exePath;
+    imuIniPath.replace_extension(L".ini");                 // IMU_Stabilize_Gyro.ini
+    paramsIniPath.replace_filename(L"parameters.ini");     // parameters.ini in same folder
 
+    // Create INI managers for both
+    INIManager imuIni(imuIniPath);
+    INIManager paramIni(paramsIniPath);
+
+
+    
+
+
+    // === Read from parameters.ini ===
+    WIDTH = paramIni.ReadInteger(L"image", L"width", 1920);
+    HEIGHT = paramIni.ReadInteger(L"image", L"height", 1080);
+    NUM_CAMS = paramIni.ReadInteger(L"image", L"num_cams", 6);
+    BUFFER_LINES = paramIni.ReadInteger(L"image", L"buffer_lines", 15);
+
+    fx = paramIni.ReadFloat(L"calibration", L"fx", 1204.505857f);
+    fy = paramIni.ReadFloat(L"calibration", L"fy", 1204.505857f);
+    float cx_ratio = paramIni.ReadFloat(L"calibration", L"cx_ratio", 0.5f);
+    float cy_ratio = paramIni.ReadFloat(L"calibration", L"cy_ratio", 0.5f);
+    cx = WIDTH * cx_ratio;
+    cy = HEIGHT * cy_ratio;
+
+    K1 = paramIni.ReadFloat(L"calibration", L"k1", -0.343698f);
+    K2 = paramIni.ReadFloat(L"calibration", L"k2", 0.105503f);
+    K3 = paramIni.ReadFloat(L"calibration", L"k3", 0.0f);
+    P1 = paramIni.ReadFloat(L"calibration", L"p1", -0.001558f);
+    P2 = paramIni.ReadFloat(L"calibration", L"p2", -0.002416f);
+
+    cylindrical_fov_deg = paramIni.ReadFloat(L"projection", L"cylindrical_fov_deg", 60.0f);
+
+    panorama_crop_height_scale = paramIni.ReadFloat(L"cropping", L"panorama_crop_height_scale", 0.80f);
+    panorama_crop_width_scale = paramIni.ReadFloat(L"cropping", L"panorama_crop_width_scale", 0.80f);
+    original_crop_height_scale = paramIni.ReadFloat(L"cropping", L"original_crop_height_scale", 0.70f);
+    original_crop_width_scale = paramIni.ReadFloat(L"cropping", L"original_crop_width_scale", 0.54f);
+
+    PITCH_TO_TRANSLATION_FACTOR = paramIni.ReadFloat(L"transform", L"pitch_to_translation_factor", -17.44153917818162f);
+    YAW_TO_TRANSLATION_FACTOR = paramIni.ReadFloat(L"transform", L"yaw_to_translation_factor", 17.84f);
+
+    OVERLAP_RATIO = paramIni.ReadFloat(L"blend", L"overlap_ratio", 0.1f);
+    NON_OVERLAP_WIDTH = (int)(WIDTH * (1.0f - OVERLAP_RATIO));
+    PANORAMA_WIDTH = (int)(NUM_CAMS * WIDTH - (NUM_CAMS - 1) * WIDTH * OVERLAP_RATIO);
+
+
+    // === Read from IMU_Stabilize_Gyro.ini ===
     PathRemoveFileSpecW(szPath);
     std::wstring dirCapture = std::wstring(szPath) + L"\\Capture";
     CreateDirectoryW(dirCapture.c_str(), NULL);
@@ -593,17 +575,55 @@ int main() {
     std::vector<std::string> filenames;
     for (int i = 0; i < NUM_CAMS; ++i) {
         std::wstring key = L"file_" + std::to_wstring(i);
-        std::wstring val = iniManager.ReadString(L"images", key, L"");
+        std::wstring val = imuIni.ReadString(L"images", key, L"");
         filenames.push_back(WStringToUtf8(val));
     }
 
-    std::vector<float> yaw_offset_cam = iniManager.ReadFloatArray(L"offset", L"yaw");
-    std::vector<float> pitch_offset_cam = iniManager.ReadFloatArray(L"offset", L"pitch");
-    std::vector<float> roll_offset_cam = iniManager.ReadFloatArray(L"offset", L"roll");
+    std::vector<float> yaw_offset_cam = imuIni.ReadFloatArray(L"offset", L"yaw");
+    std::vector<float> pitch_offset_cam = imuIni.ReadFloatArray(L"offset", L"pitch");
+    std::vector<float> roll_offset_cam = imuIni.ReadFloatArray(L"offset", L"roll");
 
-    float roll_Sensor = iniManager.ReadFloat(L"Sensor_Orientation", L"roll", 5.25f);
-    float pitch_Sensor = iniManager.ReadFloat(L"Sensor_Orientation", L"pitch", -0.75f);
-    float yaw_Sensor = iniManager.ReadFloat(L"Sensor_Orientation", L"yaw", 0.0f);
+    float roll_Sensor = imuIni.ReadFloat(L"Sensor_Orientation", L"roll", 5.25f);
+    float pitch_Sensor = imuIni.ReadFloat(L"Sensor_Orientation", L"pitch", -0.75f);
+    float yaw_Sensor = imuIni.ReadFloat(L"Sensor_Orientation", L"yaw", 0.0f);
+
+
+
+    // ===== DEBUG PRINT: IMU INI values =====
+    printf("\n[DEBUG] Sensor Orientation:\n");
+    printf("  Roll:  %.3f\n", roll_Sensor);
+    printf("  Pitch: %.3f\n", pitch_Sensor);
+    printf("  Yaw:   %.3f\n", yaw_Sensor);
+
+    printf("\n[DEBUG] Camera Offsets:\n");
+    for (int i = 0; i < yaw_offset_cam.size(); ++i) {
+        printf("  Cam %d - Yaw: %.3f, Pitch: %.3f, Roll: %.3f\n",
+            i,
+            i < yaw_offset_cam.size() ? yaw_offset_cam[i] : -999.0f,
+            i < pitch_offset_cam.size() ? pitch_offset_cam[i] : -999.0f,
+            i < roll_offset_cam.size() ? roll_offset_cam[i] : -999.0f
+        );
+    }
+
+    // ===== DEBUG PRINT: Parameters INI values =====
+    printf("\n[DEBUG] Image & Calibration Parameters:\n");
+    printf("  WIDTH: %d, HEIGHT: %d, NUM_CAMS: %d, BUFFER_LINES: %d\n", WIDTH, HEIGHT, NUM_CAMS, BUFFER_LINES);
+    printf("  fx: %.3f, fy: %.3f, cx: %.3f, cy: %.3f\n", fx, fy, cx, cy);
+    printf("  K1: %.6f, K2: %.6f, K3: %.6f\n", K1, K2, K3);
+    printf("  P1: %.6f, P2: %.6f\n", P1, P2);
+
+    printf("\n[DEBUG] Projection & Cropping:\n");
+    printf("  FOV: %.2f°\n", cylindrical_fov_deg);
+    printf("  Panorama Crop (H x W): %.2f x %.2f\n", panorama_crop_height_scale, panorama_crop_width_scale);
+    printf("  Original Crop (H x W): %.2f x %.2f\n", original_crop_height_scale, original_crop_width_scale);
+
+    printf("\n[DEBUG] Transform & Blending:\n");
+    printf("  Pitch to Translation: %.6f\n", PITCH_TO_TRANSLATION_FACTOR);
+    printf("  Yaw to Translation:   %.6f\n", YAW_TO_TRANSLATION_FACTOR);
+    printf("  Overlap Ratio:        %.2f\n", OVERLAP_RATIO);
+    printf("  NON_OVERLAP_WIDTH:    %d\n", NON_OVERLAP_WIDTH);
+    printf("  PANORAMA_WIDTH:       %d\n", PANORAMA_WIDTH);
+
 
     printf("\n........Processing........\n");
 
@@ -611,9 +631,13 @@ int main() {
     std::vector<Image*> frames(NUM_CAMS);
     std::vector<Image*> stabilized_frames;
     std::vector<Image*> original_frames;
+    Image* map_x, * map_y;
+    generateCylindricalRemap(&map_x, &map_y, WIDTH, HEIGHT, cylindrical_fov_deg, 0.0f);
 
-
-
+    if (filenames.size() != NUM_CAMS) {
+        printf("[ERROR] filenames.size() = %zu, but NUM_CAMS = %d\n", filenames.size(), NUM_CAMS);
+        exit(1);
+    }
 
     for (int cam_idx = 0; cam_idx < NUM_CAMS; ++cam_idx) {
         float roll_cam = 0, pitch_cam = 0, yaw_cam = 0;
