@@ -666,10 +666,27 @@ int main() {
 
         
         // The frame processing pipeline 
+        wchar_t buffer[512];
+
         Image* undistorted = Undistort(frames[cam_idx]);
+        swprintf_s(buffer, 512, L"[%d]_1_undistorted", cam_idx);
+        std::string undistorted_path = SaveImageFilePath(dirCapture, buffer);
+        writeBMP(undistorted_path.c_str(), undistorted);
+
         Image* projected = cylindricalRemap(undistorted, map_x, map_y);
+        swprintf_s(buffer, 512, L"[%d]_2_projected", cam_idx);
+        std::string projected_path = SaveImageFilePath(dirCapture, buffer);
+        writeBMP(projected_path.c_str(), projected);
+
         Image* affine = affineTransform(projected, -roll_cam, -(float)y_shift);
+        swprintf_s(buffer, 512, L"[%d]_3_affine", cam_idx);
+        std::string affine_path = SaveImageFilePath(dirCapture, buffer);
+        writeBMP(affine_path.c_str(), affine);
+
         Image* cropped = cropFrameHW(affine, panorama_crop_height_scale, panorama_crop_width_scale);
+        swprintf_s(buffer, 512, L"[%d]_4_cropped", cam_idx);
+        std::string cropped_path = SaveImageFilePath(dirCapture, buffer);
+        writeBMP(cropped_path.c_str(), cropped);
 
         stabilized_frames.push_back(cropped);
         original_frames.push_back(f_orig);
