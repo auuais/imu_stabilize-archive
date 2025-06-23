@@ -22,7 +22,7 @@
 #endif
 
 // === Global Parameters ===
-int WIDTH, HEIGHT, NUM_CAMS, BUFFER_LINES;
+int WIDTH, HEIGHT, NUM_CAMS, BUFFER_LINES,overlap_px;
 float fx, fy, cx, cy;
 float K1, K2, K3, P1, P2;
 float fx_new = 864.452f, fy_new = 860.023f, cx_new = 947.559f, cy_new = 534.965f;  // keep default if not overridden
@@ -35,7 +35,7 @@ bool Stabilization = true;
 
 float resize_factor = 0.5;
 
-float cylindrical_fov_deg;
+float cylindrical_H_fov_deg, cylindrical_V_fov_deg;
 float panorama_crop_height_scale, panorama_crop_width_scale;
 float original_crop_height_scale, original_crop_width_scale;
 float PITCH_TO_TRANSLATION_FACTOR, YAW_TO_TRANSLATION_FACTOR;
@@ -247,7 +247,36 @@ Image* affineTransform(const Image* img, float angle_deg, float translate_y) {
     return output;
 }
 
-void generateCylindricalRemap(Image** map_x, Image** map_y, int width, int height, float fov_h_deg, float fov_v_deg, float x_shift)
+void loadCylindricalMaps(Image** map_x, Image** map_y, int width, int height, const std::filesystem::path& exePath) {
+    *map_x = (Image*)malloc(sizeof(Image));
+    *map_y = (Image*)malloc(sizeof(Image));
+
+    (*map_x)->width = width;
+    (*map_x)->height = height;
+    (*map_x)->channels = 1;
+    (*map_x)->data = (unsigned char*)malloc(width * height * sizeof(float));
+
+    (*map_y)->width = width;
+    (*map_y)->height = height;
+    (*map_y)->channels = 1;
+    (*map_y)->data = (unsigned char*)malloc(width * height * sizeof(float));
+
+    std::filesystem::path mapx_path = exePath.parent_path() / "map_x.bin";
+    std::filesystem::path mapy_path = exePath.parent_path() / "map_y.bin";
+
+    FILE* fx = fopen(mapx_path.string().c_str(), "rb");
+    fread((*map_x)->data, sizeof(float), width * height, fx);
+    fclose(fx);
+
+    FILE* fy = fopen(mapy_path.string().c_str(), "rb");
+    fread((*map_y)->data, sizeof(float), width * height, fy);
+    fclose(fy);
+
+    printf("[INFO] Cylindrical maps loaded from disk.\n");
+}
+
+
+void generateCylindricalRemap(Image** map_x, Image** map_y, int width, int height, float fov_h_deg, float fov_v_deg, float x_shift, const std::filesystem::path& exePath)
 {
     float fov_h_rad = fov_h_deg * (M_PI / 180.0f);
     float fov_v_rad = fov_v_deg * (M_PI / 180.0f);
@@ -290,6 +319,22 @@ void generateCylindricalRemap(Image** map_x, Image** map_y, int width, int heigh
             ((float*)(*map_y)->data)[index] = src_y;
         }
     }
+
+    // Save map_x and map_y to binary files
+    std::filesystem::path mapx_path = exePath.parent_path() / "map_x.bin";
+    std::filesystem::path mapy_path = exePath.parent_path() / "map_y.bin";
+
+    FILE* fx = fopen(mapx_path.string().c_str(), "wb");
+    fwrite((*map_x)->data, sizeof(float), width * height, fx);
+    fclose(fx);
+
+    FILE* fy = fopen(mapy_path.string().c_str(), "wb");
+    fwrite((*map_y)->data, sizeof(float), width * height, fy);
+    fclose(fy);
+
+    printf("[INFO] Cylindrical maps saved to %s and %s\n",
+        mapx_path.string().c_str(), mapy_path.string().c_str());
+
 }
 
 
@@ -704,7 +749,8 @@ int main() {
     P1 = paramIni.ReadFloat(L"calibration", L"p1", -0.001558f);
     P2 = paramIni.ReadFloat(L"calibration", L"p2", -0.002416f);
 
-    cylindrical_fov_deg = paramIni.ReadFloat(L"projection", L"cylindrical_fov_deg", 60.0f);
+    cylindrical_H_fov_deg = paramIni.ReadFloat(L"projection", L"cylindrical_H_fov_deg", 60.0f);
+    cylindrical_V_fov_deg = paramIni.ReadFloat(L"projection", L"cylindrical_V_fov_deg", 51.3f);
 
     panorama_crop_height_scale = paramIni.ReadFloat(L"cropping", L"panorama_crop_height_scale", 0.80f);
     panorama_crop_width_scale = paramIni.ReadFloat(L"cropping", L"panorama_crop_width_scale", 0.80f);
@@ -715,9 +761,9 @@ int main() {
     PITCH_TO_TRANSLATION_FACTOR *= resize_factor; // when resizing applied
     YAW_TO_TRANSLATION_FACTOR = paramIni.ReadFloat(L"transform", L"yaw_to_translation_factor", 17.84f);
 
-    OVERLAP_RATIO = paramIni.ReadFloat(L"blend", L"overlap_ratio", 0.1f);
-    NON_OVERLAP_WIDTH = (int)(WIDTH * (1.0f - OVERLAP_RATIO));
-    PANORAMA_WIDTH = (int)(NUM_CAMS * WIDTH - (NUM_CAMS - 1) * WIDTH * OVERLAP_RATIO);
+    overlap_px = paramIni.ReadInteger(L"blend", L"overlap_px ", 100);
+    
+    resize_factor = paramIni.ReadFloat(L"resize", L"resize_factor ", 0.5);
 
 
     // === Read from IMU_Stabilize_Gyro.ini ===
@@ -783,7 +829,7 @@ int main() {
     printf("  P1: %.6f, P2: %.6f\n", P1, P2);
 
     printf("\n[DEBUG] Projection & Cropping:\n");
-    printf("  FOV: %.2f°\n", cylindrical_fov_deg);
+    printf("  FOV: %.2f°\n", cylindrical_H_fov_deg);
     printf("  Panorama Crop (H x W): %.2f x %.2f\n", panorama_crop_height_scale, panorama_crop_width_scale);
     printf("  Original Crop (H x W): %.2f x %.2f\n", original_crop_height_scale, original_crop_width_scale);
 
@@ -802,7 +848,16 @@ int main() {
     std::vector<Image*> stabilized_frames;
     std::vector<Image*> original_frames;
     Image* map_x, * map_y;
-    generateCylindricalRemap(&map_x, &map_y, WIDTH*resize_factor, HEIGHT* resize_factor, cylindrical_fov_deg, 51.3,0.0f);
+    std::filesystem::path mapx_path = exePath.parent_path() / "map_x.bin";
+    std::filesystem::path mapy_path = exePath.parent_path() / "map_y.bin";
+
+    //if (std::filesystem::exists(mapx_path) && std::filesystem::exists(mapy_path)) {
+        loadCylindricalMaps(&map_x, &map_y, WIDTH * resize_factor, HEIGHT * resize_factor, exePath);
+    /*}
+    else {
+        generateCylindricalRemap(&map_x, &map_y, WIDTH * resize_factor, HEIGHT * resize_factor, cylindrical_H_fov_deg, cylindrical_V_fov_deg, 0.0f, exePath);
+    }*/
+
 
     if (filenames.size() != NUM_CAMS) {
         printf("[ERROR] filenames.size() = %zu, but NUM_CAMS = %d\n", filenames.size(), NUM_CAMS);
@@ -869,7 +924,7 @@ int main() {
 
 
 
-    Image* panorama = featherBlendFit(stabilized_frames, 100 * resize_factor, 3840, 480);
+    Image* panorama = featherBlendFit(stabilized_frames, overlap_px * resize_factor, 3840, 480);
 
 
 
