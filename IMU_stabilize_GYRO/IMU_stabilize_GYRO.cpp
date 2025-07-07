@@ -25,8 +25,8 @@
 int WIDTH, HEIGHT, NUM_CAMS, BUFFER_LINES,overlap_px;
 float fx, fy, cx, cy;
 float K1, K2, K3, P1, P2;
-float fx_new = 864.452f, fy_new = 860.023f, cx_new = 947.559f, cy_new = 534.965f;  // keep default if not overridden
-
+//float fx_new = 864.452f, fy_new = 860.023f, cx_new = 947.559f, cy_new = 534.965f;  // keep default if not overridden
+float fx_new = 500.625603, fy_new = 486.870958, cx_new = 313.554080, cy_new = 203.072890;
 float roll_Sensor = 0.0f;
 float pitch_Sensor = 0.0f;
 float yaw_Sensor = 0.0f;
@@ -757,13 +757,15 @@ int main() {
     original_crop_height_scale = paramIni.ReadFloat(L"cropping", L"original_crop_height_scale", 0.70f);
     original_crop_width_scale = paramIni.ReadFloat(L"cropping", L"original_crop_width_scale", 0.54f);
 
+    resize_factor = paramIni.ReadFloat(L"resize", L"resize_factor ", 0.5);
+
     PITCH_TO_TRANSLATION_FACTOR = paramIni.ReadFloat(L"transform", L"pitch_to_translation_factor", -17.44153917818162f);
     PITCH_TO_TRANSLATION_FACTOR *= resize_factor; // when resizing applied
     YAW_TO_TRANSLATION_FACTOR = paramIni.ReadFloat(L"transform", L"yaw_to_translation_factor", 17.84f);
 
     overlap_px = paramIni.ReadInteger(L"blend", L"overlap_px ", 100);
     
-    resize_factor = paramIni.ReadFloat(L"resize", L"resize_factor ", 0.5);
+    
 
 
     // === Read from IMU_Stabilize_Gyro.ini ===
@@ -851,12 +853,12 @@ int main() {
     std::filesystem::path mapx_path = exePath.parent_path() / "map_x.bin";
     std::filesystem::path mapy_path = exePath.parent_path() / "map_y.bin";
 
-    //if (std::filesystem::exists(mapx_path) && std::filesystem::exists(mapy_path)) {
+    if (std::filesystem::exists(mapx_path) && std::filesystem::exists(mapy_path)) {
         loadCylindricalMaps(&map_x, &map_y, WIDTH * resize_factor, HEIGHT * resize_factor, exePath);
-    /*}
+    }
     else {
         generateCylindricalRemap(&map_x, &map_y, WIDTH * resize_factor, HEIGHT * resize_factor, cylindrical_H_fov_deg, cylindrical_V_fov_deg, 0.0f, exePath);
-    }*/
+    }
 
 
     if (filenames.size() != NUM_CAMS) {
@@ -924,7 +926,7 @@ int main() {
 
 
 
-    Image* panorama = featherBlendFit(stabilized_frames, overlap_px * resize_factor, 3840, 480);
+    Image* panorama = featherBlendFit(stabilized_frames, overlap_px * resize_factor, 1620, 480);
 
 
 
