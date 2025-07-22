@@ -743,6 +743,11 @@ int main() {
     cx = WIDTH * cx_ratio;
     cy = HEIGHT * cy_ratio;
 
+    fx_new = paramIni.ReadFloat(L"calibration", L"fx_dist", 1204.505857f);
+    fy_new = paramIni.ReadFloat(L"calibration", L"fy_dist", 1204.505857f);
+    cx_new = paramIni.ReadFloat(L"calibration", L"cx_dist", 1204.505857f);
+    cy_new = paramIni.ReadFloat(L"calibration", L"cy_dist", 1204.505857f);
+
     K1 = paramIni.ReadFloat(L"calibration", L"k1", -0.343698f);
     K2 = paramIni.ReadFloat(L"calibration", L"k2", 0.105503f);
     K3 = paramIni.ReadFloat(L"calibration", L"k3", 0.0f);
