@@ -1,951 +1,967 @@
 ﻿#define _CRT_SECURE_NO_WARNINGS
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <math.h>
+#define NOMINMAX
 
-//for data read from file
-/////////////////////////////////////////////////
+// IMU_Stabilize_Gyro_Linebuffer_MT_V5_Tiled_Undist_ResampledX_PaddedY_FixedStride_Multi_Pipelined_Fixed.cpp
+// - Logic identical to stride-fix version
+// - Loads images once, reuses from RAM
+// - Runs N frames, prints per-frame time and multi-frame averages
+// - Optional: print profiling stats per frame; saving cadence configurable
+// - Pipelined across frames: LUT -> Render -> Blend stages in separate threads with queues
+// - Fixed: Persistent thread pools per stage, reduced worker count to avoid oversubscription
 
-#include <Shlwapi.h>  // PathRemoveFileSpecW
+#include <Windows.h>
+#include <Shlwapi.h>
 #pragma comment(lib, "Shlwapi.lib")
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstdint>
+#include <cmath>
+#include <cstring>
+#include <string>
+#include <vector>
+#include <thread>
+#include <queue>
+#include <future>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
 #include <filesystem>
+#include <chrono>
+#include <stdexcept>
+//#include <immintrin.h>
+
 #include "ini_manager.h"
-
-//////////////////////////////////////////////
-
-
-
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
-// === Global Parameters ===
-int WIDTH, HEIGHT, NUM_CAMS, BUFFER_LINES,overlap_px;
-float fx, fy, cx, cy;
-float K1, K2, K3, P1, P2;
-//float fx_new = 864.452f, fy_new = 860.023f, cx_new = 947.559f, cy_new = 534.965f;  // keep default if not overridden
-float fx_new = 500.625603, fy_new = 486.870958, cx_new = 313.554080, cy_new = 203.072890;
-float roll_Sensor = 0.0f;
-float pitch_Sensor = 0.0f;
-float yaw_Sensor = 0.0f;
+// ===================== Multi-frame controls =====================
+#ifndef NUM_FRAMES
+#define NUM_FRAMES          960
+#endif
+#ifndef WARMUP_FRAMES
+#define WARMUP_FRAMES        300        // excluded from averages
+#endif
+#ifndef SAVE_EVERY_K
+#define SAVE_EVERY_K         0     // 0 = save none; 1 = save all; 30 = save every 30th
+#endif
+#ifndef PRINT_STATS_EACH_FRAME
+#define PRINT_STATS_EACH_FRAME 0      // 1 = print profiling summary after each frame
+#endif
 
-bool Stabilization = true;
+// ===================== Tiles =====================
+#ifndef TILE_W
+#define TILE_W  128
+#endif
+#ifndef TILE_H
+#define TILE_H   64
+#endif
 
-float resize_factor = 0.5;
+#define ENABLE_MT               1
+#define LIGHT_PROF              1
 
-float cylindrical_H_fov_deg, cylindrical_V_fov_deg;
-float panorama_crop_height_scale, panorama_crop_width_scale;
-float original_crop_height_scale, original_crop_width_scale;
-float PITCH_TO_TRANSLATION_FACTOR, YAW_TO_TRANSLATION_FACTOR;
-float OVERLAP_RATIO;
-int NON_OVERLAP_WIDTH, PANORAMA_WIDTH;
+// ===================== Fixed-point =====================
+static const int WFIX_SHIFT = 16;   // Q16.16
+static const int MAP_SHIFT = 4;    // Q12.4
+static const int MAP_SCALE = (1 << MAP_SHIFT);
 
+// ===================== Logging =====================
+static inline void logln(const char* s) { printf("%s\r\n", s); fflush(stdout); }
 
+// ===================== Profiling =====================
+enum Stage : int { ST_IO = 0, ST_MAPS, ST_UNDISTMAP, ST_LUT, ST_RENDER, ST_BLEND, ST_MISC, ST_COUNT };
+static const char* STAGE_NAME[ST_COUNT] = { "I/O","Maps","UndistMap","LUT","Render","Blend","Misc" };
+struct StageStats {
+    std::atomic<uint64_t>   calls{ 0 };
+    std::atomic<long double> ms_total{ 0.0L };
+    std::atomic<uint64_t>   bytes_read{ 0 };
+    std::atomic<uint64_t>   bytes_written{ 0 };
+};
+static StageStats G_STATS[ST_COUNT];
+static thread_local Stage TL_CUR_STAGE = ST_MISC;
 
-#pragma pack(push, 1)
-typedef struct {
-    unsigned short bfType;
-    unsigned int   bfSize;
-    unsigned short bfReserved1;
-    unsigned short bfReserved2;
-    unsigned int   bfOffBits;
-} CustomBitmapFileHeader;
+#if LIGHT_PROF
+#  define MEM_READ(x)  do{}while(0)
+#  define MEM_WRITE(x) do{}while(0)
+#else
+#  define MEM_READ(x)  (G_STATS[TL_CUR_STAGE].bytes_read   += (uint64_t)(x))
+#  define MEM_WRITE(x) (G_STATS[TL_CUR_STAGE].bytes_written+= (uint64_t)(x))
+#endif
 
+struct StageTimer {
+    Stage s;
+    std::chrono::high_resolution_clock::time_point t0;
+    StageTimer(Stage st) : s(st), t0(std::chrono::high_resolution_clock::now()) { TL_CUR_STAGE = s; G_STATS[s].calls++; }
+    ~StageTimer() {
+        auto t1 = std::chrono::high_resolution_clock::now();
+        long double ms = std::chrono::duration<long double, std::milli>(t1 - t0).count();
+        G_STATS[s].ms_total.store(G_STATS[s].ms_total.load() + ms);
+        TL_CUR_STAGE = ST_MISC;
+    }
+};
+static inline void reset_stats() {
+    for (int s = 0; s < ST_COUNT; ++s) {
+        G_STATS[s].calls.store(0);
+        G_STATS[s].ms_total.store(0.0L);
+        G_STATS[s].bytes_read.store(0);
+        G_STATS[s].bytes_written.store(0);
+    }
+}
+static inline void print_stats_summary(const char* header) {
+    printf("\r\n===== %s =====\r\n", header);
+    for (int s = 0; s < ST_COUNT; ++s) {
+        long double ms = G_STATS[s].ms_total.load();
+        double sec = (double)ms / 1000.0;
+        double rd_MB = (double)G_STATS[s].bytes_read.load() / (1024.0 * 1024.0);
+        double wr_MB = (double)G_STATS[s].bytes_written.load() / (1024.0 * 1024.0);
+        double rd_MBps = sec > 0.0 ? rd_MB / sec : 0.0;
+        double wr_MBps = sec > 0.0 ? wr_MB / sec : 0.0;
+        printf("Stage %-10s | calls:%6llu | time:%9.3Lf ms | R:%7.2f MB | W:%7.2f MB | R:%8.2f MB/s | W:%8.2f MB/s\r\n",
+            STAGE_NAME[s],
+            (unsigned long long)G_STATS[s].calls.load(),
+            ms, rd_MB, wr_MB, rd_MBps, wr_MBps);
+    }
+    fflush(stdout);
+}
 
-typedef struct {
-    unsigned int   biSize;
-    int            biWidth;
-    int            biHeight;
-    unsigned short biPlanes;
-    unsigned short biBitCount;
-    unsigned int   biCompression;
-    unsigned int   biSizeImage;
-    int            biXPelsPerMeter;
-    int            biYPelsPerMeter;
-    unsigned int   biClrUsed;
-    unsigned int   biClrImportant;
-} CustomBitmapInfoHeader;
+// ===================== Helpers =====================
+static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+static unsigned char sat_u8(int v) { return (v < 0) ? 0 : (v > 255 ? 255 : (unsigned char)v); }
+
+// ===================== Image (RGB) =====================
+typedef struct { int width, height, channels; unsigned char* data; } Image;
+#define PIXEL(img,y,x,c) ((img)->data[((y)*(img)->width+(x))*(img)->channels+(c)])
+
+// ===================== BMP I/O =====================
+#pragma pack(push,1)
+typedef struct { unsigned short bfType; unsigned int bfSize; unsigned short bfReserved1; unsigned short bfReserved2; unsigned int bfOffBits; } CustomBitmapFileHeader;
+typedef struct { unsigned int biSize; int biWidth; int biHeight; unsigned short biPlanes; unsigned short biBitCount; unsigned int biCompression; unsigned int biSizeImage; int biXPelsPerMeter; int biYPelsPerMeter; unsigned int biClrUsed; unsigned int biClrImportant; } CustomBitmapInfoHeader;
 #pragma pack(pop)
 
-
-typedef struct {
-    int width;
-    int height;
-    int channels;
-    unsigned char* data; 
-} Image;
-
-
-#define PIXEL(img, y, x, c) ((img)->data[((y) * (img)->width + (x)) * (img)->channels + (c)])
-
-
-static unsigned char saturate_cast(float val) {
-    if (val < 0) return 0;
-    if (val > 255) return 255;
-    return (unsigned char)(val + 0.5f);
-}
-
-
-Image* readBMP(const char* filename) {
-    FILE* fp = fopen(filename, "rb");
-    CustomBitmapFileHeader fileHeader;
-    CustomBitmapInfoHeader infoHeader;
-
-    fread(&fileHeader, sizeof(BITMAPFILEHEADER), 1, fp);
-    fread(&infoHeader, sizeof(BITMAPINFOHEADER), 1, fp);
-
+static Image* readBMP(const char* filename) {
+    StageTimer _t(ST_IO);
+    FILE* fp = fopen(filename, "rb"); if (!fp) return nullptr;
+    BITMAPFILEHEADER bfh{}; BITMAPINFOHEADER bih{};
+    fread(&bfh, sizeof(bfh), 1, fp); MEM_READ(sizeof(bfh));
+    fread(&bih, sizeof(bih), 1, fp); MEM_READ(sizeof(bih));
     Image* img = (Image*)malloc(sizeof(Image));
-    img->width = infoHeader.biWidth;
-    img->height = abs(infoHeader.biHeight);
-    img->channels = 3;
+    img->width = bih.biWidth; img->height = abs(bih.biHeight); img->channels = 3;
     int row_padded = ((img->width * 3 + 3) / 4) * 4;
-    img->data = (unsigned char*)malloc(img->width * img->height * 3);
-    fseek(fp, fileHeader.bfOffBits, SEEK_SET);
-    for (int i = 0; i < img->height; i++) {
-        fread(img->data + i * img->width * 3, 1, img->width * 3, fp);
+    img->data = (unsigned char*)malloc((size_t)img->width * img->height * 3);
+    fseek(fp, bfh.bfOffBits, SEEK_SET);
+    for (int i = 0; i < img->height; ++i) {
+        size_t got = fread(img->data + (size_t)i * img->width * 3, 1, (size_t)img->width * 3, fp); MEM_READ(got);
         fseek(fp, row_padded - img->width * 3, SEEK_CUR);
     }
-    fclose(fp);
-    return img;
+    fclose(fp); return img;
 }
-
-
-void free_image(Image* img) {
-    if (img) {
-        if (img->data) free(img->data);
-        free(img);
-    }
-}
-
-
-int writeBMP(const char* filename, const Image* img) {
-    FILE* fp = fopen(filename, "wb");
-    int row_padded = ((img->width * 3 + 3) / 4) * 4;
-    int fileSize = 54 + row_padded * img->height;
-    unsigned char bmpfileheader[14] = { 'B','M', 0,0,0,0, 0,0, 0,0, 54,0,0,0 };
-    unsigned char bmpinfoheader[40] = { 0 };
-    unsigned char bmppad[3] = { 0,0,0 };
+static int writeBMP(const char* filename, const Image* img) {
+    StageTimer _t(ST_IO);
+    FILE* fp = fopen(filename, "wb"); if (!fp) return 0;
+    int w = img->width, h = img->height; int c = img->channels; if (c != 3) c = 3;
+    int row_padded = ((w * 3 + 3) / 4) * 4; int fileSize = 54 + row_padded * h;
+    unsigned char bmpfileheader[14] = { 'B','M',0,0,0,0,0,0,0,0,54,0,0,0 };
+    unsigned char bmpinfoheader[40] = { 0 }; unsigned char pad[3] = { 0,0,0 };
     bmpfileheader[2] = (unsigned char)(fileSize);
-    bmpfileheader[3] = (unsigned char)(fileSize >> 8);
-    bmpfileheader[4] = (unsigned char)(fileSize >> 16);
-    bmpfileheader[5] = (unsigned char)(fileSize >> 24);
     bmpinfoheader[0] = 40;
-    bmpinfoheader[4] = (unsigned char)(img->width);
-    bmpinfoheader[5] = (unsigned char)(img->width >> 8);
-    bmpinfoheader[6] = (unsigned char)(img->width >> 16);
-    bmpinfoheader[7] = (unsigned char)(img->width >> 24);
-    bmpinfoheader[8] = (unsigned char)(img->height);
-    bmpinfoheader[9] = (unsigned char)(img->height >> 8);
-    bmpinfoheader[10] = (unsigned char)(img->height >> 16);
-    bmpinfoheader[11] = (unsigned char)(img->height >> 24);
+    bmpinfoheader[4] = (unsigned char)(w);
+    bmpinfoheader[5] = (unsigned char)(w >> 8);
+    bmpinfoheader[6] = (unsigned char)(w >> 16);
+    bmpinfoheader[7] = (unsigned char)(w >> 24);
+    bmpinfoheader[8] = (unsigned char)(h);
+    bmpinfoheader[9] = (unsigned char)(h >> 8);
+    bmpinfoheader[10] = (unsigned char)(h >> 16);
+    bmpinfoheader[11] = (unsigned char)(h >> 24);
     bmpinfoheader[12] = 1;
     bmpinfoheader[14] = 24;
-    fwrite(bmpfileheader, 1, 14, fp);
-    fwrite(bmpinfoheader, 1, 40, fp);
-    for (int i = 0; i < img->height; i++) {
-        fwrite(img->data + i * img->width * 3, 1, img->width * 3, fp);
-        fwrite(bmppad, 1, row_padded - img->width * 3, fp);
+    fwrite(bmpfileheader, 1, 14, fp); MEM_WRITE(14);
+    fwrite(bmpinfoheader, 1, 40, fp); MEM_WRITE(40);
+    for (int i = 0; i < h; ++i) {
+        const unsigned char* s = &img->data[(size_t)i * w * c];
+        fwrite(s, 1, (size_t)w * 3, fp); MEM_WRITE(w * 3);
+        fwrite(pad, 1, (size_t)(row_padded - w * 3), fp); MEM_WRITE(row_padded - w * 3);
     }
-    fclose(fp);
-    return 1;
+    fclose(fp); return 1;
+}
+static void freeImage(Image* img) { if (!img) return; free(img->data); free(img); }
+
+// ===================== Path helpers =====================
+static std::wstring StringToWString(const std::string& s) { if (s.empty()) return {}; int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), NULL, 0); std::wstring r(n, 0); MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &r[0], n); return r; }
+static std::string  WStringToUtf8(const std::wstring& w) { if (w.empty()) return {}; int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), NULL, 0, NULL, NULL); std::string r(n, 0); WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), &r[0], n, NULL, NULL); return r; }
+#define CAPTURE_DIR_W L"C:\\SVNProjects\\IMU_Stabilize_V24\\x64\\Debug\\Capture"
+static std::string SaveImageFilePath(const std::wstring& captureDir, const std::wstring& prefix, int frameIdx = -1) {
+    StageTimer _t(ST_IO);
+    SYSTEMTIME st; GetLocalTime(&st);
+    wchar_t fname[256];
+    if (frameIdx < 0)
+        swprintf_s(fname, 256, L"%04d%02d%02d_%02d%02d%02d_%s.bmp",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, prefix.c_str());
+    else
+        swprintf_s(fname, 256, L"%04d%02d%02d_%02d%02d%02d_%s_f%04d.bmp",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, prefix.c_str(), frameIdx);
+    std::filesystem::path out = std::filesystem::path(captureDir) / fname;
+    return WStringToUtf8(out.wstring());
 }
 
-// === Interpolation Function ===
-void interpolation(const Image* img, float x, float y, unsigned char* result) {
-    int x0 = (int)floorf(x);
-    int y0 = (int)floorf(y);
-    float dx = x - x0;
-    float dy = y - y0;
-
-    for (int c = 0; c < 3; ++c) result[c] = 0;
-
-    if (x0 < 0 || x0 >= img->width - 1 || y0 < 0 || y0 >= img->height - 1) return;
-
-    for (int c = 0; c < 3; ++c) {
-        float p00 = PIXEL(img, y0, x0, c);
-        float p10 = PIXEL(img, y0, x0 + 1, c);
-        float p01 = PIXEL(img, y0 + 1, x0, c);
-        float p11 = PIXEL(img, y0 + 1, x0 + 1, c);
-        float val = (1 - dx) * (1 - dy) * p00 + dx * (1 - dy) * p10 + (1 - dx) * dy * p01 + dx * dy * p11;
-        result[c] = (unsigned char)(val > 255 ? 255 : (val < 0 ? 0 : val));
-    }
-}
-
-
-
-
-// === Manual Undistortion Function ===
-Image* Undistort(const Image* img) {
-    Image* output = (Image*)malloc(sizeof(Image));
-    output->width = img->width;
-    output->height = img->height;
-    output->channels = 3;
-    output->data = (unsigned char*)calloc(img->width * img->height * 3, sizeof(unsigned char));
-
-    for (int v = 0; v < img->height; ++v) {
-        for (int u = 0; u < img->width; ++u) {
-            float x = (u - cx_new) / fx_new;
-            float y = (v - cy_new) / fy_new;
-            float r2 = x * x + y * y;
-
-            float radial = 1 + K1 * r2 + K2 * r2 * r2 + K3 * r2 * r2 * r2;
-            float dx = 2 * P1 * x * y + P2 * (r2 + 2 * x * x);
-            float dy = P1 * (r2 + 2 * y * y) + 2 * P2 * x * y;
-
-            float x_dist = x * radial + dx;
-            float y_dist = y * radial + dy;
-
-            float u_d = x_dist * fx + cx;
-            float v_d = y_dist * fy + cy;
-
-            unsigned char pixel[3];
-            interpolation(img, u_d, v_d, pixel);
-
-            for (int c = 0; c < 3; ++c) {
-                PIXEL(output, v, u, c) = pixel[c];
+// ===================== Tiny Thread Pool =====================
+class TinyPool {
+public:
+    explicit TinyPool(unsigned n = std::thread::hardware_concurrency()) :stop(false) { n = n ? n : 1; for (unsigned i = 0; i < n; ++i) workers.emplace_back([this] {run(); }); }
+    ~TinyPool() { { std::unique_lock<std::mutex> lk(mx); stop = true; cv.notify_all(); } for (auto& t : workers) t.join(); }
+    void submit(std::function<void()> fn) { { std::unique_lock<std::mutex> lk(mx); q.emplace(std::move(fn)); } cv.notify_one(); }
+    void wait_idle() { std::unique_lock<std::mutex> lk(mx); done_cv.wait(lk, [&] {return q.empty() && active == 0; }); }
+private:
+    void run() {
+        for (;;) {
+            std::function<void()> job;
+            {
+                std::unique_lock<std::mutex> lk(mx);
+                cv.wait(lk, [&] {return stop || !q.empty(); });
+                if (stop && q.empty()) return;
+                job = std::move(q.front()); q.pop(); ++active;
+            }
+            job();
+            {
+                std::unique_lock<std::mutex> lk(mx);
+                --active; if (q.empty() && active == 0) done_cv.notify_all();
             }
         }
     }
-    return output;
+    std::vector<std::thread> workers; std::mutex mx; std::condition_variable cv, done_cv; std::queue<std::function<void()>> q; std::atomic<bool> stop; int active = 0;
+};
+
+// ===================== Params and globals =====================
+static int   WIDTH = 1920, HEIGHT = 1080, NUM_CAMS = 6, overlap_px = 100;
+static float fx = 1204.505857f, fy = 1204.505857f, cx = 960.0f, cy = 540.0f;
+static float K1 = -0.343698f, K2 = 0.105503f, K3 = 0.0f, P1 = -0.001558f, P2 = -0.002416f;
+static float fx_new = 1204.505857f, fy_new = 1204.505857f, cx_new = 947.559f, cy_new = 534.965f;
+static float cylindrical_H_fov_deg = 60.0f, cylindrical_V_fov_deg = 51.3f;
+static float panorama_crop_height_scale = 0.80f, panorama_crop_width_scale = 0.80f;
+static float resize_factor = 0.5f;
+static float PITCH_TO_TRANSLATION_FACTOR = -17.44153917818162f, YAW_TO_TRANSLATION_FACTOR = 17.84f;
+static float roll_Sensor = 0.0f, pitch_Sensor = 0.0f, yaw_Sensor = 0.0f;
+static int   TARGET_W = 3840, TARGET_H = 480;
+
+// Number of workers per pool (divided to avoid oversubscription)
+static unsigned POOL_WORKERS = std::max(1u, std::thread::hardware_concurrency() / 2);
+
+// ===================== Angle LUT (±5°, 0.25°) Q1.15 =====================
+struct AngleLUTEntry { int16_t c; int16_t s; };
+static std::vector<AngleLUTEntry> ANG_LUT;
+static inline void build_angle_lut() {
+    if (!ANG_LUT.empty()) return;
+    const float minDeg = -5.0f, maxDeg = 5.0f, step = 0.25f;
+    int N = (int)std::lround((maxDeg - minDeg) / step) + 1;
+    ANG_LUT.resize(N);
+    for (int i = 0; i < N; ++i) {
+        float deg = minDeg + i * step, rad = deg * (float)M_PI / 180.0f;
+        int16_t c = (int16_t)std::lroundf(cosf(rad) * 32767.0f);
+        int16_t s = (int16_t)std::lroundf(sinf(rad) * 32767.0f);
+        ANG_LUT[i] = { c,s };
+    }
+}
+static inline void get_cos_sin_q15(float deg, int16_t* c, int16_t* s) {
+    float idxf = (deg + 5.0f) / 0.25f; int idx = (int)std::lround(idxf);
+    if (idx < 0) idx = 0; if (idx >= (int)ANG_LUT.size()) idx = (int)ANG_LUT.size() - 1;
+    *c = ANG_LUT[idx].c; *s = ANG_LUT[idx].s;
 }
 
-
-
-
-
-// === Affine Transformation Function ===
-Image* affineTransform(const Image* img, float angle_deg, float translate_y) {
-    int w = img->width, h = img->height;
-    float angle_rad = angle_deg * M_PI / 180.0f;
-    float cos_a = cosf(angle_rad);
-    float sin_a = sinf(angle_rad);
-    float cx_center = w / 2.0f, cy_center = h / 2.0f;
-
-    Image* output = (Image*)malloc(sizeof(Image));
-    output->width = w;
-    output->height = h;
-    output->channels = 3;
-    output->data = (unsigned char*)calloc(w * h * 3, sizeof(unsigned char));
-
+// ===================== Cyl and Undist maps (Q12.4) =====================
+static void loadCylMapsQ(std::vector<int16_t>& mapx, std::vector<int16_t>& mapy, int w, int h, const std::filesystem::path& exePath) {
+    StageTimer _t(ST_MAPS);
+    mapx.resize((size_t)w * h); mapy.resize((size_t)w * h);
+    auto px = exePath.parent_path() / "map_x_q.bin"; auto py = exePath.parent_path() / "map_y_q.bin";
+    FILE* fxp = fopen(px.string().c_str(), "rb"); FILE* fyp = fopen(py.string().c_str(), "rb");
+    if (!fxp || !fyp) { if (fxp)fclose(fxp); if (fyp)fclose(fyp); throw std::runtime_error("Cyl maps not found"); }
+    fread(mapx.data(), sizeof(int16_t), (size_t)w * h, fxp); fclose(fxp);
+    fread(mapy.data(), sizeof(int16_t), (size_t)w * h, fyp); fclose(fyp);
+    printf("[INFO] Cylindrical maps (Q12.4) loaded from disk.\r\n");
+}
+static void saveCylMapsQ(const std::vector<int16_t>& mapx, const std::vector<int16_t>& mapy, const std::filesystem::path& exePath) {
+    StageTimer _t(ST_MAPS);
+    auto px = exePath.parent_path() / "map_x_q.bin"; auto py = exePath.parent_path() / "map_y_q.bin";
+    FILE* fxp = fopen(px.string().c_str(), "wb"); FILE* fyp = fopen(py.string().c_str(), "wb");
+    fwrite(mapx.data(), sizeof(int16_t), mapx.size(), fxp); fclose(fxp);
+    fwrite(mapy.data(), sizeof(int16_t), mapy.size(), fyp); fclose(fyp);
+    printf("[INFO] Cylindrical maps (Q12.4) saved.\r\n");
+}
+static void generateCylMapsQ(std::vector<int16_t>& mapx, std::vector<int16_t>& mapy, int w, int h, float fov_h_deg, float fov_v_deg, float x_shift, const std::filesystem::path& exePath) {
+    StageTimer _t(ST_MAPS);
+    mapx.resize((size_t)w * h); mapy.resize((size_t)w * h);
+    float fov_h_rad = fov_h_deg * (float)M_PI / 180.0f, fov_v_rad = fov_v_deg * (float)M_PI / 180.0f;
+    float fx_cyl = w / (2.0f * tanf(fov_h_rad / 2.0f));
+    float fy_cyl = h / (2.0f * tanf(fov_v_rad / 2.0f));
+    float cx_cyl = w / 2.0f, cy_cyl = h / 2.0f;
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
-            float dx = x - cx_center;
-            float dy = y - cy_center - translate_y;
-            float src_x = cos_a * dx + sin_a * dy + cx_center;
-            float src_y = -sin_a * dx + cos_a * dy + cy_center;
-            unsigned char pixel[3];
-            interpolation(img, src_x, src_y, pixel);
-            for (int c = 0; c < 3; ++c) {
-                PIXEL(output, y, x, c) = pixel[c];
-            }
-        }
-    }
-    printf("Affine applied with angle=%.2f, shift=%.2f\n", angle_deg, translate_y);
-
-    return output;
-}
-
-void loadCylindricalMaps(Image** map_x, Image** map_y, int width, int height, const std::filesystem::path& exePath) {
-    *map_x = (Image*)malloc(sizeof(Image));
-    *map_y = (Image*)malloc(sizeof(Image));
-
-    (*map_x)->width = width;
-    (*map_x)->height = height;
-    (*map_x)->channels = 1;
-    (*map_x)->data = (unsigned char*)malloc(width * height * sizeof(float));
-
-    (*map_y)->width = width;
-    (*map_y)->height = height;
-    (*map_y)->channels = 1;
-    (*map_y)->data = (unsigned char*)malloc(width * height * sizeof(float));
-
-    std::filesystem::path mapx_path = exePath.parent_path() / "map_x.bin";
-    std::filesystem::path mapy_path = exePath.parent_path() / "map_y.bin";
-
-    FILE* fx = fopen(mapx_path.string().c_str(), "rb");
-    fread((*map_x)->data, sizeof(float), width * height, fx);
-    fclose(fx);
-
-    FILE* fy = fopen(mapy_path.string().c_str(), "rb");
-    fread((*map_y)->data, sizeof(float), width * height, fy);
-    fclose(fy);
-
-    printf("[INFO] Cylindrical maps loaded from disk.\n");
-}
-
-
-void generateCylindricalRemap(Image** map_x, Image** map_y, int width, int height, float fov_h_deg, float fov_v_deg, float x_shift, const std::filesystem::path& exePath)
-{
-    float fov_h_rad = fov_h_deg * (M_PI / 180.0f);
-    float fov_v_rad = fov_v_deg * (M_PI / 180.0f);
-
-    float fx_cyl = width / (2.0f * tanf(fov_h_rad / 2.0f));
-    float fy_cyl = height / (2.0f * tanf(fov_v_rad / 2.0f));
-    float cx_cyl = width / 2.0f;
-    float cy_cyl = height / 2.0f;
-
-    // Allocate map_x
-    *map_x = (Image*)malloc(sizeof(Image));
-    (*map_x)->width = width;
-    (*map_x)->height = height;
-    (*map_x)->channels = 1;
-    (*map_x)->data = (unsigned char*)malloc(width * height * sizeof(float));
-
-    // Allocate map_y
-    *map_y = (Image*)malloc(sizeof(Image));
-    (*map_y)->width = width;
-    (*map_y)->height = height;
-    (*map_y)->channels = 1;
-    (*map_y)->data = (unsigned char*)malloc(width * height * sizeof(float));
-
-    for (int y = 0; y < height; ++y)
-    {
-        for (int x = 0; x < width; ++x)
-        {
             float theta = (x - cx_cyl + x_shift) / fx_cyl;
-            float h = (y - cy_cyl) / fy_cyl;
-
-            float x_source = sinf(theta);
-            float y_source = h;
-            float z_source = cosf(theta);
-
-            float src_x = fx*resize_factor * (x_source / z_source) + cx*resize_factor;
-            float src_y = fy*resize_factor * (y_source / z_source) + cy*resize_factor;
-
-            int index = y * width + x;
-            ((float*)(*map_x)->data)[index] = src_x;
-            ((float*)(*map_y)->data)[index] = src_y;
+            float hh = (y - cy_cyl) / fy_cyl;
+            float xs = sinf(theta), ys = hh, zs = cosf(theta);
+            float src_x = fx * resize_factor * (xs / zs) + cx * resize_factor;
+            float src_y = fy * resize_factor * (ys / zs) + cy * resize_factor;
+            int32_t qx = (int32_t)lroundf(src_x * MAP_SCALE);
+            int32_t qy = (int32_t)lroundf(src_y * MAP_SCALE);
+            qx = clampi(qx, INT16_MIN, INT16_MAX);
+            qy = clampi(qy, INT16_MIN, INT16_MAX);
+            mapx[(size_t)y * w + x] = (int16_t)qx; MEM_WRITE(sizeof(int16_t));
+            mapy[(size_t)y * w + x] = (int16_t)qy; MEM_WRITE(sizeof(int16_t));
         }
     }
-
-    // Save map_x and map_y to binary files
-    std::filesystem::path mapx_path = exePath.parent_path() / "map_x.bin";
-    std::filesystem::path mapy_path = exePath.parent_path() / "map_y.bin";
-
-    FILE* fx = fopen(mapx_path.string().c_str(), "wb");
-    fwrite((*map_x)->data, sizeof(float), width * height, fx);
-    fclose(fx);
-
-    FILE* fy = fopen(mapy_path.string().c_str(), "wb");
-    fwrite((*map_y)->data, sizeof(float), width * height, fy);
-    fclose(fy);
-
-    printf("[INFO] Cylindrical maps saved to %s and %s\n",
-        mapx_path.string().c_str(), mapy_path.string().c_str());
-
+    saveCylMapsQ(mapx, mapy, exePath);
 }
 
+static std::filesystem::path undXPath(const std::filesystem::path& exe) { return exe.parent_path() / L"und_x_q.bin"; }
+static std::filesystem::path undYPath(const std::filesystem::path& exe) { return exe.parent_path() / L"und_y_q.bin"; }
+static bool loadUndistForwardMapsQ(std::vector<int16_t>& udx_q, std::vector<int16_t>& udy_q, int w, int h, const std::filesystem::path& exe) {
+    StageTimer _t(ST_UNDISTMAP);
+    auto px = undXPath(exe), py = undYPath(exe);
+    FILE* fxp = fopen(px.string().c_str(), "rb"); FILE* fyp = fopen(py.string().c_str(), "rb");
+    if (!fxp || !fyp) { if (fxp)fclose(fxp); if (fyp)fclose(fyp); return false; }
+    udx_q.resize((size_t)w * h); udy_q.resize((size_t)w * h);
+    fread(udx_q.data(), sizeof(int16_t), (size_t)w * h, fxp); fclose(fxp);
+    fread(udy_q.data(), sizeof(int16_t), (size_t)w * h, fyp); fclose(fyp);
+    printf("[INFO] Forward undistort maps loaded.\r\n"); return true;
+}
+static void saveUndistForwardMapsQ(const std::vector<int16_t>& udx_q, const std::vector<int16_t>& udy_q, int w, int h, const std::filesystem::path& exe) {
+    StageTimer _t(ST_UNDISTMAP);
+    auto px = undXPath(exe), py = undYPath(exe);
+    FILE* fxp = fopen(px.string().c_str(), "wb"); FILE* fyp = fopen(py.string().c_str(), "wb");
+    fwrite(udx_q.data(), sizeof(int16_t), udx_q.size(), fxp); fclose(fxp);
+    fwrite(udy_q.data(), sizeof(int16_t), udy_q.size(), fyp); fclose(fyp);
+    printf("[INFO] Forward undistort maps saved.\r\n");
+}
+static void generateUndistortForwardMapsQ(
+    std::vector<int16_t>& udx_q, std::vector<int16_t>& udy_q,
+    int w, int h,
+    float fx_src, float fy_src, float cx_src, float cy_src,
+    float fx_und, float fy_und, float cx_und, float cy_und,
+    float k1, float k2, float k3, float p1, float p2,
+    float resize_factor_local)
+{
+    StageTimer _t(ST_UNDISTMAP);
+    udx_q.resize((size_t)w * h); udy_q.resize((size_t)w * h);
+    const float fx_r = fx_src * resize_factor_local, fy_r = fy_src * resize_factor_local, cx_r = cx_src * resize_factor_local, cy_r = cy_src * resize_factor_local;
+    const float fxu_r = fx_und * resize_factor_local, fyu_r = fy_und * resize_factor_local, cxu_r = cx_und * resize_factor_local, cyu_r = cy_und * resize_factor_local;
+    for (int v = 0; v < h; ++v) {
+        for (int u = 0; u < w; ++u) {
+            float x = (u - cxu_r) / fxu_r, y = (v - cyu_r) / fyu_r, r2 = x * x + y * y;
+            float radial = 1.0f + k1 * r2 + k2 * r2 * r2 + k3 * r2 * r2 * r2;
+            float dx = 2.0f * p1 * x * y + p2 * (r2 + 2.0f * x * x);
+            float dy = p1 * (r2 + 2.0f * y * y) + 2.0f * p2 * x * y;
+            float xd = x * radial + dx, yd = y * radial + dy;
+            float u_d = xd * fx_r + cx_r, v_d = yd * fy_r + cy_r;
+            int32_t qx = (int32_t)lroundf(u_d * MAP_SCALE);
+            int32_t qy = (int32_t)lroundf(v_d * MAP_SCALE);
+            qx = clampi(qx, INT16_MIN, INT16_MAX);
+            qy = clampi(qy, INT16_MIN, INT16_MAX);
+            udx_q[(size_t)v * w + u] = (int16_t)qx; MEM_WRITE(sizeof(int16_t));
+            udy_q[(size_t)v * w + u] = (int16_t)qy; MEM_WRITE(sizeof(int16_t));
+        }
+    }
+    printf("[INFO] Forward undistort maps (Q12.4) built.\r\n");
+}
 
+// ===================== Compose Cyl with Undist (Q12.4) =====================
+static std::filesystem::path compXPath(const std::filesystem::path& exe) { return exe.parent_path() / L"comp_x_q.bin"; }
+static std::filesystem::path compYPath(const std::filesystem::path& exe) { return exe.parent_path() / L"comp_y_q.bin"; }
+static bool loadComposedMapsQ(std::vector<int16_t>& ox, std::vector<int16_t>& oy, int w, int h, const std::filesystem::path& exe) {
+    StageTimer _t(ST_UNDISTMAP);
+    auto px = compXPath(exe), py = compYPath(exe);
+    FILE* fxp = fopen(px.string().c_str(), "rb"); FILE* fyp = fopen(py.string().c_str(), "rb");
+    if (!fxp || !fyp) { if (fxp)fclose(fxp); if (fyp)fclose(fyp); return false; }
+    ox.resize((size_t)w * h); oy.resize((size_t)w * h);
+    fread(ox.data(), sizeof(int16_t), (size_t)w * h, fxp); fclose(fxp);
+    fread(oy.data(), sizeof(int16_t), (size_t)w * h, fyp); fclose(fyp);
+    printf("[INFO] Composed maps loaded.\r\n"); return true;
+}
+static void saveComposedMapsQ(const std::vector<int16_t>& ox, const std::vector<int16_t>& oy, int w, int h, const std::filesystem::path& exe) {
+    StageTimer _t(ST_UNDISTMAP);
+    auto px = compXPath(exe), py = compYPath(exe);
+    FILE* fxp = fopen(px.string().c_str(), "wb"); FILE* fyp = fopen(py.string().c_str(), "wb");
+    fwrite(ox.data(), sizeof(int16_t), ox.size(), fxp); fclose(fxp);
+    fwrite(oy.data(), sizeof(int16_t), oy.size(), fyp); fclose(fyp);
+    printf("[INFO] Composed maps saved.\r\n");
+}
+static void composeCylWithUndistQ(
+    const std::vector<int16_t>& cyl_x_q, const std::vector<int16_t>& cyl_y_q,
+    const std::vector<int16_t>& und_x_q, const std::vector<int16_t>& und_y_q,
+    int w, int h,
+    std::vector<int16_t>& out_x_q, std::vector<int16_t>& out_y_q)
+{
+    StageTimer _t(ST_UNDISTMAP);
+    out_x_q.resize((size_t)w * h); out_y_q.resize((size_t)w * h);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            int32_t fu_q = (int32_t)cyl_x_q[(size_t)y * w + x];
+            int32_t fv_q = (int32_t)cyl_y_q[(size_t)y * w + x];
+            int32_t fu_q16 = fu_q << (WFIX_SHIFT - MAP_SHIFT);
+            int32_t fv_q16 = fv_q << (WFIX_SHIFT - MAP_SHIFT);
+            int iu = clampi((fu_q16 >> WFIX_SHIFT), 0, w - 2);
+            int iv = clampi((fv_q16 >> WFIX_SHIFT), 0, h - 2);
+            uint8_t wx8 = (uint8_t)((fu_q16 >> 8) & 0xFF);
+            uint8_t wy8 = (uint8_t)((fv_q16 >> 8) & 0xFF);
+            int W_x1 = (int)wx8, W_y1 = (int)wy8; int W_x0 = 256 - W_x1, W_y0 = 256 - W_y1;
+            int32_t v00x = und_x_q[(size_t)iv * w + iu], v10x = und_x_q[(size_t)iv * w + iu + 1];
+            int32_t v01x = und_x_q[(size_t)(iv + 1) * w + iu], v11x = und_x_q[(size_t)(iv + 1) * w + iu + 1];
+            int32_t v00y = und_y_q[(size_t)iv * w + iu], v10y = und_y_q[(size_t)iv * w + iu + 1];
+            int32_t v01y = und_y_q[(size_t)(iv + 1) * w + iu], v11y = und_y_q[(size_t)(iv + 1) * w + iu + 1];
+            auto bilerp_q = [&](int32_t A00, int32_t A10, int32_t A01, int32_t A11)->int32_t {
+                int32_t h0 = A00 + (((A10 - A00) * W_x1) >> 8);
+                int32_t h1 = A01 + (((A11 - A01) * W_x1) >> 8);
+                return h0 + (((h1 - h0) * W_y1) >> 8);
+                };
+            int32_t ux_q = bilerp_q(v00x, v10x, v01x, v11x);
+            int32_t uy_q = bilerp_q(v00y, v10y, v01y, v11y);
+            out_x_q[(size_t)y * w + x] = (int16_t)clampi(ux_q, INT16_MIN, INT16_MAX);
+            out_y_q[(size_t)y * w + x] = (int16_t)clampi(uy_q, INT16_MIN, INT16_MAX);
+            MEM_WRITE(2 * sizeof(int16_t));
+        }
+    }
+    printf("[INFO] Composed Cyl×Undist maps built (Q12.4).\r\n");
+}
 
+// ===================== LUT + Renderer =====================
+#pragma pack(push,1)
+struct MapEntry { int16_t x0, y0; uint16_t wx, wy; };
+#pragma pack(pop)
 
+// build LUT from resampled maps; note src_stride to keep row alignment fixed
+static void buildLUT_FromResampled(
+    std::vector<MapEntry>& lut,
+    const int16_t* comp_x_s, const int16_t* comp_y_s, // Q12.4
+    int out_w, int out_h,
+    int src_stride,                                   // stride of comp_*_s rows
+    int in_w, int in_h,
+    int resized_w, int resized_h,
+    float roll_deg, int y_shift_px, float resize_factor_local)
+{
+    StageTimer _t(ST_LUT);
+    lut.resize((size_t)out_w * out_h);
 
-// === Cylindrical Remapping Function ===
-//Image* cylindricalRemap(const Image* img, const Image* map_x, const Image* map_y) {
-//    Image* output = (Image*)malloc(sizeof(Image));
-//    output->width = img->width;
-//    output->height = img->height;
-//    output->channels = img->channels;
-//    output->data = (unsigned char*)calloc(img->width * img->height * img->channels, sizeof(unsigned char));
-//
-//    for (int y = 0; y < img->height; ++y) {
-//        for (int x = 0; x < img->width; ++x) {
-//            int index = y * img->width + x;
-//            float src_x = ((float*)map_x->data)[index];
-//            float src_y = ((float*)map_y->data)[index];
-//
-//            unsigned char pixel[3];
-//            interpolation(img, src_x, src_y, pixel);
-//
-//            for (int c = 0; c < 3; ++c) {
-//                PIXEL(output, y, x, c) = pixel[c];
-//            }
-//        }
-//    }
-//    return output;
-//}
-//
-//
-//// === Manual Crop Function ===
-//Image* cropFrame(const Image* img, int start_x, int start_y, int crop_w, int crop_h) {
-//    Image* cropped = (Image*)malloc(sizeof(Image));
-//    cropped->width = crop_w;
-//    cropped->height = crop_h;
-//    cropped->channels = img->channels;
-//    cropped->data = (unsigned char*)calloc(crop_w * crop_h * img->channels, sizeof(unsigned char));
-//
-//    for (int y = 0; y < crop_h; ++y) {
-//        for (int x = 0; x < crop_w; ++x) {
-//            int src_x = start_x + x;
-//            int src_y = start_y + y;
-//            if (src_x >= 0 && src_x < img->width && src_y >= 0 && src_y < img->height) {
-//                for (int c = 0; c < img->channels; ++c) {
-//                    PIXEL(cropped, y, x, c) = PIXEL(img, src_y, src_x, c);
-//                }
-//            }
-//        }
-//    }
-//    return cropped;
-//}
-//
-//// === Center Crop Function ===
-//Image* cropFrameHW(const Image* img, float crop_scale_h, float crop_scale_w) {
-//    int crop_h = (int)(img->height * crop_scale_h);
-//    int crop_w = (int)(img->width * crop_scale_w);
-//    int start_y = (img->height - crop_h) / 2;
-//    int start_x = (img->width - crop_w) / 2;
-//    return cropFrame(img, start_x, start_y, crop_w, crop_h);
-//}
+    const int32_t cxr_q = (resized_w << 15);
+    const int32_t cyr_q = (resized_h << 15);
+    int16_t c15 = 0, s15 = 0; get_cos_sin_q15(roll_deg, &c15, &s15);
+    const int32_t yshift_q = ((int32_t)y_shift_px) << WFIX_SHIFT;
+    const int32_t inv_resize_q = (int32_t)llroundf((1.0f / resize_factor_local) * (1 << WFIX_SHIFT));
+    const int32_t max_x_q = ((in_w - 2) << WFIX_SHIFT);
+    const int32_t max_y_q = ((in_h - 2) << WFIX_SHIFT);
 
+    for (int y = 0; y < out_h; ++y) {
+        const int16_t* mx = &comp_x_s[(size_t)y * src_stride];
+        const int16_t* my = &comp_y_s[(size_t)y * src_stride];
+        MapEntry* me = &lut[(size_t)y * out_w];
+        for (int x = 0; x < out_w; ++x) {
+            int32_t srcx_q16 = ((int32_t)mx[x]) << (WFIX_SHIFT - MAP_SHIFT);
+            int32_t srcy_q16 = ((int32_t)my[x]) << (WFIX_SHIFT - MAP_SHIFT);
 
-Image* processFramePipeline(
-    const Image* input,
-    const Image* map_x,
-    const Image* map_y,
-    float resize_factor,
-    float roll_angle_deg,
-    float y_shift,
-    float crop_h_scale,
-    float crop_w_scale
-) {
-    // Determine intermediate sizes
-    int resized_w = static_cast<int>(input->width * resize_factor);
-    int resized_h = static_cast<int>(input->height * resize_factor);
+            int32_t dx_q = srcx_q16 - cxr_q;
+            int32_t dy_q = (srcy_q16 - cyr_q) - yshift_q;
 
-    // Determine crop area
-    int crop_w = static_cast<int>(resized_w * crop_w_scale);
-    int crop_h = static_cast<int>(resized_h * crop_h_scale);
-    int crop_x0 = (resized_w - crop_w) / 2;
-    int crop_y0 = (resized_h - crop_h) / 2;
+            int32_t ax_q = (int32_t)(((int64_t)c15 * dx_q + (int64_t)s15 * dy_q) >> 15) + cxr_q;
+            int32_t ay_q = (int32_t)((-(int64_t)s15 * dx_q + (int64_t)c15 * dy_q) >> 15) + cyr_q;
 
-    // Prepare output image
-    Image* output = (Image*)malloc(sizeof(Image));
-    output->width = crop_w;
-    output->height = crop_h;
-    output->channels = 3;
-    output->data = (unsigned char*)calloc(crop_w * crop_h * 3, sizeof(unsigned char));
+            int32_t ox_q = (int32_t)(((int64_t)ax_q * inv_resize_q) >> WFIX_SHIFT);
+            int32_t oy_q = (int32_t)(((int64_t)ay_q * inv_resize_q) >> WFIX_SHIFT);
 
-    // Precompute rotation parameters
-    float angle_rad = roll_angle_deg * M_PI / 180.0f;
-    float cos_a = cosf(angle_rad);
-    float sin_a = sinf(angle_rad);
-    float cx = resized_w / 2.0f;
-    float cy = resized_h / 2.0f;
+            ox_q = clampi(ox_q, 0, max_x_q);
+            oy_q = clampi(oy_q, 0, max_y_q);
 
-    // Combined processing loop
-    for (int y = 0; y < crop_h; ++y) {
-        for (int x = 0; x < crop_w; ++x) {
-            int target_x = crop_x0 + x;
-            int target_y = crop_y0 + y;
+            MapEntry e;
+            e.x0 = (int16_t)(ox_q >> WFIX_SHIFT);
+            e.y0 = (int16_t)(oy_q >> WFIX_SHIFT);
+            e.wx = (uint16_t)(ox_q & 0xFFFF);
+            e.wy = (uint16_t)(oy_q & 0xFFFF);
+            me[x] = e; MEM_WRITE(sizeof(MapEntry));
+        }
+    }
+}
 
-            // Cylindrical source from map
-            int map_idx = target_y * resized_w + target_x;
-            float src_x_cyl = ((float*)map_x->data)[map_idx];
-            float src_y_cyl = ((float*)map_y->data)[map_idx];
-
-            // Affine transform
-            float dx = src_x_cyl - cx;
-            float dy = src_y_cyl - cy - y_shift;
-
-            float affine_x = cos_a * dx + sin_a * dy + cx;
-            float affine_y = -sin_a * dx + cos_a * dy + cy;
-
-            // Resize: inverse scale to original image
-            float final_x = affine_x / resize_factor;
-            float final_y = affine_y / resize_factor;
-
-            // Interpolate and store
-            unsigned char pixel[3];
-            interpolation(input, final_x, final_y, pixel);
-            for (int c = 0; c < 3; ++c) {
-                PIXEL(output, y, x, c) = pixel[c];
+static void renderFromLUT_Tiled(const Image* src, const std::vector<MapEntry>& lut, int out_w, int out_h, Image* out) {
+    StageTimer _t(ST_RENDER);
+    out->width = out_w; out->height = out_h; out->channels = 3;
+    out->data = (unsigned char*)malloc((size_t)out_w * out_h * 3);
+    const int sstride = src->width * 3;
+    for (int ty = 0; ty < out_h; ty += TILE_H) {
+        int h_block = (ty + TILE_H <= out_h) ? TILE_H : (out_h - ty);
+        for (int tx = 0; tx < out_w; tx += TILE_W) {
+            int w_block = (tx + TILE_W <= out_w) ? TILE_W : (out_w - tx);
+            for (int y = 0; y < h_block; ++y) {
+                int oy = ty + y;
+                const MapEntry* rowLUT = &lut[(size_t)oy * out_w + tx];
+                unsigned char* dst = &out->data[(size_t)oy * out_w * 3 + tx * 3];
+                for (int x = 0; x < w_block; ++x) {
+                    const MapEntry e = rowLUT[x];
+                    int x0 = e.x0, y0 = e.y0; unsigned wx = e.wx, wy = e.wy;
+                    unsigned W_x0 = 0x10000 - wx, W_x1 = wx;
+                    unsigned W_y0 = 0x10000 - wy, W_y1 = wy;
+                    unsigned W00 = (unsigned)(((uint64_t)W_x0 * W_y0) >> 16);
+                    unsigned W10 = (unsigned)(((uint64_t)W_x1 * W_y0) >> 16);
+                    unsigned W01 = (unsigned)(((uint64_t)W_x0 * W_y1) >> 16);
+                    unsigned W11 = (unsigned)(((uint64_t)W_x1 * W_y1) >> 16);
+                    const unsigned char* p0 = &src->data[(size_t)y0 * sstride + x0 * 3];
+                    const unsigned char* p1 = p0 + 3;
+                    const unsigned char* p2 = p0 + sstride;
+                    const unsigned char* p3 = p2 + 3;
+                    unsigned char* d = &dst[x * 3];
+                    d[0] = (unsigned char)((p0[0] * W00 + p1[0] * W10 + p2[0] * W01 + p3[0] * W11) >> 16);
+                    d[1] = (unsigned char)((p0[1] * W00 + p1[1] * W10 + p2[1] * W01 + p3[1] * W11) >> 16);
+                    d[2] = (unsigned char)((p0[2] * W00 + p1[2] * W10 + p2[2] * W01 + p3[2] * W11) >> 16);
+                }
             }
         }
     }
-
-    return output;
 }
 
-
-
-Image* ResizeImage(const Image* input, float scale) {
-    int new_width = static_cast<int>(input->width * scale);
-    int new_height = static_cast<int>(input->height * scale);
-
-    // Allocate new image manually
-    Image* output = (Image*)malloc(sizeof(Image));
-    output->width = new_width;
-    output->height = new_height;
-    output->channels = input->channels;
-    output->data = (unsigned char*)calloc(new_width * new_height * input->channels, sizeof(unsigned char));
-
-    for (int y = 0; y < new_height; ++y) {
-        for (int x = 0; x < new_width; ++x) {
-            float src_x = x / scale;
-            float src_y = y / scale;
-
-            unsigned char pixel[3]; // Assuming 3 channels max; extend if needed
-            interpolation(input, src_x, src_y, pixel);
-
-            for (int c = 0; c < input->channels; ++c) {
-                output->data[(y * new_width + x) * input->channels + c] = pixel[c];
-            }
-        }
-    }
-
-    return output;
-}
-
-
-Image* featherBlendFit(const std::vector<Image*>& frames, int overlap, int target_width, int target_height) {
-    if (frames.empty()) return NULL;
-
-    int height = frames[0]->height;
-    int channels = frames[0]->channels;
-    int total_width = frames[0]->width;
-
-    for (int i = 1; i < frames.size(); ++i)
-        total_width += (frames[i]->width - overlap);
-
-    // Step 1: Allocate intermediate panorama buffer
+// ===================== Feather Blend with vertical padding =====================
+static Image* featherBlendWithPadMT(const std::vector<Image*>& frames, int overlap, int final_w, int final_h, TinyPool& pool) {
+    StageTimer _t(ST_BLEND);
+    if (frames.empty()) return nullptr;
+    const int c = 3;
     Image* blended = (Image*)malloc(sizeof(Image));
-    blended->width = total_width;
-    blended->height = height;
-    blended->channels = channels;
-    blended->data = (unsigned char*)calloc(total_width * height * channels, sizeof(unsigned char));
+    blended->width = final_w; blended->height = final_h; blended->channels = c;
+    blended->data = (unsigned char*)calloc((size_t)final_w * final_h * c, 1); // pad=0
+    const int src_h = frames[0]->height;
+    const int ypad = (final_h - src_h) / 2;
+    std::vector<uint16_t> alpha(overlap);
+    for (int x = 0; x < overlap; ++x) alpha[x] = (uint16_t)(((uint64_t)x << 16) / (overlap ? overlap : 1));
 
-    int current_x = 0;
-    for (int i = 0; i < frames.size(); ++i) {
-        Image* img = frames[i];
-        for (int y = 0; y < height; ++y) {
-            for (int x = 0; x < img->width; ++x) {
-                int out_x = current_x + x;
+    auto worker = [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
+            int sy = y - ypad; if (sy < 0 || sy >= src_h) continue;
+            unsigned char* dstRow = &blended->data[(size_t)y * final_w * c];
 
-                if (i > 0 && x < overlap) {
-                    float alpha = (float)x / (float)overlap;
-                    for (int c = 0; c < channels; ++c) {
-                        unsigned char prev = PIXEL(blended, y, out_x, c);
-                        unsigned char curr = PIXEL(img, y, x, c);
-                        PIXEL(blended, y, out_x, c) = (unsigned char)((1 - alpha) * prev + alpha * curr);
+            // seed with first camera
+            const Image* img0 = frames[0];
+            const unsigned char* src0 = &img0->data[(size_t)sy * img0->width * c];
+            memcpy(dstRow, src0, (size_t)img0->width * c);
+            int curx = img0->width;
+
+            for (size_t i = 1; i < frames.size(); ++i) {
+                const Image* img = frames[i];
+                const unsigned char* srcRow = &img->data[(size_t)sy * img->width * c];
+                int ov = overlap; if (ov > img->width) ov = img->width; if (ov > curx) ov = curx;
+
+                // overlap blend
+                for (int x = 0; x < ov; ++x) {
+                    unsigned a = alpha[x];
+                    size_t dp = (size_t)(curx - ov + x) * c, sp = (size_t)x * c;
+                    for (int ch = 0; ch < 3; ++ch) {
+                        unsigned prev = dstRow[dp + ch], curr = srcRow[sp + ch];
+                        dstRow[dp + ch] = (unsigned char)((prev * (0x10000 - a) + curr * a) >> 16);
                     }
                 }
-                else {
-                    for (int c = 0; c < channels; ++c) {
-                        PIXEL(blended, y, out_x, c) = PIXEL(img, y, x, c);
-                    }
-                }
+                // tail copy
+                int tail = img->width - ov;
+                if (tail > 0) memcpy(&dstRow[(size_t)curx * c], &srcRow[(size_t)ov * c], (size_t)tail * c);
+                curx += tail;
             }
         }
-        current_x += (img->width - overlap);
-    }
-
-    // Step 2: Resize to target width, compute scale factor
-    float scale = (float)target_width / blended->width;
-    int new_height = (int)(blended->height * scale);
-
-    Image* resized = ResizeImage(blended, scale);
-    free(blended->data);
-    free(blended);
-
-    // Step 3: Create final image with vertical padding to target height
-    Image* final_output = (Image*)malloc(sizeof(Image));
-    final_output->width = target_width;
-    final_output->height = target_height;
-    final_output->channels = channels;
-    final_output->data = (unsigned char*)calloc(target_width * target_height * channels, sizeof(unsigned char));
-
-    int y_offset = (target_height - new_height) / 2;
-
-    for (int y = 0; y < new_height; ++y) {
-        for (int x = 0; x < target_width; ++x) {
-            for (int c = 0; c < channels; ++c) {
-                PIXEL(final_output, y + y_offset, x, c) = PIXEL(resized, y, x, c);
-            }
-        }
-    }
-
-    free(resized->data);
-    free(resized);
-    return final_output;
+        };
+    const int chunk = 128;
+    for (int y0 = 0; y0 < final_h; y0 += chunk) pool.submit([worker, y0, final_h] { worker(y0, std::min(final_h, y0 + chunk)); });
+    pool.wait_idle();
+    return blended;
 }
 
-
-
-
-void convert_rpy_sensor_to_cam(
-    double roll_sys1, double pitch_sys1, double yaw_offset,
-    double pitch_offset, double roll_offset,
-    float* roll_deg_out, float* pitch_deg_out, float* yaw_deg_out
-) {
-    // Convert to radians
-    double roll_rad = roll_sys1 * M_PI / 180.0;
-    double pitch_rad = pitch_sys1 * M_PI / 180.0;
-    double roll_offset_rad = roll_offset * M_PI / 180.0;
-    double pitch_offset_rad = pitch_offset * M_PI / 180.0;
-    double yaw_offset_rad = yaw_offset * M_PI / 180.0;
-
-    // Rotation matrix Rx (roll)
-    double Rx[3][3] = {
-        {1, 0, 0},
-        {0, cos(roll_rad), -sin(roll_rad)},
-        {0, sin(roll_rad),  cos(roll_rad)}
-    };
-
-    // Rotation matrix Ry (pitch)
-    double Ry[3][3] = {
-        {cos(pitch_rad), 0, sin(pitch_rad)},
-        {0, 1, 0},
-        {-sin(pitch_rad), 0, cos(pitch_rad)}
-    };
-
-    // R_sys1 = Rx * Ry
+// ===================== Sensor to camera =====================
+static void convert_rpy_sensor_to_cam(double roll_sys1, double pitch_sys1, double yaw_offset, double pitch_offset, double roll_offset, float* roll_deg_out, float* pitch_deg_out, float* yaw_deg_out) {
+    StageTimer _t(ST_MISC);
+    double rr = roll_sys1 * M_PI / 180.0, pp = pitch_sys1 * M_PI / 180.0;
+    double ror = roll_offset * M_PI / 180.0, por = pitch_offset * M_PI / 180.0, yor = yaw_offset * M_PI / 180.0;
+    double Rx[3][3] = { {1,0,0},{0,cos(rr),-sin(rr)},{0,sin(rr),cos(rr)} };
+    double Ry[3][3] = { {cos(pp),0,sin(pp)},{0,1,0},{-sin(pp),0,cos(pp)} };
     double R_sys1[3][3];
-    for (int i = 0; i < 3; ++i)
-        for (int j = 0; j < 3; ++j)
-            R_sys1[i][j] = Rx[i][0] * Ry[0][j] + Rx[i][1] * Ry[1][j] + Rx[i][2] * Ry[2][j];
-
-    // Rotation matrices for offsets
-    double R_roll_offset[3][3] = {
-        {1, 0, 0},
-        {0, cos(roll_offset_rad), -sin(roll_offset_rad)},
-        {0, sin(roll_offset_rad),  cos(roll_offset_rad)}
-    };
-    double R_pitch_offset[3][3] = {
-        {cos(pitch_offset_rad), 0, sin(pitch_offset_rad)},
-        {0, 1, 0},
-        {-sin(pitch_offset_rad), 0, cos(pitch_offset_rad)}
-    };
-    double R_yaw_offset[3][3] = {
-        {cos(yaw_offset_rad), -sin(yaw_offset_rad), 0},
-        {sin(yaw_offset_rad),  cos(yaw_offset_rad), 0},
-        {0, 0, 1}
-    };
-
-    // R_offset = R_yaw * R_pitch * R_roll
-    double R_temp[3][3], R_offset[3][3];
-    for (int i = 0; i < 3; ++i)
-        for (int j = 0; j < 3; ++j)
-            R_temp[i][j] = R_yaw_offset[i][0] * R_pitch_offset[0][j] +
-            R_yaw_offset[i][1] * R_pitch_offset[1][j] +
-            R_yaw_offset[i][2] * R_pitch_offset[2][j];
-
-    for (int i = 0; i < 3; ++i)
-        for (int j = 0; j < 3; ++j)
-            R_offset[i][j] = R_temp[i][0] * R_roll_offset[0][j] +
-            R_temp[i][1] * R_roll_offset[1][j] +
-            R_temp[i][2] * R_roll_offset[2][j];
-
-    // Final rotation R_cam(i) = R_sensor * R_offset
-    double R_sysX[3][3];
-    for (int i = 0; i < 3; ++i)
-        for (int j = 0; j < 3; ++j)
-            R_sysX[i][j] = R_sys1[i][0] * R_offset[0][j] +
-            R_sys1[i][1] * R_offset[1][j] +
-            R_sys1[i][2] * R_offset[2][j];
-
-    // Extract Euler angles
-    double pitchX = asin(-R_sysX[2][0]);
-    double cy = cos(pitchX);
-    double rollX, yawX;
-
-    if (fabs(cy) > 1e-6) {
-        rollX = atan2(R_sysX[2][1], R_sysX[2][2]);
-        yawX = atan2(R_sysX[1][0], R_sysX[0][0]);
-    }
-    else {
-        rollX = 0;
-        yawX = atan2(-R_sysX[0][1], R_sysX[1][1]);
-    }
-
+    for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) R_sys1[i][j] = Rx[i][0] * Ry[0][j] + Rx[i][1] * Ry[1][j] + Rx[i][2] * Ry[2][j];
+    double Rr[3][3] = { {1,0,0},{0,cos(ror),-sin(ror)},{0,sin(ror),cos(ror)} };
+    double Rp[3][3] = { {cos(por),0,sin(por)},{0,1,0},{-sin(por),0,cos(por)} };
+    double Rz[3][3] = { {cos(yor),-sin(yor),0},{sin(yor),cos(yor),0},{0,0,1} };
+    double Rt[3][3];
+    for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) Rt[i][j] = Rz[i][0] * Rp[0][j] + Rz[i][1] * Rp[1][j] + Rz[i][2] * Rp[2][j];
+    double Roff[3][3];
+    for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) Roff[i][j] = Rt[i][0] * Rr[0][j] + Rt[i][1] * Rr[1][j] + Rt[i][2] * Rr[2][j];
+    double R[3][3];
+    for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) R[i][j] = R_sys1[i][0] * Roff[0][j] + R_sys1[i][1] * Roff[1][j] + R_sys1[i][2] * Roff[2][j];
+    double pitchX = asin(-R[2][0]); double cy_ = cos(pitchX);
+    double rollX, yawX; if (fabs(cy_) > 1e-6) { rollX = atan2(R[2][1], R[2][2]); yawX = atan2(R[1][0], R[0][0]); }
+    else { rollX = 0; yawX = atan2(-R[0][1], R[1][1]); }
     *roll_deg_out = (float)(rollX * 180.0 / M_PI);
     *pitch_deg_out = (float)(pitchX * 180.0 / M_PI);
     *yaw_deg_out = (float)(yawX * 180.0 / M_PI);
 }
 
-std::wstring StringToWString(const std::string& str)
-{
-    if (str.empty()) return {};
-    int size_needed = MultiByteToWideChar(CP_UTF8, 0, str.data(), (int)str.size(), NULL, 0);
-    std::wstring result(size_needed, 0);
-    MultiByteToWideChar(CP_UTF8, 0, str.data(), (int)str.size(), &result[0], size_needed);
-    return result;
-}
+// ===================== Pipeline Data Structures =====================
+struct LutData {
+    int frame;
+    std::chrono::high_resolution_clock::time_point start_time;
+    std::vector<std::vector<MapEntry>> luts; // per camera
+};
 
-std::string WStringToUtf8(const std::wstring& wstr)
-{
-    if (wstr.empty()) return {};
-    int size = WideCharToMultiByte(CP_UTF8, 0, wstr.data(), (int)wstr.length(), nullptr, 0, nullptr, nullptr);
-    std::string result(size, 0);
-    WideCharToMultiByte(CP_UTF8, 0, wstr.data(), (int)wstr.length(), &result[0], size, nullptr, nullptr);
-    return result;
-}
+struct RenderData {
+    int frame;
+    std::chrono::high_resolution_clock::time_point start_time;
+    std::vector<Image*> stabilized; // per camera
+};
 
-std::string SaveImageFilePath(const std::wstring& captureDir, const std::wstring& prefix)
-{
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-
-    wchar_t buffer[512];
-    swprintf_s(buffer, 512, L"%s\\%04d%02d%02d_%02d%02d%02d_%s.bmp",
-        captureDir.c_str(),
-        st.wYear, st.wMonth, st.wDay,
-        st.wHour, st.wMinute, st.wSecond, prefix.c_str());
-
-    std::wstring widePath(buffer);
-    return WStringToUtf8(widePath);
-}
-
-
-
-
-
-
-
-float clamp(float val) {
-    return (val > 5.0f) ? 5.0f : (val < -5.0f) ? -5.0f : val;
-}
-
-
+// ===================== main =====================
 int main() {
-    
-    
-    
-    // Get base path
-    wchar_t szPath[MAX_PATH] = L"";
-    GetModuleFileNameW(NULL, szPath, MAX_PATH);
+    build_angle_lut();
 
-    // Convert to std::filesystem::path
-    std::filesystem::path exePath(szPath);
-    std::filesystem::path imuIniPath = exePath;
-    std::filesystem::path paramsIniPath = exePath;
-    imuIniPath.replace_extension(L".ini");                 // IMU_Stabilize_Gyro.ini
-    paramsIniPath.replace_filename(L"parameters.ini");     // parameters.ini in same folder
+    wchar_t wpath[MAX_PATH] = L""; GetModuleFileNameW(NULL, wpath, MAX_PATH);
+    std::filesystem::path exePath(wpath);
+    std::filesystem::path imuIniPath = exePath;        imuIniPath.replace_extension(L".ini");
+    std::filesystem::path paramsIniPath = exePath;     paramsIniPath.replace_filename(L"parameters.ini");
 
-    // Create INI managers for both
-    INIManager imuIni(imuIniPath);
+    // Read parameters once
     INIManager paramIni(paramsIniPath);
+    WIDTH = paramIni.ReadInteger(L"image", L"width", WIDTH);
+    HEIGHT = paramIni.ReadInteger(L"image", L"height", HEIGHT);
+    NUM_CAMS = paramIni.ReadInteger(L"image", L"num_cams", NUM_CAMS);
 
-
-    
-
-
-    // === Read from parameters.ini ===
-    WIDTH = paramIni.ReadInteger(L"image", L"width", 1920);
-    HEIGHT = paramIni.ReadInteger(L"image", L"height", 1080);
-    NUM_CAMS = paramIni.ReadInteger(L"image", L"num_cams", 6);
-    BUFFER_LINES = paramIni.ReadInteger(L"image", L"buffer_lines", 15);
-
-    fx = paramIni.ReadFloat(L"calibration", L"fx", 1204.505857f);
-    fy = paramIni.ReadFloat(L"calibration", L"fy", 1204.505857f);
+    fx = paramIni.ReadFloat(L"calibration", L"fx", fx);
+    fy = paramIni.ReadFloat(L"calibration", L"fy", fy);
     float cx_ratio = paramIni.ReadFloat(L"calibration", L"cx_ratio", 0.5f);
     float cy_ratio = paramIni.ReadFloat(L"calibration", L"cy_ratio", 0.5f);
-    cx = WIDTH * cx_ratio;
-    cy = HEIGHT * cy_ratio;
+    cx = WIDTH * cx_ratio; cy = HEIGHT * cy_ratio;
 
-    fx_new = paramIni.ReadFloat(L"calibration", L"fx_dist", 1204.505857f);
-    fy_new = paramIni.ReadFloat(L"calibration", L"fy_dist", 1204.505857f);
-    cx_new = paramIni.ReadFloat(L"calibration", L"cx_dist", 1204.505857f);
-    cy_new = paramIni.ReadFloat(L"calibration", L"cy_dist", 1204.505857f);
+    fx_new = paramIni.ReadFloat(L"calibration", L"fx_dist", fx_new);
+    fy_new = paramIni.ReadFloat(L"calibration", L"fy_dist", fy_new);
+    cx_new = paramIni.ReadFloat(L"calibration", L"cx_dist", cx_new);
+    cy_new = paramIni.ReadFloat(L"calibration", L"cy_dist", cy_new);
 
-    K1 = paramIni.ReadFloat(L"calibration", L"k1", -0.343698f);
-    K2 = paramIni.ReadFloat(L"calibration", L"k2", 0.105503f);
-    K3 = paramIni.ReadFloat(L"calibration", L"k3", 0.0f);
-    P1 = paramIni.ReadFloat(L"calibration", L"p1", -0.001558f);
-    P2 = paramIni.ReadFloat(L"calibration", L"p2", -0.002416f);
+    K1 = paramIni.ReadFloat(L"calibration", L"k1", K1);
+    K2 = paramIni.ReadFloat(L"calibration", L"k2", K2);
+    K3 = paramIni.ReadFloat(L"calibration", L"k3", K3);
+    P1 = paramIni.ReadFloat(L"calibration", L"p1", P1);
+    P2 = paramIni.ReadFloat(L"calibration", L"p2", P2);
 
-    cylindrical_H_fov_deg = paramIni.ReadFloat(L"projection", L"cylindrical_H_fov_deg", 60.0f);
-    cylindrical_V_fov_deg = paramIni.ReadFloat(L"projection", L"cylindrical_V_fov_deg", 51.3f);
+    cylindrical_H_fov_deg = paramIni.ReadFloat(L"projection", L"cylindrical_H_fov_deg", cylindrical_H_fov_deg);
+    cylindrical_V_fov_deg = paramIni.ReadFloat(L"projection", L"cylindrical_V_fov_deg", cylindrical_V_fov_deg);
 
-    panorama_crop_height_scale = paramIni.ReadFloat(L"cropping", L"panorama_crop_height_scale", 0.80f);
-    panorama_crop_width_scale = paramIni.ReadFloat(L"cropping", L"panorama_crop_width_scale", 0.80f);
-    original_crop_height_scale = paramIni.ReadFloat(L"cropping", L"original_crop_height_scale", 0.70f);
-    original_crop_width_scale = paramIni.ReadFloat(L"cropping", L"original_crop_width_scale", 0.54f);
+    panorama_crop_height_scale = paramIni.ReadFloat(L"cropping", L"panorama_crop_height_scale", panorama_crop_height_scale);
+    panorama_crop_width_scale = paramIni.ReadFloat(L"cropping", L"panorama_crop_width_scale", panorama_crop_width_scale);
 
-    resize_factor = paramIni.ReadFloat(L"resize", L"resize_factor ", 0.5);
+    resize_factor = paramIni.ReadFloat(L"resize", L"resize_factor ", resize_factor);
+    PITCH_TO_TRANSLATION_FACTOR = paramIni.ReadFloat(L"transform", L"pitch_to_translation_factor", PITCH_TO_TRANSLATION_FACTOR) * resize_factor;
+    YAW_TO_TRANSLATION_FACTOR = paramIni.ReadFloat(L"transform", L"yaw_to_translation_factor", YAW_TO_TRANSLATION_FACTOR);
 
-    PITCH_TO_TRANSLATION_FACTOR = paramIni.ReadFloat(L"transform", L"pitch_to_translation_factor", -17.44153917818162f);
-    PITCH_TO_TRANSLATION_FACTOR *= resize_factor; // when resizing applied
-    YAW_TO_TRANSLATION_FACTOR = paramIni.ReadFloat(L"transform", L"yaw_to_translation_factor", 17.84f);
+    overlap_px = paramIni.ReadInteger(L"blend", L"overlap_px ", overlap_px);
 
-    overlap_px = paramIni.ReadInteger(L"blend", L"overlap_px ", 100);
-    
-    
+    TARGET_W = paramIni.ReadInteger(L"output", L"target_w", TARGET_W);
+    TARGET_H = paramIni.ReadInteger(L"output", L"target_h", TARGET_H);
 
+    // IMU ini
+    INIManager imuIni(imuIniPath);
 
-    // === Read from IMU_Stabilize_Gyro.ini ===
-    PathRemoveFileSpecW(szPath);
-    std::wstring dirCapture = std::wstring(szPath) + L"\\Capture";
-    CreateDirectoryW(dirCapture.c_str(), NULL);
-
-    std::vector<std::string> filenames;
+    // Input file names
+    std::vector<std::string> filenames; filenames.reserve(NUM_CAMS);
     for (int i = 0; i < NUM_CAMS; ++i) {
         std::wstring key = L"file_" + std::to_wstring(i);
-        std::wstring val = imuIni.ReadString(L"images", key, L"");
-        filenames.push_back(WStringToUtf8(val));
+        filenames.push_back(WStringToUtf8(imuIni.ReadString(L"images", key, L"")));
     }
 
-    std::vector<float> yaw_offset_cam = imuIni.ReadFloatArray(L"offset", L"yaw");
-    std::vector<float> pitch_offset_cam = imuIni.ReadFloatArray(L"offset", L"pitch");
-    std::vector<float> roll_offset_cam = imuIni.ReadFloatArray(L"offset", L"roll");
+    std::vector<float> yaw_off = imuIni.ReadFloatArray(L"offset", L"yaw");
+    std::vector<float> pit_off = imuIni.ReadFloatArray(L"offset", L"pitch");
+    std::vector<float> rol_off = imuIni.ReadFloatArray(L"offset", L"roll");
 
-
-
-    //-----------------------------Read in realtime later------------------------------
-    Stabilization = imuIni.ReadBoolean(L"Sensor_Orientation", L"stabilization", true);
-
-    if (Stabilization) {
-        roll_Sensor = imuIni.ReadFloat(L"Sensor_Orientation", L"roll", 0.0f);
-        pitch_Sensor = imuIni.ReadFloat(L"Sensor_Orientation", L"pitch", 0.0f);
-        yaw_Sensor = imuIni.ReadFloat(L"Sensor_Orientation", L"yaw", 0.0f);
-
-        // Clamp values to ±5 degrees
-        roll_Sensor = clamp(roll_Sensor);
-        pitch_Sensor = clamp(pitch_Sensor);
-        yaw_Sensor = clamp(yaw_Sensor);
+    auto clamp5 = [&](float v) { return v > 5.0f ? 5.0f : (v < -5.0f ? -5.0f : v); };
+    bool StabilizationIni = imuIni.ReadBoolean(L"Sensor_Orientation", L"stabilization", true);
+    if (StabilizationIni) {
+        roll_Sensor = clamp5(imuIni.ReadFloat(L"Sensor_Orientation", L"roll", 0.0f));
+        pitch_Sensor = clamp5(imuIni.ReadFloat(L"Sensor_Orientation", L"pitch", 0.0f));
+        yaw_Sensor = clamp5(imuIni.ReadFloat(L"Sensor_Orientation", L"yaw", 0.0f));
     }
-    else {
-        roll_Sensor = 0.0f;
-        pitch_Sensor = 0.0f;
-        yaw_Sensor = 0.0f;
-    }
+    else { roll_Sensor = pitch_Sensor = yaw_Sensor = 0.0f; }
 
-    //----------------------------------------------------------------------------------
+    logln("........Processing (V5 Tiled + Undist + ResampledX + PaddedY, stride fix, multi-frame, pipelined fixed)........");
 
-    // ===== DEBUG PRINT: IMU INI values =====
-    printf("\n[DEBUG] Sensor Orientation:\n");
-    printf("  Roll:  %.3f\n", roll_Sensor);
-    printf("  Pitch: %.3f\n", pitch_Sensor);
-    printf("  Yaw:   %.3f\n", yaw_Sensor);
+    // Geometry in resized-map space
+    const int resized_w = (int)lroundf(WIDTH * resize_factor);
+    const int resized_h = (int)lroundf(HEIGHT * resize_factor);
+    const int crop_w = (int)lroundf(resized_w * panorama_crop_width_scale);
+    const int crop_h = (int)lroundf(resized_h * panorama_crop_height_scale);
+    const int crop_x0 = (resized_w - crop_w) / 2;
+    const int crop_y0 = (resized_h - crop_h) / 2;
 
-    printf("\n[DEBUG] Camera Offsets:\n");
-    for (int i = 0; i < yaw_offset_cam.size(); ++i) {
-        printf("  Cam %d - Yaw: %.3f, Pitch: %.3f, Roll: %.3f\n",
-            i,
-            i < yaw_offset_cam.size() ? yaw_offset_cam[i] : -999.0f,
-            i < pitch_offset_cam.size() ? pitch_offset_cam[i] : -999.0f,
-            i < roll_offset_cam.size() ? roll_offset_cam[i] : -999.0f
-        );
+    // Maps load/build once
+    std::vector<int16_t> cyl_x_q, cyl_y_q;
+    try { loadCylMapsQ(cyl_x_q, cyl_y_q, resized_w, resized_h, exePath); }
+    catch (...) { generateCylMapsQ(cyl_x_q, cyl_y_q, resized_w, resized_h, cylindrical_H_fov_deg, cylindrical_V_fov_deg, 0.0f, exePath); }
+
+    std::vector<int16_t> und_x_q, und_y_q;
+    if (!loadUndistForwardMapsQ(und_x_q, und_y_q, resized_w, resized_h, exePath)) {
+        generateUndistortForwardMapsQ(und_x_q, und_y_q, resized_w, resized_h,
+            fx, fy, cx, cy, fx_new, fy_new, cx_new, cy_new, K1, K2, K3, P1, P2, resize_factor);
+        saveUndistForwardMapsQ(und_x_q, und_y_q, resized_w, resized_h, exePath);
     }
 
-    // ===== DEBUG PRINT: Parameters INI values =====
-    printf("\n[DEBUG] Image & Calibration Parameters:\n");
-    printf("  WIDTH: %d, HEIGHT: %d, NUM_CAMS: %d, BUFFER_LINES: %d\n", WIDTH, HEIGHT, NUM_CAMS, BUFFER_LINES);
-    printf("  fx: %.3f, fy: %.3f, cx: %.3f, cy: %.3f\n", fx, fy, cx, cy);
-    printf("  K1: %.6f, K2: %.6f, K3: %.6f\n", K1, K2, K3);
-    printf("  P1: %.6f, P2: %.6f\n", P1, P2);
-
-    printf("\n[DEBUG] Projection & Cropping:\n");
-    printf("  FOV: %.2f°\n", cylindrical_H_fov_deg);
-    printf("  Panorama Crop (H x W): %.2f x %.2f\n", panorama_crop_height_scale, panorama_crop_width_scale);
-    printf("  Original Crop (H x W): %.2f x %.2f\n", original_crop_height_scale, original_crop_width_scale);
-
-    printf("\n[DEBUG] Transform & Blending:\n");
-    printf("  Pitch to Translation: %.6f\n", PITCH_TO_TRANSLATION_FACTOR);
-    printf("  Yaw to Translation:   %.6f\n", YAW_TO_TRANSLATION_FACTOR);
-    printf("  Overlap Ratio:        %.2f\n", OVERLAP_RATIO);
-    printf("  NON_OVERLAP_WIDTH:    %d\n", NON_OVERLAP_WIDTH);
-    printf("  PANORAMA_WIDTH:       %d\n", PANORAMA_WIDTH);
-
-
-    printf("\n........Processing........\n");
-
-
-    std::vector<Image*> frames(NUM_CAMS);
-    std::vector<Image*> stabilized_frames;
-    std::vector<Image*> original_frames;
-    Image* map_x, * map_y;
-    std::filesystem::path mapx_path = exePath.parent_path() / "map_x.bin";
-    std::filesystem::path mapy_path = exePath.parent_path() / "map_y.bin";
-
-    if (std::filesystem::exists(mapx_path) && std::filesystem::exists(mapy_path)) {
-        loadCylindricalMaps(&map_x, &map_y, WIDTH * resize_factor, HEIGHT * resize_factor, exePath);
-    }
-    else {
-        generateCylindricalRemap(&map_x, &map_y, WIDTH * resize_factor, HEIGHT * resize_factor, cylindrical_H_fov_deg, cylindrical_V_fov_deg, 0.0f, exePath);
+    std::vector<int16_t> comp_x_q, comp_y_q;
+    if (!loadComposedMapsQ(comp_x_q, comp_y_q, resized_w, resized_h, exePath)) {
+        composeCylWithUndistQ(cyl_x_q, cyl_y_q, und_x_q, und_y_q, resized_w, resized_h, comp_x_q, comp_y_q);
+        saveComposedMapsQ(comp_x_q, comp_y_q, resized_w, resized_h, exePath);
     }
 
-
-    if (filenames.size() != NUM_CAMS) {
-        printf("[ERROR] filenames.size() = %zu, but NUM_CAMS = %d\n", filenames.size(), NUM_CAMS);
-        exit(1);
+    // Input frames load once
+    std::vector<Image*> frames(NUM_CAMS, nullptr);
+    for (int i = 0; i < NUM_CAMS; ++i) {
+        frames[i] = readBMP(filenames[i].c_str());
+        if (!frames[i]) { printf("[ERROR] read fail cam %d\r\n", i); return 1; }
+        printf("[INFO] Camera %2d: %dx%d\r\n", i, frames[i]->width, frames[i]->height);
     }
-    
-    for (int cam_idx = 0; cam_idx < NUM_CAMS; ++cam_idx) {
-        
-        
-        float roll_cam = 0, pitch_cam = 0, yaw_cam = 0;
-        convert_rpy_sensor_to_cam(
-            roll_Sensor, pitch_Sensor,
-            yaw_offset_cam[cam_idx],
-            pitch_offset_cam[cam_idx],
-            roll_offset_cam[cam_idx],
-            &roll_cam, &pitch_cam, &yaw_cam
-        );
 
-        int y_shift = (int)(PITCH_TO_TRANSLATION_FACTOR * pitch_cam);
-        frames[cam_idx] = readBMP(filenames[cam_idx].c_str());
+    // Per-camera target widths to fill TARGET_W with overlap
+    const int overlap_resized = (int)lroundf(overlap_px * resize_factor);
+    const int pano_w_crop = NUM_CAMS * crop_w - (NUM_CAMS - 1) * overlap_resized;
+    const double scale_x = (double)TARGET_W / (double)pano_w_crop;
 
-        if (!frames[cam_idx]) {
-            printf("[ERROR] Failed to read image for camera %d: %s\n", cam_idx, filenames[cam_idx].c_str());
-            continue;
+    int overlap_target = (int)llround(overlap_resized * scale_x);
+    int per_cam_w_base = (int)llround(crop_w * scale_x);
+
+    std::vector<int> per_cam_w(NUM_CAMS, per_cam_w_base);
+    {
+        int total_now = NUM_CAMS * per_cam_w_base - (NUM_CAMS - 1) * overlap_target;
+        int delta = TARGET_W - total_now;
+        for (int i = 0; delta > 0 && i < NUM_CAMS; ++i, --delta) per_cam_w[i]++;
+        for (int i = 0; delta < 0 && i < NUM_CAMS; ++i, ++delta) if (per_cam_w[i] > 1) per_cam_w[i]--;
+    }
+    const int per_cam_h = crop_h;
+    int per_cam_w_max = 0; for (int w : per_cam_w) per_cam_w_max = std::max(per_cam_w_max, w);
+
+    // One-time horizontal resample of composed maps to per_cam_w_max, height = crop_h
+    std::vector<int16_t> comp_x_s((size_t)per_cam_w_max * per_cam_h);
+    std::vector<int16_t> comp_y_s((size_t)per_cam_w_max * per_cam_h);
+
+    std::vector<int> iu(per_cam_w_max);
+    std::vector<uint8_t> wx8(per_cam_w_max);
+    {
+        const double sx = (double)crop_w / (double)per_cam_w_max;
+        for (int x = 0; x < per_cam_w_max; ++x) {
+            double u = crop_x0 + (x + 0.5) * sx - 0.5;
+            int iu0 = clampi((int)floor(u), 0, resized_w - 2);
+            iu[x] = iu0;
+            int w8 = (int)std::lround((u - iu0) * 256.0); if (w8 < 0) w8 = 0; if (w8 > 255) w8 = 255;
+            wx8[x] = (uint8_t)w8;
         }
+    }
+    {
+        for (int y = 0; y < per_cam_h; ++y) {
+            int src_y = clampi(crop_y0 + y, 0, resized_h - 2);
+            const int16_t* r0x = &comp_x_q[(size_t)src_y * resized_w];
+            const int16_t* r0y = &comp_y_q[(size_t)src_y * resized_w];
+            const int16_t* r1x = &comp_x_q[(size_t)(src_y + 1) * resized_w];
+            const int16_t* r1y = &comp_y_q[(size_t)(src_y + 1) * resized_w];
 
-        printf("[INFO] Camera %d: Width = %d, Height = %d\n",
-            cam_idx, frames[cam_idx]->width, frames[cam_idx]->height);
+            int16_t* dxx = &comp_x_s[(size_t)y * per_cam_w_max];
+            int16_t* dyy = &comp_y_s[(size_t)y * per_cam_w_max];
 
-            
-        // The frame processing pipeline 
-        Image* undistorted = Undistort(frames[cam_idx]);
-        Image* cropped = processFramePipeline(
-            undistorted, map_x, map_y,
-            resize_factor,
-            -roll_cam,
-            -(float)y_shift,
-            panorama_crop_height_scale,
-            panorama_crop_width_scale
-        );
-
-
-        stabilized_frames.push_back(cropped);
-        
-
-        //// Save each original frame
-        wchar_t label[32];
-        //swprintf_s(label, L"original_cam%d", cam_idx);
-        //std::string frame_path = SaveImageFilePath(dirCapture, label);
-        //writeBMP(frame_path.c_str(), f_orig);
-        //printf("[Saved Original] %s\n", frame_path.c_str());
-
-        //// Save each undistorted frame
-        //
-        swprintf_s(label, L"undistorted_cam%d", cam_idx);
-        std::string frame_path2 = SaveImageFilePath(dirCapture, label);
-        writeBMP(frame_path2.c_str(), undistorted);
-        printf("[Saved undistorted] %s\n", frame_path2.c_str());
-
-        //
-        free(undistorted->data); free(undistorted);
-       
+            for (int x = 0; x < per_cam_w_max; ++x) {
+                int u0 = iu[x]; int Wx1 = wx8[x]; // Wx0=256-Wx1
+                int32_t a00x = r0x[u0], a10x = r0x[u0 + 1];
+                int32_t a00y = r0y[u0], a10y = r0y[u0 + 1];
+                int32_t hx0x = a00x + (((a10x - a00x) * Wx1) >> 8);
+                int32_t hx0y = a00y + (((a10y - a00y) * Wx1) >> 8);
+                dxx[x] = (int16_t)clampi(hx0x, INT16_MIN, INT16_MAX);
+                dyy[x] = (int16_t)clampi(hx0y, INT16_MIN, INT16_MAX);
+            }
+        }
     }
 
+    // Prepare output dir once
+    std::wstring captureDirW = CAPTURE_DIR_W; CreateDirectoryW(captureDirW.c_str(), NULL);
 
+    // Pipeline setup
+    std::queue<LutData> lut_q;
+    std::queue<RenderData> render_q;
+    std::mutex lut_mx, render_mx;
+    std::condition_variable lut_cv, render_cv;
+    std::vector<double> frame_ms(NUM_FRAMES, 0.0);
+    std::mutex frame_ms_mx;
+    std::atomic<int> finished_frames{ 0 };
+    std::condition_variable done_cv;
+    std::mutex done_mx;
 
-    Image* panorama = featherBlendFit(stabilized_frames, overlap_px * resize_factor, 1620, 480);
+    auto total_t0 = std::chrono::high_resolution_clock::now();
 
+    // LUT stage thread
+    std::thread lut_thread([&] {
+        TinyPool pool(POOL_WORKERS);
+        for (int f = 0; f < NUM_FRAMES; ++f) {
+            LutData data;
+            data.frame = f;
+            data.start_time = std::chrono::high_resolution_clock::now();
+            data.luts.resize(NUM_CAMS);
 
+#if PRINT_STATS_EACH_FRAME
+            reset_stats();
+#endif
 
-   
+            for (int i = 0; i < NUM_CAMS; ++i) {
+                pool.submit([&data, i, &yaw_off, &pit_off, &rol_off, &comp_x_s, &comp_y_s, &per_cam_w, per_cam_h, per_cam_w_max, &frames, resized_w, resized_h] {
+                    float roll_cam = 0, pitch_cam = 0, yaw_cam = 0;
+                    convert_rpy_sensor_to_cam(roll_Sensor, pitch_Sensor,
+                        yaw_off[i], pit_off[i], rol_off[i],
+                        &roll_cam, &pitch_cam, &yaw_cam);
+                    int y_shift_px = (int)lroundf(PITCH_TO_TRANSLATION_FACTOR * pitch_cam);
 
-    
-    std::string result_path = SaveImageFilePath(dirCapture, L"panorama");
+                    buildLUT_FromResampled(
+                        data.luts[i],
+                        comp_x_s.data(), comp_y_s.data(),
+                        per_cam_w[i], per_cam_h,
+                        per_cam_w_max,
+                        frames[i]->width, frames[i]->height,
+                        resized_w, resized_h,
+                        -roll_cam, -y_shift_px, resize_factor);
+                    });
+            }
+            pool.wait_idle();
 
-    writeBMP(result_path.c_str(), panorama);
+#if PRINT_STATS_EACH_FRAME
+            char hdr[96];
+            sprintf(hdr, "PROFILING SUMMARY LUT (frame %d)", f);
+            print_stats_summary(hdr);
+#endif
 
-    
+            {
+                std::unique_lock<std::mutex> lk(lut_mx);
+                lut_q.push(std::move(data));
+            }
+            lut_cv.notify_one();
+        }
+        });
 
-    free(map_x->data); free(map_x);
-    free(map_y->data); free(map_y);
+    // Render stage thread
+    std::thread render_thread([&] {
+        TinyPool pool(POOL_WORKERS);
+        int processed = 0;
+        while (processed < NUM_FRAMES) {
+            LutData data;
+            {
+                std::unique_lock<std::mutex> lk(lut_mx);
+                lut_cv.wait(lk, [&] { return !lut_q.empty(); });
+                data = std::move(lut_q.front());
+                lut_q.pop();
+            }
 
+#if PRINT_STATS_EACH_FRAME
+            reset_stats();
+#endif
+
+            RenderData rdata;
+            rdata.frame = data.frame;
+            rdata.start_time = data.start_time;
+            rdata.stabilized.resize(NUM_CAMS, nullptr);
+
+            for (int i = 0; i < NUM_CAMS; ++i) {
+                pool.submit([&rdata, &data, i, &frames, &per_cam_w, per_cam_h] {
+                    Image* out = (Image*)malloc(sizeof(Image));
+                    renderFromLUT_Tiled(frames[i], data.luts[i], per_cam_w[i], per_cam_h, out);
+                    rdata.stabilized[i] = out;
+                    });
+            }
+            pool.wait_idle();
+
+#if PRINT_STATS_EACH_FRAME
+            char hdr[96];
+            sprintf(hdr, "PROFILING SUMMARY RENDER (frame %d)", data.frame);
+            print_stats_summary(hdr);
+#endif
+
+            {
+                std::unique_lock<std::mutex> lk(render_mx);
+                render_q.push(std::move(rdata));
+            }
+            render_cv.notify_one();
+            ++processed;
+        }
+        });
+
+    // Blend stage thread
+    std::thread blend_thread([&] {
+        TinyPool blend_pool(POOL_WORKERS);
+        int processed = 0;
+        while (processed < NUM_FRAMES) {
+            RenderData rdata;
+            {
+                std::unique_lock<std::mutex> lk(render_mx);
+                render_cv.wait(lk, [&] { return !render_q.empty(); });
+                rdata = std::move(render_q.front());
+                render_q.pop();
+            }
+
+#if PRINT_STATS_EACH_FRAME
+            reset_stats();
+#endif
+
+            Image* panorama = featherBlendWithPadMT(rdata.stabilized, overlap_target, TARGET_W, TARGET_H, blend_pool);
+
+            // Optional save cadence
+            if (SAVE_EVERY_K > 0 && ((rdata.frame + 1) % SAVE_EVERY_K == 0)) {
+                std::string savePath = SaveImageFilePath(captureDirW, L"panorama_v5_resampledX_padY_stridefix_pipelined_fixed", rdata.frame);
+                writeBMP(savePath.c_str(), panorama);
+                printf("[Saved Panorama] %s  | frame %d\n", savePath.c_str(), rdata.frame);
+            }
+
+            auto t1 = std::chrono::high_resolution_clock::now();
+            double ms = std::chrono::duration<double, std::milli>(t1 - rdata.start_time).count();
+            {
+                std::unique_lock<std::mutex> lk(frame_ms_mx);
+                frame_ms[rdata.frame] = ms;
+            }
+            printf("[Frame %d] time %.3f ms\n", rdata.frame, ms);
+
+#if PRINT_STATS_EACH_FRAME
+            char hdr[96];
+            sprintf(hdr, "PROFILING SUMMARY BLEND (frame %d)", rdata.frame);
+            print_stats_summary(hdr);
+#endif
+
+            // cleanup per-frame
+            for (auto* p : rdata.stabilized) { if (p) { free(p->data); free(p); } }
+            if (panorama) { free(panorama->data); free(panorama); }
+
+            ++processed;
+            ++finished_frames;
+            if (finished_frames == NUM_FRAMES) {
+                std::unique_lock<std::mutex> lk(done_mx);
+                done_cv.notify_one();
+            }
+        }
+        });
+
+    // Wait for all frames to finish
+    {
+        std::unique_lock<std::mutex> lk(done_mx);
+        done_cv.wait(lk, [&] { return finished_frames == NUM_FRAMES; });
+    }
+
+    // Join threads
+    lut_thread.join();
+    render_thread.join();
+    blend_thread.join();
+
+    auto total_t1 = std::chrono::high_resolution_clock::now();
+    double total_ms = std::chrono::duration<double, std::milli>(total_t1 - total_t0).count();
+    double throughput_fps = 1000.0 * NUM_FRAMES / total_ms;
+
+    // Multi-frame summary (latency)
+    double sum_ms = 0.0; int counted = 0;
+    for (int i = WARMUP_FRAMES; i < NUM_FRAMES; ++i) { sum_ms += frame_ms[i]; ++counted; }
+    double avg_ms = counted > 0 ? sum_ms / counted : 0.0;
+    double latency_fps = avg_ms > 0.0 ? 1000.0 / avg_ms : 0.0;
+
+    printf("\r\n===== MULTI-FRAME SUMMARY (PIPELINED FIXED) =====\n");
+    printf("Frames: %d (warmup %d ignored for latency avg)\n", NUM_FRAMES, WARMUP_FRAMES);
+    printf("Avg latency per frame: %.3f ms\n", avg_ms);
+    printf("Latency FPS: %.2f\n", latency_fps);
+    printf("Total time: %.3f ms\n", total_ms);
+    printf("Throughput FPS: %.2f\n", throughput_fps);
+
+#if !PRINT_STATS_EACH_FRAME
+    print_stats_summary("PROFILING SUMMARY (V5 resampledX + paddedY, stride fix, multi-frame, pipelined fixed)");
+#endif
+
+    // free input frames once
+    for (auto* f : frames) { if (f) { free(f->data); free(f); } }
     return 0;
 }
