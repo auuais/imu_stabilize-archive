@@ -1,13 +1,11 @@
 ﻿#define _CRT_SECURE_NO_WARNINGS
 #define NOMINMAX
 
-// IMU_Stabilize_Gyro_Linebuffer_MT_V5_Tiled_Undist_ResampledX_PaddedY_FixedStride_Multi_Pipelined_Fixed.cpp
+// IMU_Stabilize_Gyro_Linebuffer_MT_V5_Tiled_Undist_ResampledX_PaddedY_FixedStride_Multi.cpp
 // - Logic identical to stride-fix version
 // - Loads images once, reuses from RAM
 // - Runs N frames, prints per-frame time and multi-frame averages
 // - Optional: print profiling stats per frame; saving cadence configurable
-// - Pipelined across frames: LUT -> Render -> Blend stages in separate threads with queues
-// - Fixed: Persistent thread pools per stage, reduced worker count to avoid oversubscription
 
 #include <Windows.h>
 #include <Shlwapi.h>
@@ -29,7 +27,6 @@
 #include <filesystem>
 #include <chrono>
 #include <stdexcept>
-//#include <immintrin.h>
 
 #include "ini_manager.h"
 
@@ -39,13 +36,13 @@
 
 // ===================== Multi-frame controls =====================
 #ifndef NUM_FRAMES
-#define NUM_FRAMES          960
+#define NUM_FRAMES         720
 #endif
 #ifndef WARMUP_FRAMES
-#define WARMUP_FRAMES        300        // excluded from averages
+#define WARMUP_FRAMES        100        // excluded from averages
 #endif
 #ifndef SAVE_EVERY_K
-#define SAVE_EVERY_K         0     // 0 = save none; 1 = save all; 30 = save every 30th
+#define SAVE_EVERY_K        120       // 0 = save none; 1 = save all; 30 = save every 30th
 #endif
 #ifndef PRINT_STATS_EACH_FRAME
 #define PRINT_STATS_EACH_FRAME 0      // 1 = print profiling summary after each frame
@@ -190,20 +187,55 @@ static void freeImage(Image* img) { if (!img) return; free(img->data); free(img)
 // ===================== Path helpers =====================
 static std::wstring StringToWString(const std::string& s) { if (s.empty()) return {}; int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), NULL, 0); std::wstring r(n, 0); MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &r[0], n); return r; }
 static std::string  WStringToUtf8(const std::wstring& w) { if (w.empty()) return {}; int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), NULL, 0, NULL, NULL); std::string r(n, 0); WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), &r[0], n, NULL, NULL); return r; }
-#define CAPTURE_DIR_W L"C:\\SVNProjects\\IMU_Stabilize_V24\\x64\\Debug\\Capture"
-static std::string SaveImageFilePath(const std::wstring& captureDir, const std::wstring& prefix, int frameIdx = -1) {
+
+#define CAPTURE_DIR_W L"\\Capture" /// Add your path here please
+
+std::wstring GetExeDir()
+{
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+
+    std::wstring path(exePath);
+    size_t pos = path.find_last_of(L"\\/");
+    if (pos != std::wstring::npos)
+        path = path.substr(0, pos);
+
+    return path;
+}
+
+std::wstring GetCaptureDir()
+{
+    std::wstring dir = GetExeDir() + L"\\" + CAPTURE_DIR_W;
+    CreateDirectoryW(dir.c_str(), NULL); // auto-create if missing
+    return dir;
+}
+
+
+static std::string SaveImageFilePath(const std::wstring& prefix, int frameIdx = -1)
+{
     StageTimer _t(ST_IO);
-    SYSTEMTIME st; GetLocalTime(&st);
+
+    std::wstring captureDir = GetCaptureDir();
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+
     wchar_t fname[256];
     if (frameIdx < 0)
         swprintf_s(fname, 256, L"%04d%02d%02d_%02d%02d%02d_%s.bmp",
-            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, prefix.c_str());
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+            prefix.c_str());
     else
         swprintf_s(fname, 256, L"%04d%02d%02d_%02d%02d%02d_%s_f%04d.bmp",
-            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, prefix.c_str(), frameIdx);
-    std::filesystem::path out = std::filesystem::path(captureDir) / fname;
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+            prefix.c_str(), frameIdx);
+
+    std::filesystem::path out =
+        std::filesystem::path(captureDir) / fname;
+
     return WStringToUtf8(out.wstring());
 }
+
 
 // ===================== Tiny Thread Pool =====================
 class TinyPool {
@@ -243,9 +275,6 @@ static float resize_factor = 0.5f;
 static float PITCH_TO_TRANSLATION_FACTOR = -17.44153917818162f, YAW_TO_TRANSLATION_FACTOR = 17.84f;
 static float roll_Sensor = 0.0f, pitch_Sensor = 0.0f, yaw_Sensor = 0.0f;
 static int   TARGET_W = 3840, TARGET_H = 480;
-
-// Number of workers per pool (divided to avoid oversubscription)
-static unsigned POOL_WORKERS = std::max(1u, std::thread::hardware_concurrency() / 2);
 
 // ===================== Angle LUT (±5°, 0.25°) Q1.15 =====================
 struct AngleLUTEntry { int16_t c; int16_t s; };
@@ -515,7 +544,7 @@ static void renderFromLUT_Tiled(const Image* src, const std::vector<MapEntry>& l
 }
 
 // ===================== Feather Blend with vertical padding =====================
-static Image* featherBlendWithPadMT(const std::vector<Image*>& frames, int overlap, int final_w, int final_h, TinyPool& pool) {
+static Image* featherBlendWithPadMT(const std::vector<Image*>& frames, int overlap, int final_w, int final_h) {
     StageTimer _t(ST_BLEND);
     if (frames.empty()) return nullptr;
     const int c = 3;
@@ -527,6 +556,7 @@ static Image* featherBlendWithPadMT(const std::vector<Image*>& frames, int overl
     std::vector<uint16_t> alpha(overlap);
     for (int x = 0; x < overlap; ++x) alpha[x] = (uint16_t)(((uint64_t)x << 16) / (overlap ? overlap : 1));
 
+    TinyPool pool(std::max(1u, std::thread::hardware_concurrency()));
     auto worker = [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y) {
             int sy = y - ypad; if (sy < 0 || sy >= src_h) continue;
@@ -560,7 +590,7 @@ static Image* featherBlendWithPadMT(const std::vector<Image*>& frames, int overl
         }
         };
     const int chunk = 128;
-    for (int y0 = 0; y0 < final_h; y0 += chunk) pool.submit([worker, y0, final_h] { worker(y0, std::min(final_h, y0 + chunk)); });
+    for (int y0 = 0; y0 < final_h; y0 += chunk) pool.submit([&, y0] { worker(y0, std::min(final_h, y0 + chunk)); });
     pool.wait_idle();
     return blended;
 }
@@ -590,19 +620,6 @@ static void convert_rpy_sensor_to_cam(double roll_sys1, double pitch_sys1, doubl
     *pitch_deg_out = (float)(pitchX * 180.0 / M_PI);
     *yaw_deg_out = (float)(yawX * 180.0 / M_PI);
 }
-
-// ===================== Pipeline Data Structures =====================
-struct LutData {
-    int frame;
-    std::chrono::high_resolution_clock::time_point start_time;
-    std::vector<std::vector<MapEntry>> luts; // per camera
-};
-
-struct RenderData {
-    int frame;
-    std::chrono::high_resolution_clock::time_point start_time;
-    std::vector<Image*> stabilized; // per camera
-};
 
 // ===================== main =====================
 int main() {
@@ -674,7 +691,7 @@ int main() {
     }
     else { roll_Sensor = pitch_Sensor = yaw_Sensor = 0.0f; }
 
-    logln("........Processing (V5 Tiled + Undist + ResampledX + PaddedY, stride fix, multi-frame, pipelined fixed)........");
+    logln("........Processing (V5 Tiled + Undist + ResampledX + PaddedY, stride fix, multi-frame)........");
 
     // Geometry in resized-map space
     const int resized_w = (int)lroundf(WIDTH * resize_factor);
@@ -770,195 +787,98 @@ int main() {
     // Prepare output dir once
     std::wstring captureDirW = CAPTURE_DIR_W; CreateDirectoryW(captureDirW.c_str(), NULL);
 
-    // Pipeline setup
-    std::queue<LutData> lut_q;
-    std::queue<RenderData> render_q;
-    std::mutex lut_mx, render_mx;
-    std::condition_variable lut_cv, render_cv;
-    std::vector<double> frame_ms(NUM_FRAMES, 0.0);
-    std::mutex frame_ms_mx;
-    std::atomic<int> finished_frames{ 0 };
-    std::condition_variable done_cv;
-    std::mutex done_mx;
+    // Frame loop
+    std::vector<double> frame_ms; frame_ms.reserve(NUM_FRAMES);
+    reset_stats(); // stats across all frames
+    for (int f = 0; f < NUM_FRAMES; ++f) {
+        auto t0 = std::chrono::high_resolution_clock::now();
 
-    auto total_t0 = std::chrono::high_resolution_clock::now();
+        // Per-frame: build LUTs and render per camera
+        std::vector<Image*> stabilized(NUM_CAMS, nullptr);
+        auto process_one = [&](int cam_idx) {
+            float roll_cam = 0, pitch_cam = 0, yaw_cam = 0;
+            convert_rpy_sensor_to_cam(roll_Sensor, pitch_Sensor,
+                yaw_off[cam_idx], pit_off[cam_idx], rol_off[cam_idx],
+                &roll_cam, &pitch_cam, &yaw_cam);
+            int y_shift_px = (int)lroundf(PITCH_TO_TRANSLATION_FACTOR * pitch_cam);
 
-    // LUT stage thread
-    std::thread lut_thread([&] {
-        TinyPool pool(POOL_WORKERS);
-        for (int f = 0; f < NUM_FRAMES; ++f) {
-            LutData data;
-            data.frame = f;
-            data.start_time = std::chrono::high_resolution_clock::now();
-            data.luts.resize(NUM_CAMS);
+            const int ow = per_cam_w[cam_idx];
+            const int oh = per_cam_h;
 
-#if PRINT_STATS_EACH_FRAME
-            reset_stats();
-#endif
+            std::vector<MapEntry> lut; lut.reserve((size_t)ow * oh);
+            buildLUT_FromResampled(
+                lut,
+                comp_x_s.data(), comp_y_s.data(),
+                ow, oh,
+                /*src_stride=*/per_cam_w_max,
+                frames[cam_idx]->width, frames[cam_idx]->height,
+                resized_w, resized_h,
+                -roll_cam, -y_shift_px, resize_factor);
 
-            for (int i = 0; i < NUM_CAMS; ++i) {
-                pool.submit([&data, i, &yaw_off, &pit_off, &rol_off, &comp_x_s, &comp_y_s, &per_cam_w, per_cam_h, per_cam_w_max, &frames, resized_w, resized_h] {
-                    float roll_cam = 0, pitch_cam = 0, yaw_cam = 0;
-                    convert_rpy_sensor_to_cam(roll_Sensor, pitch_Sensor,
-                        yaw_off[i], pit_off[i], rol_off[i],
-                        &roll_cam, &pitch_cam, &yaw_cam);
-                    int y_shift_px = (int)lroundf(PITCH_TO_TRANSLATION_FACTOR * pitch_cam);
+            Image* out = (Image*)malloc(sizeof(Image));
+            renderFromLUT_Tiled(frames[cam_idx], lut, ow, oh, out);
+            stabilized[cam_idx] = out;
+            };
 
-                    buildLUT_FromResampled(
-                        data.luts[i],
-                        comp_x_s.data(), comp_y_s.data(),
-                        per_cam_w[i], per_cam_h,
-                        per_cam_w_max,
-                        frames[i]->width, frames[i]->height,
-                        resized_w, resized_h,
-                        -roll_cam, -y_shift_px, resize_factor);
-                    });
-            }
+#if ENABLE_MT
+        {
+            TinyPool pool(std::max(1u, std::thread::hardware_concurrency()));
+            for (int i = 0; i < NUM_CAMS; ++i) pool.submit([&, i] { process_one(i); });
             pool.wait_idle();
-
-#if PRINT_STATS_EACH_FRAME
-            char hdr[96];
-            sprintf(hdr, "PROFILING SUMMARY LUT (frame %d)", f);
-            print_stats_summary(hdr);
-#endif
-
-            {
-                std::unique_lock<std::mutex> lk(lut_mx);
-                lut_q.push(std::move(data));
-            }
-            lut_cv.notify_one();
         }
-        });
-
-    // Render stage thread
-    std::thread render_thread([&] {
-        TinyPool pool(POOL_WORKERS);
-        int processed = 0;
-        while (processed < NUM_FRAMES) {
-            LutData data;
-            {
-                std::unique_lock<std::mutex> lk(lut_mx);
-                lut_cv.wait(lk, [&] { return !lut_q.empty(); });
-                data = std::move(lut_q.front());
-                lut_q.pop();
-            }
-
-#if PRINT_STATS_EACH_FRAME
-            reset_stats();
+#else
+        for (int i = 0; i < NUM_CAMS; ++i) process_one(i);
 #endif
 
-            RenderData rdata;
-            rdata.frame = data.frame;
-            rdata.start_time = data.start_time;
-            rdata.stabilized.resize(NUM_CAMS, nullptr);
+        // Blend with vertical padding
+        Image* panorama = featherBlendWithPadMT(stabilized, overlap_target, TARGET_W, TARGET_H);
 
-            for (int i = 0; i < NUM_CAMS; ++i) {
-                pool.submit([&rdata, &data, i, &frames, &per_cam_w, per_cam_h] {
-                    Image* out = (Image*)malloc(sizeof(Image));
-                    renderFromLUT_Tiled(frames[i], data.luts[i], per_cam_w[i], per_cam_h, out);
-                    rdata.stabilized[i] = out;
-                    });
-            }
-            pool.wait_idle();
+        // Optional save cadence
+        if (SAVE_EVERY_K > 0 && ((f + 1) % SAVE_EVERY_K == 0)) {
 
-#if PRINT_STATS_EACH_FRAME
-            char hdr[96];
-            sprintf(hdr, "PROFILING SUMMARY RENDER (frame %d)", data.frame);
-            print_stats_summary(hdr);
-#endif
+            std::string savePath = SaveImageFilePath(
+                L"panorama_v5_resampledX_padY_stridefix",
+                f
+            );
 
-            {
-                std::unique_lock<std::mutex> lk(render_mx);
-                render_q.push(std::move(rdata));
-            }
-            render_cv.notify_one();
-            ++processed;
+            writeBMP(savePath.c_str(), panorama);
+
+            printf("[Saved Panorama] %s  | frame %d\n", savePath.c_str(), f);
         }
-        });
 
-    // Blend stage thread
-    std::thread blend_thread([&] {
-        TinyPool blend_pool(POOL_WORKERS);
-        int processed = 0;
-        while (processed < NUM_FRAMES) {
-            RenderData rdata;
-            {
-                std::unique_lock<std::mutex> lk(render_mx);
-                render_cv.wait(lk, [&] { return !render_q.empty(); });
-                rdata = std::move(render_q.front());
-                render_q.pop();
-            }
 
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        frame_ms.push_back(ms);
+        printf("[Frame %d] time %.3f ms\n", f, ms);
+
+        // cleanup per-frame
+        for (auto* p : stabilized) { if (p) { free(p->data); free(p); } }
+        if (panorama) { free(panorama->data); free(panorama); }
+
+        // Optional: per-frame profiling snapshot
 #if PRINT_STATS_EACH_FRAME
-            reset_stats();
+        char hdr[96];
+        sprintf(hdr, "PROFILING SUMMARY (frame %d)", f);
+        print_stats_summary(hdr);
+        reset_stats();
 #endif
-
-            Image* panorama = featherBlendWithPadMT(rdata.stabilized, overlap_target, TARGET_W, TARGET_H, blend_pool);
-
-            // Optional save cadence
-            if (SAVE_EVERY_K > 0 && ((rdata.frame + 1) % SAVE_EVERY_K == 0)) {
-                std::string savePath = SaveImageFilePath(captureDirW, L"panorama_v5_resampledX_padY_stridefix_pipelined_fixed", rdata.frame);
-                writeBMP(savePath.c_str(), panorama);
-                printf("[Saved Panorama] %s  | frame %d\n", savePath.c_str(), rdata.frame);
-            }
-
-            auto t1 = std::chrono::high_resolution_clock::now();
-            double ms = std::chrono::duration<double, std::milli>(t1 - rdata.start_time).count();
-            {
-                std::unique_lock<std::mutex> lk(frame_ms_mx);
-                frame_ms[rdata.frame] = ms;
-            }
-            printf("[Frame %d] time %.3f ms\n", rdata.frame, ms);
-
-#if PRINT_STATS_EACH_FRAME
-            char hdr[96];
-            sprintf(hdr, "PROFILING SUMMARY BLEND (frame %d)", rdata.frame);
-            print_stats_summary(hdr);
-#endif
-
-            // cleanup per-frame
-            for (auto* p : rdata.stabilized) { if (p) { free(p->data); free(p); } }
-            if (panorama) { free(panorama->data); free(panorama); }
-
-            ++processed;
-            ++finished_frames;
-            if (finished_frames == NUM_FRAMES) {
-                std::unique_lock<std::mutex> lk(done_mx);
-                done_cv.notify_one();
-            }
-        }
-        });
-
-    // Wait for all frames to finish
-    {
-        std::unique_lock<std::mutex> lk(done_mx);
-        done_cv.wait(lk, [&] { return finished_frames == NUM_FRAMES; });
     }
 
-    // Join threads
-    lut_thread.join();
-    render_thread.join();
-    blend_thread.join();
-
-    auto total_t1 = std::chrono::high_resolution_clock::now();
-    double total_ms = std::chrono::duration<double, std::milli>(total_t1 - total_t0).count();
-    double throughput_fps = 1000.0 * NUM_FRAMES / total_ms;
-
-    // Multi-frame summary (latency)
+    // Multi-frame summary
     double sum_ms = 0.0; int counted = 0;
-    for (int i = WARMUP_FRAMES; i < NUM_FRAMES; ++i) { sum_ms += frame_ms[i]; ++counted; }
+    for (int i = WARMUP_FRAMES; i < (int)frame_ms.size(); ++i) { sum_ms += frame_ms[i]; ++counted; }
     double avg_ms = counted > 0 ? sum_ms / counted : 0.0;
-    double latency_fps = avg_ms > 0.0 ? 1000.0 / avg_ms : 0.0;
+    double avg_fps = avg_ms > 0.0 ? 1000.0 / avg_ms : 0.0;
 
-    printf("\r\n===== MULTI-FRAME SUMMARY (PIPELINED FIXED) =====\n");
-    printf("Frames: %d (warmup %d ignored for latency avg)\n", NUM_FRAMES, WARMUP_FRAMES);
-    printf("Avg latency per frame: %.3f ms\n", avg_ms);
-    printf("Latency FPS: %.2f\n", latency_fps);
-    printf("Total time: %.3f ms\n", total_ms);
-    printf("Throughput FPS: %.2f\n", throughput_fps);
+    printf("\r\n===== MULTI-FRAME SUMMARY =====\n");
+    printf("Frames: %d (warmup %d ignored)\n", NUM_FRAMES, WARMUP_FRAMES);
+    printf("Avg frame time: %.3f ms\n", avg_ms);
+    printf("Avg FPS: %.2f\n", avg_fps);
 
+    // If per-frame stats were not printed, print the aggregate of all frames
 #if !PRINT_STATS_EACH_FRAME
-    print_stats_summary("PROFILING SUMMARY (V5 resampledX + paddedY, stride fix, multi-frame, pipelined fixed)");
+    print_stats_summary("PROFILING SUMMARY (V5 resampledX + paddedY, stride fix, multi-frame)");
 #endif
 
     // free input frames once
