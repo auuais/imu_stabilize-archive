@@ -42,10 +42,10 @@
 #define NUM_FRAMES          960
 #endif
 #ifndef WARMUP_FRAMES
-#define WARMUP_FRAMES        300        // excluded from averages
+#define WARMUP_FRAMES       200       // excluded from averages
 #endif
 #ifndef SAVE_EVERY_K
-#define SAVE_EVERY_K         0     // 0 = save none; 1 = save all; 30 = save every 30th
+#define SAVE_EVERY_K         240    // 0 = save none; 1 = save all; 30 = save every 30th
 #endif
 #ifndef PRINT_STATS_EACH_FRAME
 #define PRINT_STATS_EACH_FRAME 0      // 1 = print profiling summary after each frame
@@ -53,10 +53,10 @@
 
 // ===================== Tiles =====================
 #ifndef TILE_W
-#define TILE_W  128
+#define TILE_W  1920
 #endif
 #ifndef TILE_H
-#define TILE_H   64
+#define TILE_H   4
 #endif
 
 #define ENABLE_MT               1
@@ -515,7 +515,7 @@ static void renderFromLUT_Tiled(const Image* src, const std::vector<MapEntry>& l
 }
 
 // ===================== Feather Blend with vertical padding =====================
-static Image* featherBlendWithPadMT(const std::vector<Image*>& frames, int overlap, int final_w, int final_h, TinyPool& pool) {
+static Image* featherBlendWithPadMT(const std::vector<Image*>& frames, int overlap, int final_w, int final_h, TinyPool& pool, float feather_strength = 1.0f) {
     StageTimer _t(ST_BLEND);
     if (frames.empty()) return nullptr;
     const int c = 3;
@@ -525,7 +525,20 @@ static Image* featherBlendWithPadMT(const std::vector<Image*>& frames, int overl
     const int src_h = frames[0]->height;
     const int ypad = (final_h - src_h) / 2;
     std::vector<uint16_t> alpha(overlap);
-    for (int x = 0; x < overlap; ++x) alpha[x] = (uint16_t)(((uint64_t)x << 16) / (overlap ? overlap : 1));
+    if (overlap <= 0) {
+        // no overlap
+    }
+    else {
+        // Non-linear feather using power curve
+        const double inv_overlap = 1.0 / overlap;
+        const double gamma = 1.0 / std::max<float>(0.1f, feather_strength);
+
+        for (int x = 0; x < overlap; ++x) {
+            double t = (x + 0.5) * inv_overlap;  // [0,1]
+            double s = std::pow(t, gamma);      // apply curve
+            alpha[x] = (uint16_t)std::lround(s * 65535.0);
+        }
+    }
 
     auto worker = [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y) {
@@ -647,6 +660,7 @@ int main() {
     YAW_TO_TRANSLATION_FACTOR = paramIni.ReadFloat(L"transform", L"yaw_to_translation_factor", YAW_TO_TRANSLATION_FACTOR);
 
     overlap_px = paramIni.ReadInteger(L"blend", L"overlap_px ", overlap_px);
+    float feather_strength = paramIni.ReadFloat(L"blend", L"feather_strength", 1.0f);
 
     TARGET_W = paramIni.ReadInteger(L"output", L"target_w", TARGET_W);
     TARGET_H = paramIni.ReadInteger(L"output", L"target_h", TARGET_H);
@@ -893,7 +907,7 @@ int main() {
             reset_stats();
 #endif
 
-            Image* panorama = featherBlendWithPadMT(rdata.stabilized, overlap_target, TARGET_W, TARGET_H, blend_pool);
+            Image* panorama = featherBlendWithPadMT(rdata.stabilized, overlap_target, TARGET_W, TARGET_H, blend_pool, feather_strength);
 
             // Optional save cadence
             if (SAVE_EVERY_K > 0 && ((rdata.frame + 1) % SAVE_EVERY_K == 0)) {
