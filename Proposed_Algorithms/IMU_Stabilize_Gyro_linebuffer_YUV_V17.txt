@@ -1,0 +1,2159 @@
+// IMU_stabilize_GYRO_MT_V17_rowrun_fpga_model_ROW_WINDOW_ONFLY_BUCKETS_DDR_SLICE.cpp
+//
+// V17 (PC-time optimizations + Release path robustness):
+// 1) REMOVE huge cam_scan_Y/U/V nested vectors:
+//    - Keep each camera frame as contiguous Y/U/V planes.
+//    - LineCache loads rows via pointer arithmetic (no per-row heap allocations / copies).
+// 2) MOVE on-the-fly bucket build INTO the per-camera worker thread:
+//    - Scheduler work is now parallelized across NUM_CAMS.
+//    - Main thread no longer calls build_runs_for_y0_on_the_fly() per cam.
+// 3) RowWindow allocation made O(1) using a free-slot stack (no WINDOW_H scan).
+// 4) Cache ok/violation counters are accumulated locally per worker per y0, then atomically added once.
+// 5) Release "failed to load frame0" fix:
+//    - Robust INI discovery:
+//      a) Use exe-name.ini if present
+//      b) else try "imu.ini" in exe directory
+//      c) parameters.ini searched in exe directory (and required)
+//    - Also supports CLI override:
+//      argv[1] = imu ini path, argv[2] = parameters ini path
+
+
+#define _CRT_SECURE_NO_WARNINGS
+#define NOMINMAX
+
+#include <Windows.h>
+#include <Shlwapi.h>
+#pragma comment(lib, "Shlwapi.lib")
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstdint>
+#include <cmath>
+#include <cstring>
+#include <string>
+#include <vector>
+#include <thread>
+#include <array>
+#include <filesystem>
+#include <chrono>
+#include <stdexcept>
+#include <atomic>
+#include <algorithm>
+#include <mutex>
+#include <condition_variable>
+
+#include "ini_manager.h"
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+// ===================== Global switches =====================
+#ifndef NUM_FRAMES
+#define NUM_FRAMES          1
+#endif
+
+#ifndef SAVE_EVERY_K
+#define SAVE_EVERY_K        1   // 0 = save none; 1 = save all; 30 = every 30th
+#endif
+
+#ifndef STRIP_H
+#define STRIP_H             2   // hard constraint
+#endif
+
+#ifndef WINDOW_H
+#define WINDOW_H            120 // active destination-row slots (bounded on-chip model)
+#endif
+
+// ===================== Fixed-point constants =====================
+static const int WFIX_SHIFT = 16;   // Q16.16
+static const int MAP_SHIFT = 4;    // Q12.4
+static const int MAP_SCALE = (1 << MAP_SHIFT);
+
+// RowRun delta stored as Q12.4 (int16), promoted to Q16.16 by << 12
+static const int DRUN_SHIFT = 4;                        // Q12.4
+static const int DRUN_TO_Q16 = (WFIX_SHIFT - DRUN_SHIFT);// 12
+
+#ifndef RUN_TOL_Q16
+#define RUN_TOL_Q16         (256) // 1/256 pixel in Q16.16
+#endif
+
+// ===================== Logging =====================
+static inline void logln(const char* s) { printf("%s\r\n", s); fflush(stdout); }
+
+// ===================== Profiling (thread-safe) =====================
+enum Stage : int {
+    ST_IO = 0,
+    ST_MAPS,
+    ST_UNDISTMAP,
+    ST_LUT,
+    ST_SCHED,
+    ST_RENDER,
+    ST_BLEND,
+    ST_DDR,
+    ST_MISC,
+    ST_COUNT
+};
+
+static const char* STAGE_NAME[ST_COUNT] = {
+    "I/O","Maps","UndistMap","LUT","Sched","Render","Blend","DDR","Misc"
+};
+
+struct StageStats {
+    std::atomic<uint64_t> calls{ 0 };
+    std::atomic<uint64_t> ns_total{ 0 };
+    std::atomic<uint64_t> bytes_read{ 0 };
+    std::atomic<uint64_t> bytes_written{ 0 };
+};
+
+static StageStats G_STATS[ST_COUNT];
+static thread_local Stage TL_CUR_STAGE = ST_MISC;
+
+#define MEM_READ(n)  do{ G_STATS[TL_CUR_STAGE].bytes_read.fetch_add((uint64_t)(n), std::memory_order_relaxed); }while(0)
+#define MEM_WRITE(n) do{ G_STATS[TL_CUR_STAGE].bytes_written.fetch_add((uint64_t)(n), std::memory_order_relaxed); }while(0)
+
+struct StageTimer {
+    Stage s;
+    std::chrono::high_resolution_clock::time_point t0;
+    StageTimer(Stage st) : s(st), t0(std::chrono::high_resolution_clock::now()) {
+        TL_CUR_STAGE = s;
+        G_STATS[s].calls.fetch_add(1, std::memory_order_relaxed);
+    }
+    ~StageTimer() {
+        auto t1 = std::chrono::high_resolution_clock::now();
+        uint64_t ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+        G_STATS[s].ns_total.fetch_add(ns, std::memory_order_relaxed);
+        TL_CUR_STAGE = ST_MISC;
+    }
+};
+
+static inline void reset_stats() {
+    for (int s = 0; s < ST_COUNT; ++s) {
+        G_STATS[s].calls.store(0, std::memory_order_relaxed);
+        G_STATS[s].ns_total.store(0, std::memory_order_relaxed);
+        G_STATS[s].bytes_read.store(0, std::memory_order_relaxed);
+        G_STATS[s].bytes_written.store(0, std::memory_order_relaxed);
+    }
+}
+
+static inline void print_stats_summary(const char* header) {
+    printf("\r\n===== %s =====\r\n", header);
+    for (int s = 0; s < ST_COUNT; ++s) {
+        uint64_t ns = G_STATS[s].ns_total.load(std::memory_order_relaxed);
+        long double ms = (long double)ns / 1.0e6L;
+        double sec = (double)ns / 1.0e9;
+
+        double rd_MB = (double)G_STATS[s].bytes_read.load(std::memory_order_relaxed) / (1024.0 * 1024.0);
+        double wr_MB = (double)G_STATS[s].bytes_written.load(std::memory_order_relaxed) / (1024.0 * 1024.0);
+        double rd_MBps = sec > 0.0 ? rd_MB / sec : 0.0;
+        double wr_MBps = sec > 0.0 ? wr_MB / sec : 0.0;
+
+        printf("Stage %-10s | calls:%6llu | time:%9.3Lf ms | R:%7.2f MB | W:%7.2f MB | R:%8.2f MB/s | W:%8.2f MB/s\r\n",
+            STAGE_NAME[s],
+            (unsigned long long)G_STATS[s].calls.load(std::memory_order_relaxed),
+            ms, rd_MB, wr_MB, rd_MBps, wr_MBps);
+    }
+    fflush(stdout);
+}
+
+// ===================== Helpers =====================
+static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+static inline unsigned char sat_u8(int v) { return (v < 0) ? 0 : (v > 255 ? 255 : (unsigned char)v); }
+static inline uint64_t ceil_div_u64(uint64_t a, uint64_t b) { return (a + b - 1) / b; }
+
+// ===================== Image struct (RGB for I/O only) =====================
+typedef struct { int width, height, channels; unsigned char* data; } Image;
+
+static void freeImage(Image* img) {
+    if (!img) return;
+    free(img->data);
+    free(img);
+}
+
+// ===================== YUV 4:2:2 planar struct =====================
+struct YUV422Image {
+    int width = 0;
+    int height = 0;
+    unsigned char* Y = nullptr;
+    unsigned char* U = nullptr;
+    unsigned char* V = nullptr;
+};
+
+static void freeYUV422ImageHeap(YUV422Image* img) {
+    if (!img) return;
+    free(img->Y);
+    free(img->U);
+    free(img->V);
+    free(img);
+}
+
+// ===================== RGB -> YUV422 planar =====================
+static YUV422Image* rgbToYUV422(const Image* src) {
+    StageTimer _t(ST_MISC);
+    if (!src || src->channels != 3) return nullptr;
+
+    const int w = src->width;
+    const int h = src->height;
+    const int cw = w / 2;
+
+    YUV422Image* yuv = (YUV422Image*)malloc(sizeof(YUV422Image));
+    if (!yuv) return nullptr;
+    yuv->width = w;
+    yuv->height = h;
+    yuv->Y = (unsigned char*)malloc((size_t)w * h);
+    yuv->U = (unsigned char*)malloc((size_t)cw * h);
+    yuv->V = (unsigned char*)malloc((size_t)cw * h);
+
+    if (!yuv->Y || !yuv->U || !yuv->V) {
+        freeYUV422ImageHeap(yuv);
+        return nullptr;
+    }
+
+    const unsigned char* srcData = src->data;
+    for (int y = 0; y < h; ++y) {
+        const unsigned char* row = srcData + (size_t)y * w * 3;
+        unsigned char* rowY = yuv->Y + (size_t)y * w;
+        unsigned char* rowU = yuv->U + (size_t)y * cw;
+        unsigned char* rowV = yuv->V + (size_t)y * cw;
+
+        for (int x = 0; x < w; x += 2) {
+            int x0 = x;
+            int x1 = (x + 1 < w) ? (x + 1) : (w - 1);
+
+            const unsigned char* p0 = row + x0 * 3;
+            const unsigned char* p1 = row + x1 * 3;
+
+            int B0 = p0[0], G0 = p0[1], R0 = p0[2];
+            int B1 = p1[0], G1 = p1[1], R1 = p1[2];
+
+            int Y0 = (int)std::lround(0.299f * R0 + 0.587f * G0 + 0.114f * B0);
+            int Y1 = (int)std::lround(0.299f * R1 + 0.587f * G1 + 0.114f * B1);
+            rowY[x0] = sat_u8(Y0);
+            if (x1 < w) rowY[x1] = sat_u8(Y1);
+
+            float Uf0 = -0.168736f * R0 - 0.331264f * G0 + 0.5f * B0 + 128.0f;
+            float Vf0 = 0.5f * R0 - 0.418688f * G0 - 0.081312f * B0 + 128.0f;
+            float Uf1 = -0.168736f * R1 - 0.331264f * G1 + 0.5f * B1 + 128.0f;
+            float Vf1 = 0.5f * R1 - 0.418688f * G1 - 0.081312f * B1 + 128.0f;
+
+            int Uc = (int)std::lround((Uf0 + Uf1) * 0.5f);
+            int Vc = (int)std::lround((Vf0 + Vf1) * 0.5f);
+
+            int cidx = x / 2;
+            rowU[cidx] = sat_u8(Uc);
+            rowV[cidx] = sat_u8(Vc);
+        }
+    }
+    return yuv;
+}
+
+// ===================== YUV422 -> BGR (debug/save) =====================
+static Image* yuv422ToBGR(const YUV422Image* src) {
+    if (!src) return nullptr;
+
+    const int w = src->width;
+    const int h = src->height;
+    const int cw = w / 2;
+
+    Image* img = (Image*)malloc(sizeof(Image));
+    if (!img) return nullptr;
+
+    img->width = w;
+    img->height = h;
+    img->channels = 3;
+    img->data = (unsigned char*)malloc((size_t)w * h * 3);
+    if (!img->data) { free(img); return nullptr; }
+
+    for (int y = 0; y < h; ++y) {
+        const unsigned char* rowY = src->Y + (size_t)y * w;
+        const unsigned char* rowU = src->U + (size_t)y * cw;
+        const unsigned char* rowV = src->V + (size_t)y * cw;
+        unsigned char* dst = img->data + (size_t)y * w * 3;
+
+        for (int x = 0; x < w; x += 2) {
+            int cidx = x / 2;
+
+            int Y0 = rowY[x];
+            int Y1 = (x + 1 < w) ? rowY[x + 1] : Y0;
+
+            int Uc = rowU[cidx];
+            int Vc = rowV[cidx];
+            if (Uc == 0 && Vc == 0) { Uc = 128; Vc = 128; }
+            int U = Uc - 128;
+            int V = Vc - 128;
+
+            auto write_pixel = [&](int Yval) {
+                float Yf = (float)Yval;
+                float Uf = (float)U;
+                float Vf = (float)V;
+
+                float Rf = Yf + 1.402f * Vf;
+                float Gf = Yf - 0.344136f * Uf - 0.714136f * Vf;
+                float Bf = Yf + 1.772f * Uf;
+
+                int R = clampi((int)std::lround(Rf), 0, 255);
+                int G = clampi((int)std::lround(Gf), 0, 255);
+                int B = clampi((int)std::lround(Bf), 0, 255);
+
+                dst[0] = (unsigned char)B;
+                dst[1] = (unsigned char)G;
+                dst[2] = (unsigned char)R;
+                dst += 3;
+                };
+
+            write_pixel(Y0);
+            if (x + 1 < w) write_pixel(Y1);
+        }
+    }
+    return img;
+}
+
+// ===================== BMP I/O =====================
+static Image* readBMP(const char* filename) {
+    StageTimer _t(ST_IO);
+    FILE* fp = fopen(filename, "rb");
+    if (!fp) return nullptr;
+
+    BITMAPFILEHEADER bfh{};
+    BITMAPINFOHEADER bih{};
+    if (fread(&bfh, sizeof(bfh), 1, fp) != 1) { fclose(fp); return nullptr; } MEM_READ(sizeof(bfh));
+    if (fread(&bih, sizeof(bih), 1, fp) != 1) { fclose(fp); return nullptr; } MEM_READ(sizeof(bih));
+
+    if (bfh.bfType != 0x4D42) { fclose(fp); return nullptr; } // "BM"
+
+    Image* img = (Image*)malloc(sizeof(Image));
+    if (!img) { fclose(fp); return nullptr; }
+
+    img->width = bih.biWidth;
+    img->height = abs(bih.biHeight);
+    img->channels = 3;
+
+    int row_padded = ((img->width * 3 + 3) / 4) * 4;
+    img->data = (unsigned char*)malloc((size_t)img->width * img->height * 3);
+    if (!img->data) { free(img); fclose(fp); return nullptr; }
+
+    fseek(fp, bfh.bfOffBits, SEEK_SET);
+
+    // NOTE: This reads rows as stored (BMP can be bottom-up). For your pipeline, orientation is usually irrelevant.
+    for (int i = 0; i < img->height; ++i) {
+        size_t got = fread(img->data + (size_t)i * img->width * 3, 1, (size_t)img->width * 3, fp);
+        MEM_READ(got);
+        fseek(fp, row_padded - img->width * 3, SEEK_CUR);
+    }
+    fclose(fp);
+    return img;
+}
+
+static int writeBMP(const char* filename, const Image* img) {
+    StageTimer _t(ST_IO);
+    FILE* fp = fopen(filename, "wb");
+    if (!fp) return 0;
+
+    int w = img->width;
+    int h = img->height;
+    int c = img->channels;
+    if (c != 3) c = 3;
+
+    int row_padded = ((w * 3 + 3) / 4) * 4;
+    int fileSize = 54 + row_padded * h;
+
+    unsigned char bmpfileheader[14] = { 'B','M',0,0,0,0,0,0,0,0,54,0,0,0 };
+    unsigned char bmpinfoheader[40] = { 0 };
+    unsigned char pad[3] = { 0,0,0 };
+
+    bmpfileheader[2] = (unsigned char)(fileSize);
+    bmpfileheader[3] = (unsigned char)(fileSize >> 8);
+    bmpfileheader[4] = (unsigned char)(fileSize >> 16);
+    bmpfileheader[5] = (unsigned char)(fileSize >> 24);
+
+    bmpinfoheader[0] = 40;
+    bmpinfoheader[4] = (unsigned char)(w);
+    bmpinfoheader[5] = (unsigned char)(w >> 8);
+    bmpinfoheader[6] = (unsigned char)(w >> 16);
+    bmpinfoheader[7] = (unsigned char)(w >> 24);
+    bmpinfoheader[8] = (unsigned char)(h);
+    bmpinfoheader[9] = (unsigned char)(h >> 8);
+    bmpinfoheader[10] = (unsigned char)(h >> 16);
+    bmpinfoheader[11] = (unsigned char)(h >> 24);
+    bmpinfoheader[12] = 1;
+    bmpinfoheader[14] = 24;
+
+    fwrite(bmpfileheader, 1, 14, fp); MEM_WRITE(14);
+    fwrite(bmpinfoheader, 1, 40, fp); MEM_WRITE(40);
+
+    for (int i = 0; i < h; ++i) {
+        const unsigned char* s = &img->data[(size_t)i * w * c];
+        fwrite(s, 1, (size_t)w * 3, fp); MEM_WRITE((size_t)w * 3);
+        fwrite(pad, 1, (size_t)(row_padded - w * 3), fp); MEM_WRITE((size_t)(row_padded - w * 3));
+    }
+    fclose(fp);
+    return 1;
+}
+
+static int writeYUV422(const char* filename, const YUV422Image* img) {
+    StageTimer _t(ST_IO);
+    FILE* fp = fopen(filename, "wb");
+    if (!fp) return 0;
+    const int w = img->width;
+    const int h = img->height;
+    const int cw = w / 2;
+    fwrite(img->Y, 1, (size_t)w * h, fp); MEM_WRITE((size_t)w * h);
+    fwrite(img->U, 1, (size_t)cw * h, fp); MEM_WRITE((size_t)cw * h);
+    fwrite(img->V, 1, (size_t)cw * h, fp); MEM_WRITE((size_t)cw * h);
+    fclose(fp);
+    return 1;
+}
+
+// ===================== Path helpers =====================
+static std::wstring StringToWString(const std::string& s) {
+    if (s.empty()) return {};
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), NULL, 0);
+    std::wstring r(n, 0);
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &r[0], n);
+    return r;
+}
+
+static std::string WStringToUtf8(const std::wstring& w) {
+    if (w.empty()) return {};
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), NULL, 0, NULL, NULL);
+    std::string r(n, 0);
+    WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), &r[0], n, NULL, NULL);
+    return r;
+}
+
+#define CAPTURE_DIR_W L"C:\\SVNProjects\\IMU_Stabilize_V40\\x64\\Debug\\Capture"
+
+static std::string SaveImageFilePath(const std::wstring& captureDir, const std::wstring& prefix, int frameIdx = -1) {
+    StageTimer _t(ST_IO);
+    SYSTEMTIME st; GetLocalTime(&st);
+    wchar_t fname[256];
+    if (frameIdx < 0)
+        swprintf_s(fname, 256, L"%04d%02d%02d_%02d%02d%02d_%s.bmp",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, prefix.c_str());
+    else
+        swprintf_s(fname, 256, L"%04d%02d%02d_%02d%02d%02d_%s_f%04d.bmp",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, prefix.c_str(), frameIdx);
+    std::filesystem::path out = std::filesystem::path(captureDir) / fname;
+    return WStringToUtf8(out.wstring());
+}
+
+static std::string SaveYUVFilePath(const std::wstring& captureDir, const std::wstring& prefix, int frameIdx = -1) {
+    StageTimer _t(ST_IO);
+    SYSTEMTIME st; GetLocalTime(&st);
+    wchar_t fname[256];
+    if (frameIdx < 0)
+        swprintf_s(fname, 256, L"%04d%02d%02d_%02d%02d%02d_%s.yuv",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, prefix.c_str());
+    else
+        swprintf_s(fname, 256, L"%04d%02d%02d_%02d%02d%02d_%s_f%04d.yuv",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, prefix.c_str(), frameIdx);
+    std::filesystem::path out = std::filesystem::path(captureDir) / fname;
+    return WStringToUtf8(out.wstring());
+}
+
+static inline bool file_exists(const std::filesystem::path& p) {
+    std::error_code ec;
+    return std::filesystem::exists(p, ec);
+}
+
+static std::filesystem::path pick_imu_ini(const std::filesystem::path& exePath, int argc, char** argv) {
+    if (argc >= 2 && argv[1] && argv[1][0]) {
+        return std::filesystem::path(StringToWString(argv[1]));
+    }
+    std::filesystem::path exeIni = exePath; exeIni.replace_extension(L".ini");
+    if (file_exists(exeIni)) return exeIni;
+
+    std::filesystem::path imuIni = exePath.parent_path() / L"imu.ini";
+    if (file_exists(imuIni)) return imuIni;
+
+    // fallback: try IMU.ini
+    std::filesystem::path imuIni2 = exePath.parent_path() / L"IMU.ini";
+    if (file_exists(imuIni2)) return imuIni2;
+
+    return exeIni; // will fail later with clear error
+}
+
+static std::filesystem::path pick_params_ini(const std::filesystem::path& exePath, int argc, char** argv) {
+    if (argc >= 3 && argv[2] && argv[2][0]) {
+        return std::filesystem::path(StringToWString(argv[2]));
+    }
+    std::filesystem::path p = exePath.parent_path() / L"parameters.ini";
+    return p;
+}
+
+static std::string make_abs_if_relative(const std::string& in, const std::filesystem::path& baseDir) {
+    if (in.empty()) return in;
+    std::filesystem::path p = std::filesystem::path(StringToWString(in));
+    if (p.is_relative()) {
+        p = baseDir / p;
+    }
+    return WStringToUtf8(p.wstring());
+}
+
+// ===================== Global params (INI-driven) =====================
+static int   WIDTH = 1920, HEIGHT = 1080, NUM_CAMS = 6, overlap_px = 100;
+static float fx = 1204.505857f, fy = 1204.505857f, cx = 960.0f, cy = 540.0f;
+static float K1 = -0.343698f, K2 = 0.105503f, K3 = 0.0f, P1 = -0.001558f, P2 = -0.002416f;
+static float fx_new = 1204.505857f, fy_new = 1204.505857f, cx_new = 947.559f, cy_new = 534.965f;
+static float cylindrical_H_fov_deg = 77.0f, cylindrical_V_fov_deg = 51.3f;
+static float panorama_crop_height_scale = 0.70f, panorama_crop_width_scale = 0.70f;
+static float resize_factor = 0.5f;
+static float PITCH_TO_TRANSLATION_FACTOR = -17.44153917818162f, YAW_TO_TRANSLATION_FACTOR = 17.84f;
+static float roll_Sensor = 0.0f, pitch_Sensor = 0.0f, yaw_Sensor = 0.0f;
+static int   TARGET_W = 3840, TARGET_H = 480;
+
+// ===================== Angle LUT (±5°, 0.25°) Q1.15 =====================
+struct AngleLUTEntry { int16_t c; int16_t s; };
+static std::vector<AngleLUTEntry> ANG_LUT;
+
+static inline void build_angle_lut() {
+    if (!ANG_LUT.empty()) return;
+    StageTimer _t(ST_LUT);
+    const float minDeg = -5.0f, maxDeg = 5.0f, step = 0.25f;
+    int N = (int)std::lround((maxDeg - minDeg) / step) + 1;
+    ANG_LUT.resize(N);
+    for (int i = 0; i < N; ++i) {
+        float deg = minDeg + i * step;
+        float rad = deg * (float)M_PI / 180.0f;
+        int16_t c = (int16_t)std::lroundf(cosf(rad) * 32767.0f);
+        int16_t s = (int16_t)std::lroundf(sinf(rad) * 32767.0f);
+        ANG_LUT[i] = { c, s };
+    }
+}
+
+static inline void get_cos_sin_q15(float deg, int16_t* c, int16_t* s) {
+    float idxf = (deg + 5.0f) / 0.25f;
+    int idx = (int)std::lround(idxf);
+    if (idx < 0) idx = 0;
+    if (idx >= (int)ANG_LUT.size()) idx = (int)ANG_LUT.size() - 1;
+    *c = ANG_LUT[idx].c;
+    *s = ANG_LUT[idx].s;
+}
+
+// ===================== Maps (Q12.4) =====================
+static void loadCylMapsQ(std::vector<int16_t>& mapx, std::vector<int16_t>& mapy,
+    int w, int h, const std::filesystem::path& exePath)
+{
+    StageTimer _t(ST_MAPS);
+    mapx.resize((size_t)w * h);
+    mapy.resize((size_t)w * h);
+    auto px = exePath.parent_path() / "map_x_q.bin";
+    auto py = exePath.parent_path() / "map_y_q.bin";
+    FILE* fxp = fopen(px.string().c_str(), "rb");
+    FILE* fyp = fopen(py.string().c_str(), "rb");
+    if (!fxp || !fyp) {
+        if (fxp) fclose(fxp);
+        if (fyp) fclose(fyp);
+        throw std::runtime_error("Cyl maps not found");
+    }
+    fread(mapx.data(), sizeof(int16_t), (size_t)w * h, fxp); MEM_READ(sizeof(int16_t) * (size_t)w * h); fclose(fxp);
+    fread(mapy.data(), sizeof(int16_t), (size_t)w * h, fyp); MEM_READ(sizeof(int16_t) * (size_t)w * h); fclose(fyp);
+    printf("[INFO] Cylindrical maps (Q12.4) loaded.\r\n");
+}
+
+static void saveCylMapsQ(const std::vector<int16_t>& mapx, const std::vector<int16_t>& mapy,
+    const std::filesystem::path& exePath)
+{
+    StageTimer _t(ST_MAPS);
+    auto px = exePath.parent_path() / "map_x_q.bin";
+    auto py = exePath.parent_path() / "map_y_q.bin";
+    FILE* fxp = fopen(px.string().c_str(), "wb");
+    FILE* fyp = fopen(py.string().c_str(), "wb");
+    fwrite(mapx.data(), sizeof(int16_t), mapx.size(), fxp); MEM_WRITE(sizeof(int16_t) * mapx.size()); fclose(fxp);
+    fwrite(mapy.data(), sizeof(int16_t), mapy.size(), fyp); MEM_WRITE(sizeof(int16_t) * mapy.size()); fclose(fyp);
+    printf("[INFO] Cylindrical maps (Q12.4) saved.\r\n");
+}
+
+static void generateCylMapsQ(std::vector<int16_t>& mapx, std::vector<int16_t>& mapy,
+    int w, int h, float fov_h_deg, float fov_v_deg, float x_shift,
+    const std::filesystem::path& exePath)
+{
+    StageTimer _t(ST_MAPS);
+    mapx.resize((size_t)w * h);
+    mapy.resize((size_t)w * h);
+
+    float fov_h_rad = fov_h_deg * (float)M_PI / 180.0f;
+    float fov_v_rad = fov_v_deg * (float)M_PI / 180.0f;
+    float fx_cyl = (float)w / (2.0f * tanf(fov_h_rad / 2.0f));
+    float fy_cyl = (float)h / (2.0f * tanf(fov_v_rad / 2.0f));
+    float cx_cyl = (float)w / 2.0f;
+    float cy_cyl = (float)h / 2.0f;
+
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            float theta = (x - cx_cyl + x_shift) / fx_cyl;
+            float hh = (y - cy_cyl) / fy_cyl;
+
+            float xs = sinf(theta);
+            float ys = hh;
+            float zs = cosf(theta);
+
+            float src_x = fx * resize_factor * (xs / zs) + cx * resize_factor;
+            float src_y = fy * resize_factor * (ys / zs) + cy * resize_factor;
+
+            int32_t qx = (int32_t)lroundf(src_x * MAP_SCALE);
+            int32_t qy = (int32_t)lroundf(src_y * MAP_SCALE);
+            qx = clampi(qx, INT16_MIN, INT16_MAX);
+            qy = clampi(qy, INT16_MIN, INT16_MAX);
+
+            mapx[(size_t)y * w + x] = (int16_t)qx;
+            mapy[(size_t)y * w + x] = (int16_t)qy;
+        }
+    }
+    saveCylMapsQ(mapx, mapy, exePath);
+}
+
+static std::filesystem::path undXPath(const std::filesystem::path& exe) { return exe.parent_path() / L"und_x_q.bin"; }
+static std::filesystem::path undYPath(const std::filesystem::path& exe) { return exe.parent_path() / L"und_y_q.bin"; }
+
+static bool loadUndistForwardMapsQ(std::vector<int16_t>& udx_q, std::vector<int16_t>& udy_q,
+    int w, int h, const std::filesystem::path& exe)
+{
+    StageTimer _t(ST_UNDISTMAP);
+    auto px = undXPath(exe);
+    auto py = undYPath(exe);
+    FILE* fxp = fopen(px.string().c_str(), "rb");
+    FILE* fyp = fopen(py.string().c_str(), "rb");
+    if (!fxp || !fyp) {
+        if (fxp) fclose(fxp);
+        if (fyp) fclose(fyp);
+        return false;
+    }
+    udx_q.resize((size_t)w * h);
+    udy_q.resize((size_t)w * h);
+    fread(udx_q.data(), sizeof(int16_t), (size_t)w * h, fxp); MEM_READ(sizeof(int16_t) * (size_t)w * h); fclose(fxp);
+    fread(udy_q.data(), sizeof(int16_t), (size_t)w * h, fyp); MEM_READ(sizeof(int16_t) * (size_t)w * h); fclose(fyp);
+    printf("[INFO] Forward undistort maps (Q12.4) loaded.\r\n");
+    return true;
+}
+
+static void saveUndistForwardMapsQ(const std::vector<int16_t>& udx_q, const std::vector<int16_t>& udy_q,
+    const std::filesystem::path& exe)
+{
+    StageTimer _t(ST_UNDISTMAP);
+    auto px = undXPath(exe);
+    auto py = undYPath(exe);
+    FILE* fxp = fopen(px.string().c_str(), "wb");
+    FILE* fyp = fopen(py.string().c_str(), "wb");
+    fwrite(udx_q.data(), sizeof(int16_t), udx_q.size(), fxp); MEM_WRITE(sizeof(int16_t) * udx_q.size()); fclose(fxp);
+    fwrite(udy_q.data(), sizeof(int16_t), udy_q.size(), fyp); MEM_WRITE(sizeof(int16_t) * udy_q.size()); fclose(fyp);
+    printf("[INFO] Forward undistort maps saved.\r\n");
+}
+
+static void generateUndistForwardMapsQ(
+    std::vector<int16_t>& udx_q, std::vector<int16_t>& udy_q,
+    int w, int h,
+    float fx_src, float fy_src, float cx_src, float cy_src,
+    float fx_und, float fy_und, float cx_und, float cy_und,
+    float k1, float k2, float k3, float p1, float p2,
+    float resize_factor_local)
+{
+    StageTimer _t(ST_UNDISTMAP);
+    udx_q.resize((size_t)w * h);
+    udy_q.resize((size_t)w * h);
+
+    const float fx_r = fx_src * resize_factor_local;
+    const float fy_r = fy_src * resize_factor_local;
+    const float cx_r = cx_src * resize_factor_local;
+    const float cy_r = cy_src * resize_factor_local;
+    const float fxu_r = fx_und * resize_factor_local;
+    const float fyu_r = fy_und * resize_factor_local;
+    const float cxu_r = cx_und * resize_factor_local;
+    const float cyu_r = cy_und * resize_factor_local;
+
+    for (int v = 0; v < h; ++v) {
+        for (int u = 0; u < w; ++u) {
+            float x = (u - cxu_r) / fxu_r;
+            float y = (v - cyu_r) / fyu_r;
+            float r2 = x * x + y * y;
+            float r4 = r2 * r2;
+            float r6 = r4 * r2;
+
+            float radial = 1.0f + k1 * r2 + k2 * r4 + k3 * r6;
+            float dx = 2.0f * p1 * x * y + p2 * (r2 + 2.0f * x * x);
+            float dy = p1 * (r2 + 2.0f * y * y) + 2.0f * p2 * x * y;
+
+            float xd = x * radial + dx;
+            float yd = y * radial + dy;
+            float u_d = xd * fx_r + cx_r;
+            float v_d = yd * fy_r + cy_r;
+
+            int32_t qx = (int32_t)lroundf(u_d * MAP_SCALE);
+            int32_t qy = (int32_t)lroundf(v_d * MAP_SCALE);
+            qx = clampi(qx, INT16_MIN, INT16_MAX);
+            qy = clampi(qy, INT16_MIN, INT16_MAX);
+
+            size_t idx = (size_t)v * w + u;
+            udx_q[idx] = (int16_t)qx;
+            udy_q[idx] = (int16_t)qy;
+        }
+    }
+    printf("[INFO] Forward undistort maps (Q12.4) built.\r\n");
+}
+
+static std::filesystem::path compXPath(const std::filesystem::path& exe) { return exe.parent_path() / L"comp_x_q.bin"; }
+static std::filesystem::path compYPath(const std::filesystem::path& exe) { return exe.parent_path() / L"comp_y_q.bin"; }
+
+static bool loadComposedMapsQ(std::vector<int16_t>& ox, std::vector<int16_t>& oy,
+    int w, int h, const std::filesystem::path& exe)
+{
+    StageTimer _t(ST_UNDISTMAP);
+    auto px = compXPath(exe);
+    auto py = compYPath(exe);
+    FILE* fxp = fopen(px.string().c_str(), "rb");
+    FILE* fyp = fopen(py.string().c_str(), "rb");
+    if (!fxp || !fyp) {
+        if (fxp) fclose(fxp);
+        if (fyp) fclose(fyp);
+        return false;
+    }
+    ox.resize((size_t)w * h);
+    oy.resize((size_t)w * h);
+    fread(ox.data(), sizeof(int16_t), (size_t)w * h, fxp); MEM_READ(sizeof(int16_t) * (size_t)w * h); fclose(fxp);
+    fread(oy.data(), sizeof(int16_t), (size_t)w * h, fyp); MEM_READ(sizeof(int16_t) * (size_t)w * h); fclose(fyp);
+    printf("[INFO] Composed maps loaded.\r\n");
+    return true;
+}
+
+static void saveComposedMapsQ(const std::vector<int16_t>& ox, const std::vector<int16_t>& oy,
+    const std::filesystem::path& exe)
+{
+    StageTimer _t(ST_UNDISTMAP);
+    auto px = compXPath(exe);
+    auto py = compYPath(exe);
+    FILE* fxp = fopen(px.string().c_str(), "wb");
+    FILE* fyp = fopen(py.string().c_str(), "wb");
+    fwrite(ox.data(), sizeof(int16_t), ox.size(), fxp); MEM_WRITE(sizeof(int16_t) * ox.size()); fclose(fxp);
+    fwrite(oy.data(), sizeof(int16_t), oy.size(), fyp); MEM_WRITE(sizeof(int16_t) * oy.size()); fclose(fyp);
+    printf("[INFO] Composed maps saved.\r\n");
+}
+
+static void composeCylWithUndistQ(
+    const std::vector<int16_t>& cyl_x_q,
+    const std::vector<int16_t>& cyl_y_q,
+    const std::vector<int16_t>& und_x_q,
+    const std::vector<int16_t>& und_y_q,
+    int w, int h,
+    std::vector<int16_t>& out_x_q,
+    std::vector<int16_t>& out_y_q)
+{
+    StageTimer _t(ST_UNDISTMAP);
+    out_x_q.resize((size_t)w * h);
+    out_y_q.resize((size_t)w * h);
+
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            int32_t fu_q = (int32_t)cyl_x_q[(size_t)y * w + x];
+            int32_t fv_q = (int32_t)cyl_y_q[(size_t)y * w + x];
+
+            int32_t fu_q16 = fu_q << (WFIX_SHIFT - MAP_SHIFT);
+            int32_t fv_q16 = fv_q << (WFIX_SHIFT - MAP_SHIFT);
+
+            int iu = clampi((fu_q16 >> WFIX_SHIFT), 0, w - 2);
+            int iv = clampi((fv_q16 >> WFIX_SHIFT), 0, h - 2);
+
+            uint8_t wx8 = (uint8_t)((fu_q16 >> 8) & 0xFF);
+            uint8_t wy8 = (uint8_t)((fv_q16 >> 8) & 0xFF);
+
+            int W_x1 = (int)wx8;
+            int W_y1 = (int)wy8;
+
+            int32_t v00x = und_x_q[(size_t)iv * w + iu];
+            int32_t v10x = und_x_q[(size_t)iv * w + iu + 1];
+            int32_t v01x = und_x_q[(size_t)(iv + 1) * w + iu];
+            int32_t v11x = und_x_q[(size_t)(iv + 1) * w + iu + 1];
+
+            int32_t v00y = und_y_q[(size_t)iv * w + iu];
+            int32_t v10y = und_y_q[(size_t)iv * w + iu + 1];
+            int32_t v01y = und_y_q[(size_t)(iv + 1) * w + iu];
+            int32_t v11y = und_y_q[(size_t)(iv + 1) * w + iu + 1];
+
+            auto bilerp_q = [&](int32_t A00, int32_t A10, int32_t A01, int32_t A11)->int32_t {
+                int32_t h0 = A00 + (((A10 - A00) * W_x1) >> 8);
+                int32_t h1 = A01 + (((A11 - A01) * W_x1) >> 8);
+                return h0 + (((h1 - h0) * W_y1) >> 8);
+                };
+
+            int32_t ux_q = bilerp_q(v00x, v10x, v01x, v11x);
+            int32_t uy_q = bilerp_q(v00y, v10y, v01y, v11y);
+
+            out_x_q[(size_t)y * w + x] = (int16_t)clampi(ux_q, INT16_MIN, INT16_MAX);
+            out_y_q[(size_t)y * w + x] = (int16_t)clampi(uy_q, INT16_MIN, INT16_MAX);
+        }
+    }
+    printf("[INFO] Composed Cyl×Undist maps built (Q12.4).\r\n");
+}
+
+// ===================== IMU sensor -> camera =====================
+static void convert_rpy_sensor_to_cam(double roll_sys1, double pitch_sys1,
+    double yaw_offset, double pitch_offset, double roll_offset,
+    float* roll_deg_out, float* pitch_deg_out, float* yaw_deg_out)
+{
+    double rr = roll_sys1 * M_PI / 180.0;
+    double pp = pitch_sys1 * M_PI / 180.0;
+    double ror = roll_offset * M_PI / 180.0;
+    double por = pitch_offset * M_PI / 180.0;
+    double yor = yaw_offset * M_PI / 180.0;
+
+    double Rx[3][3] = { {1,0,0},{0,cos(rr),-sin(rr)},{0,sin(rr),cos(rr)} };
+    double Ry[3][3] = { {cos(pp),0,sin(pp)},{0,1,0},{-sin(pp),0,cos(pp)} };
+    double R_sys1[3][3];
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            R_sys1[i][j] = Rx[i][0] * Ry[0][j] + Rx[i][1] * Ry[1][j] + Rx[i][2] * Ry[2][j];
+
+    double Rr[3][3] = { {1,0,0},{0,cos(ror),-sin(ror)},{0,sin(ror),cos(ror)} };
+    double Rp[3][3] = { {cos(por),0,sin(por)},{0,1,0},{-sin(por),0,cos(por)} };
+    double Rz[3][3] = { {cos(yor),-sin(yor),0},{sin(yor),cos(yor),0},{0,0,1} };
+
+    double Rt[3][3];
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            Rt[i][j] = Rz[i][0] * Rp[0][j] + Rz[i][1] * Rp[1][j] + Rz[i][2] * Rp[2][j];
+
+    double Roff[3][3];
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            Roff[i][j] = Rt[i][0] * Rr[0][j] + Rt[i][1] * Rr[1][j] + Rt[i][2] * Rr[2][j];
+
+    double R[3][3];
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            R[i][j] = R_sys1[i][0] * Roff[0][j] + R_sys1[i][1] * Roff[1][j] + R_sys1[i][2] * Roff[2][j];
+
+    double pitchX = asin(-R[2][0]);
+    double cy_ = cos(pitchX);
+    double rollX, yawX;
+    if (fabs(cy_) > 1e-6) {
+        rollX = atan2(R[2][1], R[2][2]);
+        yawX = atan2(R[1][0], R[0][0]);
+    }
+    else {
+        rollX = 0;
+        yawX = atan2(-R[0][1], R[1][1]);
+    }
+    *roll_deg_out = (float)(rollX * 180.0 / M_PI);
+    *pitch_deg_out = (float)(pitchX * 180.0 / M_PI);
+    *yaw_deg_out = (float)(yawX * 180.0 / M_PI);
+}
+
+// ===================== Build per-row base maps in ORIGINAL space =====================
+static void buildBaseMapsOriginal(
+    const std::vector<int16_t>& comp_x_q,
+    const std::vector<int16_t>& comp_y_q,
+    int resized_w, int resized_h,
+    int crop_x0, int crop_y0,
+    int crop_w, int crop_h,
+    int per_cam_w_max,
+    float resize_factor_local,
+    std::vector<int32_t>& base_x_q16,
+    std::vector<int32_t>& base_y_q16)
+{
+    StageTimer _t(ST_MAPS);
+
+    base_x_q16.resize((size_t)per_cam_w_max * crop_h);
+    base_y_q16.resize((size_t)per_cam_w_max * crop_h);
+
+    const double sx = (double)crop_w / (double)per_cam_w_max;
+    const float  inv_resize = 1.0f / resize_factor_local;
+    const float  q16_scale = (float)(1 << WFIX_SHIFT);
+
+    for (int y = 0; y < crop_h; ++y) {
+        int src_y = clampi(crop_y0 + y, 0, resized_h - 1);
+        const int16_t* rowX = &comp_x_q[(size_t)src_y * resized_w];
+        const int16_t* rowY = &comp_y_q[(size_t)src_y * resized_w];
+
+        for (int x = 0; x < per_cam_w_max; ++x) {
+            double u = crop_x0 + (x + 0.5) * sx - 0.5;
+            int iu0 = clampi((int)std::floor(u), 0, resized_w - 2);
+            double tx = u - iu0;
+            if (tx < 0.0) tx = 0.0;
+            if (tx > 1.0) tx = 1.0;
+
+            float v00x = rowX[iu0] / (float)MAP_SCALE;
+            float v10x = rowX[iu0 + 1] / (float)MAP_SCALE;
+            float src_x_r = v00x + (v10x - v00x) * (float)tx;
+
+            float v00y = rowY[iu0] / (float)MAP_SCALE;
+            float v10y = rowY[iu0 + 1] / (float)MAP_SCALE;
+            float src_y_r = v00y + (v10y - v00y) * (float)tx;
+
+            float src_x = src_x_r * inv_resize;
+            float src_y = src_y_r * inv_resize;
+
+            src_x = std::max(0.0f, std::min(src_x, (float)(WIDTH - 1)));
+            src_y = std::max(0.0f, std::min(src_y, (float)(HEIGHT - 1)));
+
+            int32_t qx16 = (int32_t)std::lround(src_x * q16_scale);
+            int32_t qy16 = (int32_t)std::lround(src_y * q16_scale);
+
+            base_x_q16[(size_t)y * per_cam_w_max + x] = qx16;
+            base_y_q16[(size_t)y * per_cam_w_max + x] = qy16;
+        }
+    }
+
+    printf("[INFO] Base maps in original space built (per_cam_w_max x crop_h, Q16.16).\r\n");
+}
+
+// ===================== RowRun schedule =====================
+#pragma pack(push, 1)
+struct RowRun {
+    uint16_t sy;
+    uint16_t ox0;
+    uint16_t len;
+    int32_t  ax0_q16;
+    int32_t  ay0_q16;
+    int16_t  dax_q12_4;
+    int16_t  day_q12_4;
+};
+#pragma pack(pop)
+
+// ===================== 2-line BRAM cache =====================
+struct LineCache {
+    std::array<std::vector<unsigned char>, STRIP_H> Y;
+    std::array<std::vector<unsigned char>, STRIP_H> U;
+    std::array<std::vector<unsigned char>, STRIP_H> V;
+    std::array<int, STRIP_H> rowId;
+
+    LineCache() {
+        rowId.fill(-1);
+        for (auto& buf : Y) buf.resize(WIDTH);
+        for (auto& buf : U) buf.resize(WIDTH / 2);
+        for (auto& buf : V) buf.resize(WIDTH / 2);
+    }
+
+    void loadRowPtr(int parity,
+        const unsigned char* scanY,
+        const unsigned char* scanU,
+        const unsigned char* scanV,
+        int row)
+    {
+        memcpy(Y[parity].data(), scanY, (size_t)WIDTH);
+        memcpy(U[parity].data(), scanU, (size_t)(WIDTH / 2));
+        memcpy(V[parity].data(), scanV, (size_t)(WIDTH / 2));
+        rowId[parity] = row;
+        MEM_WRITE((uint64_t)WIDTH + (uint64_t)(WIDTH / 2) + (uint64_t)(WIDTH / 2));
+    }
+};
+
+// ===================== Simple cyclic barrier =====================
+struct SimpleBarrier {
+    std::mutex m;
+    std::condition_variable cv;
+    int count = 0;
+    int generation = 0;
+    const int total;
+    explicit SimpleBarrier(int total_) : total(total_) {}
+
+    void wait() {
+        std::unique_lock<std::mutex> lock(m);
+        int gen = generation;
+        if (++count == total) {
+            generation++;
+            count = 0;
+            cv.notify_all();
+        }
+        else {
+            cv.wait(lock, [&] { return gen != generation; });
+        }
+    }
+};
+
+// ===================== Row window buffers (O(1) slot allocation via freelist) =====================
+struct RowWindow {
+    int numCams = 0;
+    int per_cam_h = 0;
+    std::vector<int> per_cam_w;
+
+    std::vector<int> sy_to_slot;     // [per_cam_h] -> slot or -1
+    std::vector<int> slot_sy;        // [WINDOW_H] -> sy or -1
+    std::vector<int> free_slots;     // stack
+
+    struct CamBuf {
+        int w = 0;
+        int cw = 0;
+        std::vector<unsigned char> Y;
+        std::vector<unsigned char> U;
+        std::vector<unsigned char> V;
+    };
+    std::vector<CamBuf> cam;
+
+    void init(int nCams, int pch, const std::vector<int>& pcw) {
+        numCams = nCams;
+        per_cam_h = pch;
+        per_cam_w = pcw;
+        sy_to_slot.assign(per_cam_h, -1);
+        slot_sy.assign(WINDOW_H, -1);
+
+        free_slots.clear();
+        free_slots.reserve(WINDOW_H);
+        for (int i = WINDOW_H - 1; i >= 0; --i) free_slots.push_back(i);
+
+        cam.resize(numCams);
+        for (int c = 0; c < numCams; ++c) {
+            cam[c].w = per_cam_w[c];
+            cam[c].cw = per_cam_w[c] / 2;
+            cam[c].Y.assign((size_t)WINDOW_H * cam[c].w, 0);
+            cam[c].U.assign((size_t)WINDOW_H * cam[c].cw, 128);
+            cam[c].V.assign((size_t)WINDOW_H * cam[c].cw, 128);
+        }
+    }
+
+    void reset_mappings() {
+        std::fill(sy_to_slot.begin(), sy_to_slot.end(), -1);
+        std::fill(slot_sy.begin(), slot_sy.end(), -1);
+        free_slots.clear();
+        free_slots.reserve(WINDOW_H);
+        for (int i = WINDOW_H - 1; i >= 0; --i) free_slots.push_back(i);
+    }
+
+    int allocate_slot_for_sy(int sy) {
+        if ((unsigned)sy >= (unsigned)per_cam_h) return -1;
+        int& slot = sy_to_slot[sy];
+        if (slot >= 0) return slot;
+
+        if (free_slots.empty()) return -1;
+        int freeSlot = free_slots.back();
+        free_slots.pop_back();
+
+        slot_sy[freeSlot] = sy;
+        slot = freeSlot;
+
+        for (int c = 0; c < numCams; ++c) {
+            unsigned char* y = &cam[c].Y[(size_t)freeSlot * cam[c].w];
+            unsigned char* u = &cam[c].U[(size_t)freeSlot * cam[c].cw];
+            unsigned char* v = &cam[c].V[(size_t)freeSlot * cam[c].cw];
+            memset(y, 0, (size_t)cam[c].w);
+            memset(u, 128, (size_t)cam[c].cw);
+            memset(v, 128, (size_t)cam[c].cw);
+        }
+
+        uint64_t bytes = 0;
+        for (int c = 0; c < numCams; ++c) bytes += (uint64_t)cam[c].w + 2ull * (uint64_t)cam[c].cw;
+        MEM_WRITE(bytes);
+        return freeSlot;
+    }
+
+    void free_sy(int sy) {
+        if ((unsigned)sy >= (unsigned)per_cam_h) return;
+        int slot = sy_to_slot[sy];
+        if (slot < 0) return;
+        sy_to_slot[sy] = -1;
+        slot_sy[slot] = -1;
+        free_slots.push_back(slot);
+    }
+
+    inline unsigned char* rowY(int camId, int slot) { return &cam[camId].Y[(size_t)slot * cam[camId].w]; }
+    inline unsigned char* rowU(int camId, int slot) { return &cam[camId].U[(size_t)slot * cam[camId].cw]; }
+    inline unsigned char* rowV(int camId, int slot) { return &cam[camId].V[(size_t)slot * cam[camId].cw]; }
+};
+
+// ===================== On-the-fly mapping ax/ay (row-pointer based, less overhead) =====================
+static inline bool compute_axay_for_dest_rowptr(
+    int ox,
+    int pcw,
+    const int32_t* baseX_row, // points to base_x_q16[sy*per_cam_w_max]
+    const int32_t* baseY_row,
+    int32_t cx_q, int32_t cy_q,
+    int32_t max_x_q, int32_t max_y_q,
+    int32_t y_shift_q,
+    int16_t c15, int16_t s15,
+    int32_t& ax_q, int32_t& ay_q,
+    int& y0_out,
+    uint64_t& local_reads_bytes
+) {
+    if ((unsigned)ox >= (unsigned)pcw) return false;
+
+    int32_t bx_q = baseX_row[ox];
+    int32_t by_q = baseY_row[ox];
+    local_reads_bytes += 8;
+
+    by_q += y_shift_q;
+
+    int32_t dx_q = bx_q - cx_q;
+    int32_t dy_q = by_q - cy_q;
+
+    int64_t tmpx = (int64_t)c15 * dx_q + (int64_t)s15 * dy_q;
+    int64_t tmpy = -(int64_t)s15 * dx_q + (int64_t)c15 * dy_q;
+
+    ax_q = (int32_t)(tmpx >> 15) + cx_q;
+    ay_q = (int32_t)(tmpy >> 15) + cy_q;
+
+    if (ax_q < 0 || ax_q > max_x_q || ay_q < 0 || ay_q > max_y_q) return false;
+
+    int y0 = (ay_q >> WFIX_SHIFT);
+    if (y0 < 0 || y0 >= HEIGHT - 1) return false;
+
+    y0_out = y0;
+    return true;
+}
+
+static void build_runs_for_y0_on_the_fly_rowptr(
+    int y0_target,
+    int pcw,
+    int per_cam_h,
+    int per_cam_w_max,
+    const std::vector<int32_t>& base_x_q16,
+    const std::vector<int32_t>& base_y_q16,
+    int32_t cx_q, int32_t cy_q,
+    int32_t max_x_q, int32_t max_y_q,
+    int32_t y_shift_q,
+    int16_t c15, int16_t s15,
+    const std::vector<int16_t>& spanMin_sy,
+    const std::vector<int16_t>& spanMax_sy,
+    std::vector<RowRun>& outRuns,
+    size_t& outPeakBytes // updated by caller if desired
+) {
+    StageTimer _t(ST_SCHED);
+
+    outRuns.clear();
+    if (outRuns.capacity() < 4096) outRuns.reserve(4096);
+
+    auto q_delta = [](int32_t dq16)->int16_t {
+        int32_t v = (dq16 >= 0) ? (dq16 + (1 << (DRUN_TO_Q16 - 1))) : (dq16 - (1 << (DRUN_TO_Q16 - 1)));
+        v >>= DRUN_TO_Q16;
+        v = clampi(v, -32768, 32767);
+        return (int16_t)v;
+        };
+
+    uint64_t local_reads = 0;
+
+    for (int sy = 0; sy < per_cam_h; ++sy) {
+        int16_t mn = spanMin_sy[sy];
+        int16_t mx = spanMax_sy[sy];
+        if (mx < 0) continue;
+        if (y0_target < mn || y0_target > mx) continue;
+
+        const int32_t* rowBX = &base_x_q16[(size_t)sy * (size_t)per_cam_w_max];
+        const int32_t* rowBY = &base_y_q16[(size_t)sy * (size_t)per_cam_w_max];
+
+        int ox = 0;
+        while (ox < pcw) {
+            int32_t ax0, ay0;
+            int y0c = -1;
+            if (!compute_axay_for_dest_rowptr(
+                ox, pcw, rowBX, rowBY,
+                cx_q, cy_q, max_x_q, max_y_q,
+                y_shift_q, c15, s15,
+                ax0, ay0, y0c, local_reads))
+            {
+                ox++;
+                continue;
+            }
+            if (y0c != y0_target) { ox++; continue; }
+
+            int32_t ax1 = ax0, ay1 = ay0;
+            int y0n = y0c;
+            bool has1 = false;
+            if (ox + 1 < pcw) {
+                has1 = compute_axay_for_dest_rowptr(
+                    ox + 1, pcw, rowBX, rowBY,
+                    cx_q, cy_q, max_x_q, max_y_q,
+                    y_shift_q, c15, s15,
+                    ax1, ay1, y0n, local_reads);
+                if (!has1 || y0n != y0_target) has1 = false;
+            }
+
+            int32_t dax_q16_exact = has1 ? (ax1 - ax0) : (1 << WFIX_SHIFT);
+            int32_t day_q16_exact = has1 ? (ay1 - ay0) : 0;
+
+            int16_t dax_q12_4 = q_delta(dax_q16_exact);
+            int16_t day_q12_4 = q_delta(day_q16_exact);
+
+            int start_ox = ox;
+            int len = 1;
+
+            int32_t dax_q16 = ((int32_t)dax_q12_4) << DRUN_TO_Q16;
+            int32_t day_q16 = ((int32_t)day_q12_4) << DRUN_TO_Q16;
+
+            for (int ox2 = ox + 1; ox2 < pcw; ++ox2) {
+                int32_t axE, ayE;
+                int y0E = -1;
+                if (!compute_axay_for_dest_rowptr(
+                    ox2, pcw, rowBX, rowBY,
+                    cx_q, cy_q, max_x_q, max_y_q,
+                    y_shift_q, c15, s15,
+                    axE, ayE, y0E, local_reads))
+                {
+                    break;
+                }
+                if (y0E != y0_target) break;
+
+                int i = ox2 - start_ox;
+                int32_t axP = ax0 + (int32_t)((int64_t)i * dax_q16);
+                int32_t ayP = ay0 + (int32_t)((int64_t)i * day_q16);
+
+                if ((ayP >> WFIX_SHIFT) != y0_target) break;
+
+                int32_t ex = axP - axE; if (ex < 0) ex = -ex;
+                int32_t ey = ayP - ayE; if (ey < 0) ey = -ey;
+                if (ex > RUN_TOL_Q16 || ey > RUN_TOL_Q16) break;
+
+                len++;
+            }
+
+            RowRun rr{};
+            rr.sy = (uint16_t)sy;
+            rr.ox0 = (uint16_t)start_ox;
+            rr.len = (uint16_t)len;
+            rr.ax0_q16 = ax0;
+            rr.ay0_q16 = ay0;
+            rr.dax_q12_4 = dax_q12_4;
+            rr.day_q12_4 = day_q12_4;
+            outRuns.push_back(rr);
+
+            ox += len;
+        }
+    }
+
+    MEM_READ(local_reads);
+
+    size_t bytes = outRuns.size() * sizeof(RowRun);
+    if (bytes > outPeakBytes) outPeakBytes = bytes;
+}
+
+// ===================== Precompute y0 spans per (cam,sy) and a global maxY0Bound[sy] =====================
+static void precompute_spans_and_bounds(
+    int per_cam_h,
+    int per_cam_w_max,
+    const std::vector<int32_t>& base_x_q16,
+    const std::vector<int32_t>& base_y_q16,
+    const std::vector<int>& per_cam_w,
+    const std::vector<int32_t>& y_shift_q_cam,
+    const std::vector<int16_t>& c15_cam,
+    const std::vector<int16_t>& s15_cam,
+    int32_t cx_q, int32_t cy_q,
+    int32_t max_x_q, int32_t max_y_q,
+    std::vector<std::vector<int16_t>>& spanMin_cam_sy,
+    std::vector<std::vector<int16_t>>& spanMax_cam_sy,
+    std::vector<int>& maxY0Bound_sy
+) {
+    StageTimer _t(ST_SCHED);
+
+    spanMin_cam_sy.assign((size_t)per_cam_w.size(), std::vector<int16_t>(per_cam_h, (int16_t)32767));
+    spanMax_cam_sy.assign((size_t)per_cam_w.size(), std::vector<int16_t>(per_cam_h, (int16_t)-1));
+    maxY0Bound_sy.assign(per_cam_h, -1);
+
+    uint64_t local_reads = 0;
+
+    for (int cam = 0; cam < (int)per_cam_w.size(); ++cam) {
+        int pcw = per_cam_w[cam];
+        int32_t y_shift_q = y_shift_q_cam[cam];
+        int16_t c15 = c15_cam[cam];
+        int16_t s15 = s15_cam[cam];
+
+        for (int sy = 0; sy < per_cam_h; ++sy) {
+            const int32_t* rowBX = &base_x_q16[(size_t)sy * (size_t)per_cam_w_max];
+            const int32_t* rowBY = &base_y_q16[(size_t)sy * (size_t)per_cam_w_max];
+
+            int oxs[3] = { 0, pcw / 2, pcw - 1 };
+            int mn = 1000000;
+            int mx = -1000000;
+            bool any = false;
+
+            for (int k = 0; k < 3; ++k) {
+                int ox = oxs[k];
+                int32_t ax, ay;
+                int y0;
+                if (compute_axay_for_dest_rowptr(
+                    ox, pcw, rowBX, rowBY,
+                    cx_q, cy_q, max_x_q, max_y_q,
+                    y_shift_q, c15, s15,
+                    ax, ay, y0, local_reads))
+                {
+                    any = true;
+                    mn = std::min(mn, y0);
+                    mx = std::max(mx, y0);
+                }
+            }
+
+            if (!any) {
+                spanMin_cam_sy[cam][sy] = (int16_t)32767;
+                spanMax_cam_sy[cam][sy] = (int16_t)-1;
+                continue;
+            }
+
+            spanMin_cam_sy[cam][sy] = (int16_t)clampi(mn, -32768, 32767);
+            spanMax_cam_sy[cam][sy] = (int16_t)clampi(mx, -32768, 32767);
+
+            if (mx > maxY0Bound_sy[sy]) maxY0Bound_sy[sy] = mx;
+        }
+    }
+
+    MEM_READ(local_reads);
+}
+
+// ===================== V10-like blending from row window into a destination row buffer =====================
+static void blend_row_sy_into_dst(
+    int sy_blend,
+    int TARGET_W,
+    int overlap_target,
+    const std::vector<uint16_t>& alphaY,
+    const std::vector<uint16_t>& alphaC,
+    const std::vector<int>& per_cam_w,
+    RowWindow& rw,
+    unsigned char* dstYRow,
+    unsigned char* dstURow,
+    unsigned char* dstVRow
+) {
+    const int cw_out = TARGET_W / 2;
+
+    std::fill(dstYRow, dstYRow + TARGET_W, (unsigned char)0);
+    std::fill(dstURow, dstURow + cw_out, (unsigned char)128);
+    std::fill(dstVRow, dstVRow + cw_out, (unsigned char)128);
+
+    int slot = rw.sy_to_slot[sy_blend];
+    if (slot < 0) return;
+
+    StageTimer _b(ST_BLEND);
+
+    {
+        const int w0 = per_cam_w[0];
+        const int cw0 = w0 / 2;
+        const unsigned char* srcY0 = rw.rowY(0, slot);
+        const unsigned char* srcU0 = rw.rowU(0, slot);
+        const unsigned char* srcV0 = rw.rowV(0, slot);
+        memcpy(dstYRow, srcY0, (size_t)w0);
+        memcpy(dstURow, srcU0, (size_t)cw0);
+        memcpy(dstVRow, srcV0, (size_t)cw0);
+        MEM_READ((uint64_t)w0 + 2ull * (uint64_t)cw0);
+        MEM_WRITE((uint64_t)w0 + 2ull * (uint64_t)cw0);
+    }
+
+    int curxY = per_cam_w[0];
+    int curxC = per_cam_w[0] / 2;
+
+    for (int i = 1; i < (int)per_cam_w.size(); ++i) {
+        const int w = per_cam_w[i];
+        const int cw = w / 2;
+
+        const unsigned char* srcY = rw.rowY(i, slot);
+        const unsigned char* srcU = rw.rowU(i, slot);
+        const unsigned char* srcV = rw.rowV(i, slot);
+
+        int ovY = overlap_target;
+        if (ovY > w) ovY = w;
+        if (ovY > curxY) ovY = curxY;
+
+        int ovC = overlap_target / 2;
+        if (ovC > cw) ovC = cw;
+        if (ovC > curxC) ovC = curxC;
+
+        for (int x = 0; x < ovY; ++x) {
+            unsigned a = alphaY[std::min(x, (int)alphaY.size() - 1)];
+            size_t dp = (size_t)(curxY - ovY + x);
+            size_t sp = (size_t)x;
+            unsigned prev = dstYRow[dp];
+            unsigned curr = srcY[sp];
+            dstYRow[dp] = (unsigned char)((prev * (65536u - a) + curr * a) >> 16);
+        }
+        int tailY = w - ovY;
+        if (tailY > 0) memcpy(&dstYRow[(size_t)curxY], &srcY[(size_t)ovY], (size_t)tailY);
+        curxY += tailY;
+
+        for (int x = 0; x < ovC; ++x) {
+            unsigned a = alphaC[std::min(x, (int)alphaC.size() - 1)];
+            size_t dp = (size_t)(curxC - ovC + x);
+            size_t sp = (size_t)x;
+
+            unsigned uprev = dstURow[dp];
+            unsigned ucurr = srcU[sp];
+            dstURow[dp] = (unsigned char)((uprev * (65536u - a) + ucurr * a) >> 16);
+
+            unsigned vprev = dstVRow[dp];
+            unsigned vcurr = srcV[sp];
+            dstVRow[dp] = (unsigned char)((vprev * (65536u - a) + vcurr * a) >> 16);
+        }
+        int tailC = cw - ovC;
+        if (tailC > 0) {
+            memcpy(&dstURow[(size_t)curxC], &srcU[(size_t)ovC], (size_t)tailC);
+            memcpy(&dstVRow[(size_t)curxC], &srcV[(size_t)ovC], (size_t)tailC);
+        }
+        curxC += tailC;
+
+        MEM_READ((uint64_t)w + 2ull * (uint64_t)cw);
+        MEM_WRITE((uint64_t)w + 2ull * (uint64_t)cw);
+    }
+}
+
+// ===================== Internal memory report (FPGA model) =====================
+static void print_internal_memory_report_v17(
+    int numCams,
+    int width,
+    int targetW,
+    int targetH,
+    const std::vector<int>& per_cam_w,
+    size_t peakScheduleBytes,
+    int sliceH)
+{
+    const uint64_t BRAM36_BITS = 36ull * 1024ull;
+    const uint64_t URAM_BITS = 288ull * 1024ull;
+
+    uint64_t lineCacheBytesPerCam =
+        (uint64_t)STRIP_H * ((uint64_t)width + (uint64_t)(width / 2) + (uint64_t)(width / 2));
+    uint64_t lineCacheBytesTotal = lineCacheBytesPerCam * (uint64_t)numCams;
+
+    uint64_t rowWindowBytes = 0;
+    for (int cam = 0; cam < numCams; ++cam) {
+        uint64_t w = (uint64_t)per_cam_w[cam];
+        rowWindowBytes += (uint64_t)WINDOW_H * (2ull * w);
+    }
+
+    uint64_t sliceBytesOne = 2ull * (uint64_t)targetW * (uint64_t)sliceH;
+    uint64_t sliceBytesPingPong = 2ull * sliceBytesOne;
+
+    uint64_t scheduleBytes = (uint64_t)peakScheduleBytes;
+    uint64_t ddrPanoBytes = 2ull * (uint64_t)targetW * (uint64_t)targetH;
+
+    uint64_t onChipTotalBytes = lineCacheBytesTotal + rowWindowBytes + sliceBytesPingPong + scheduleBytes;
+    uint64_t onChipTotalBits = onChipTotalBytes * 8ull;
+
+    uint64_t bram36Blocks = ceil_div_u64(onChipTotalBits, BRAM36_BITS);
+    uint64_t uramBlocks = ceil_div_u64(onChipTotalBits, URAM_BITS);
+
+    printf("\n===== INTERNAL MEMORY ESTIMATE (V17 MODEL) =====\n");
+    printf("LineCache total: %llu bytes (%.2f KB) [per cam=%.2f KB]\n",
+        (unsigned long long)lineCacheBytesTotal, lineCacheBytesTotal / 1024.0,
+        lineCacheBytesPerCam / 1024.0);
+
+    printf("RowWindow (WINDOW_H=%d): %llu bytes (%.2f MB)\n",
+        WINDOW_H, (unsigned long long)rowWindowBytes, rowWindowBytes / (1024.0 * 1024.0));
+
+    printf("Schedule (peak per-y0 RowRuns): %llu bytes (%.2f KB)\n",
+        (unsigned long long)scheduleBytes, scheduleBytes / 1024.0);
+
+    printf("Pano slice ping-pong (2x, sliceH=%d): %llu bytes (%.2f MB)\n",
+        sliceH, (unsigned long long)sliceBytesPingPong, sliceBytesPingPong / (1024.0 * 1024.0));
+
+    printf("ON-CHIP TOTAL: %llu bytes (%.2f MB)\n",
+        (unsigned long long)onChipTotalBytes, onChipTotalBytes / (1024.0 * 1024.0));
+
+    printf("Equivalent on-chip blocks:\n");
+    printf("  BRAM36 ~ %llu blocks\n", (unsigned long long)bram36Blocks);
+    printf("  URAM   ~ %llu blocks\n", (unsigned long long)uramBlocks);
+
+    printf("\nExternal DDR (full pano frame): %llu bytes (%.2f MB)\n",
+        (unsigned long long)ddrPanoBytes, ddrPanoBytes / (1024.0 * 1024.0));
+
+    printf("==============================================\n");
+}
+
+// ===================== DDR slice ping-pong =====================
+struct PanoSlicePingPong {
+    int targetW = 0;
+    int targetH = 0;
+    int sliceH = 0;
+    int cw_out = 0;
+
+    struct SliceBuf {
+        std::vector<unsigned char> Y;
+        std::vector<unsigned char> U;
+        std::vector<unsigned char> V;
+    };
+    std::array<SliceBuf, 2> slice;
+
+    int active = 0;
+    int base_py = -1;
+    int fill = 0;
+    bool started = false;
+
+    std::vector<unsigned char> ddrY;
+    std::vector<unsigned char> ddrU;
+    std::vector<unsigned char> ddrV;
+
+    void init(int W, int H, int sliceH_) {
+        targetW = W;
+        targetH = H;
+        sliceH = sliceH_;
+        cw_out = targetW / 2;
+
+        for (int i = 0; i < 2; ++i) {
+            slice[i].Y.assign((size_t)targetW * sliceH, 0);
+            slice[i].U.assign((size_t)cw_out * sliceH, 128);
+            slice[i].V.assign((size_t)cw_out * sliceH, 128);
+        }
+
+        ddrY.assign((size_t)targetW * targetH, 0);
+        ddrU.assign((size_t)cw_out * targetH, 128);
+        ddrV.assign((size_t)cw_out * targetH, 128);
+
+        active = 0;
+        base_py = -1;
+        fill = 0;
+        started = false;
+    }
+
+    void clear_active() {
+        std::fill(slice[active].Y.begin(), slice[active].Y.end(), (unsigned char)0);
+        std::fill(slice[active].U.begin(), slice[active].U.end(), (unsigned char)128);
+        std::fill(slice[active].V.begin(), slice[active].V.end(), (unsigned char)128);
+        MEM_WRITE((uint64_t)slice[active].Y.size() + (uint64_t)slice[active].U.size() + (uint64_t)slice[active].V.size());
+    }
+
+    void flush_active_to_ddr() {
+        if (!started || fill <= 0 || base_py < 0) return;
+
+        StageTimer _t(ST_DDR);
+
+        int rows = fill;
+        if (base_py + rows > targetH) rows = targetH - base_py;
+        if (rows <= 0) return;
+
+        size_t yBytes = (size_t)targetW * rows;
+        size_t cBytes = (size_t)cw_out * rows;
+        size_t yOff = (size_t)base_py * (size_t)targetW;
+        size_t cOff = (size_t)base_py * (size_t)cw_out;
+
+        memcpy(ddrY.data() + yOff, slice[active].Y.data(), yBytes);
+        memcpy(ddrU.data() + cOff, slice[active].U.data(), cBytes);
+        memcpy(ddrV.data() + cOff, slice[active].V.data(), cBytes);
+
+        MEM_WRITE((uint64_t)yBytes + 2ull * (uint64_t)cBytes);
+
+        active ^= 1;
+        clear_active();
+        started = false;
+        base_py = -1;
+        fill = 0;
+    }
+
+    bool begin_row(int py, unsigned char*& outY, unsigned char*& outU, unsigned char*& outV) {
+        if (py < 0 || py >= targetH) return false;
+
+        if (!started) {
+            started = true;
+            base_py = py;
+            fill = 0;
+        }
+
+        if (py != base_py + fill) {
+            flush_active_to_ddr();
+            started = true;
+            base_py = py;
+            fill = 0;
+        }
+
+        if (fill >= sliceH) {
+            flush_active_to_ddr();
+            started = true;
+            base_py = py;
+            fill = 0;
+        }
+
+        outY = slice[active].Y.data() + (size_t)fill * (size_t)targetW;
+        outU = slice[active].U.data() + (size_t)fill * (size_t)cw_out;
+        outV = slice[active].V.data() + (size_t)fill * (size_t)cw_out;
+        return true;
+    }
+
+    void end_row() {
+        fill++;
+        if (fill >= sliceH) flush_active_to_ddr();
+    }
+
+    void finalize() { flush_active_to_ddr(); }
+};
+
+// ===================== Main =====================
+int main(int argc, char** argv) {
+    try {
+        build_angle_lut();
+
+        wchar_t wpath[MAX_PATH] = L"";
+        GetModuleFileNameW(NULL, wpath, MAX_PATH);
+        std::filesystem::path exePath(wpath);
+
+        std::filesystem::path imuIniPath = pick_imu_ini(exePath, argc, argv);
+        std::filesystem::path paramsIniPath = pick_params_ini(exePath, argc, argv);
+
+        printf("[PATH] exe        : %s\n", exePath.string().c_str());
+        printf("[PATH] imu ini    : %s\n", imuIniPath.string().c_str());
+        printf("[PATH] params ini : %s\n", paramsIniPath.string().c_str());
+
+        if (!file_exists(paramsIniPath)) {
+            printf("[FATAL] parameters.ini not found. Place it next to exe or pass argv[2].\n");
+            return 1;
+        }
+        if (!file_exists(imuIniPath)) {
+            printf("[FATAL] IMU ini not found. Place exe-name.ini or imu.ini next to exe, or pass argv[1].\n");
+            return 1;
+        }
+
+        // Read parameters
+        INIManager paramIni(paramsIniPath);
+        WIDTH = paramIni.ReadInteger(L"image", L"width", WIDTH);
+        HEIGHT = paramIni.ReadInteger(L"image", L"height", HEIGHT);
+        NUM_CAMS = paramIni.ReadInteger(L"image", L"num_cams", NUM_CAMS);
+
+        fx = paramIni.ReadFloat(L"calibration", L"fx", fx);
+        fy = paramIni.ReadFloat(L"calibration", L"fy", fy);
+        float cx_ratio = paramIni.ReadFloat(L"calibration", L"cx_ratio", 0.5f);
+        float cy_ratio = paramIni.ReadFloat(L"calibration", L"cy_ratio", 0.5f);
+        cx = WIDTH * cx_ratio;
+        cy = HEIGHT * cy_ratio;
+
+        fx_new = paramIni.ReadFloat(L"calibration", L"fx_dist", fx_new);
+        fy_new = paramIni.ReadFloat(L"calibration", L"fy_dist", fy_new);
+        cx_new = paramIni.ReadFloat(L"calibration", L"cx_dist", cx_new);
+        cy_new = paramIni.ReadFloat(L"calibration", L"cy_dist", cy_new);
+
+        K1 = paramIni.ReadFloat(L"calibration", L"k1", K1);
+        K2 = paramIni.ReadFloat(L"calibration", L"k2", K2);
+        K3 = paramIni.ReadFloat(L"calibration", L"k3", K3);
+        P1 = paramIni.ReadFloat(L"calibration", L"p1", P1);
+        P2 = paramIni.ReadFloat(L"calibration", L"p2", P2);
+
+        cylindrical_H_fov_deg = paramIni.ReadFloat(L"projection", L"cylindrical_H_fov_deg", cylindrical_H_fov_deg);
+        cylindrical_V_fov_deg = paramIni.ReadFloat(L"projection", L"cylindrical_V_fov_deg", cylindrical_V_fov_deg);
+
+        panorama_crop_height_scale = paramIni.ReadFloat(L"cropping", L"panorama_crop_height_scale", panorama_crop_height_scale);
+        panorama_crop_width_scale = paramIni.ReadFloat(L"cropping", L"panorama_crop_width_scale", panorama_crop_width_scale);
+
+        // IMPORTANT: your INI keys had trailing spaces in earlier code; V17 reads without trailing spaces.
+        resize_factor = paramIni.ReadFloat(L"resize", L"resize_factor", resize_factor);
+        PITCH_TO_TRANSLATION_FACTOR = paramIni.ReadFloat(L"transform", L"pitch_to_translation_factor", PITCH_TO_TRANSLATION_FACTOR);
+        YAW_TO_TRANSLATION_FACTOR = paramIni.ReadFloat(L"transform", L"yaw_to_translation_factor", YAW_TO_TRANSLATION_FACTOR);
+
+        overlap_px = paramIni.ReadInteger(L"blend", L"overlap_px", overlap_px);
+        float feather_strength = paramIni.ReadFloat(L"blend", L"feather_strength", 1.0f);
+
+        TARGET_W = paramIni.ReadInteger(L"output", L"target_w", TARGET_W);
+        TARGET_H = paramIni.ReadInteger(L"output", L"target_h", TARGET_H);
+
+        // IMU ini
+        INIManager imuIni(imuIniPath);
+
+        // Input files
+        std::vector<std::string> filenames; filenames.reserve(NUM_CAMS);
+        for (int i = 0; i < NUM_CAMS; ++i) {
+            std::wstring key = L"file_" + std::to_wstring(i);
+            std::string p = WStringToUtf8(imuIni.ReadString(L"images", key, L""));
+            p = make_abs_if_relative(p, exePath.parent_path());
+            filenames.push_back(p);
+        }
+
+        // Validate paths (Release failure usually shows up here)
+        for (int i = 0; i < NUM_CAMS; ++i) {
+            if (filenames[i].empty()) {
+                printf("[FATAL] file_%d is empty in IMU ini. (Release exe-name.ini mismatch?)\n", i);
+                return 1;
+            }
+            if (!file_exists(std::filesystem::path(StringToWString(filenames[i])))) {
+                printf("[FATAL] file_%d not found: %s\n", i, filenames[i].c_str());
+                return 1;
+            }
+        }
+
+        std::vector<float> yaw_off = imuIni.ReadFloatArray(L"offset", L"yaw");
+        std::vector<float> pit_off = imuIni.ReadFloatArray(L"offset", L"pitch");
+        std::vector<float> rol_off = imuIni.ReadFloatArray(L"offset", L"roll");
+
+        auto clamp5 = [&](float v) { return v > 5.0f ? 5.0f : (v < -5.0f ? -5.0f : v); };
+        bool StabilizationIni = imuIni.ReadBoolean(L"Sensor_Orientation", L"stabilization", true);
+        if (StabilizationIni) {
+            roll_Sensor = clamp5(imuIni.ReadFloat(L"Sensor_Orientation", L"roll", 0.0f));
+            pitch_Sensor = clamp5(imuIni.ReadFloat(L"Sensor_Orientation", L"pitch", 0.0f));
+            yaw_Sensor = clamp5(imuIni.ReadFloat(L"Sensor_Orientation", L"yaw", 0.0f));
+        }
+        else {
+            roll_Sensor = pitch_Sensor = yaw_Sensor = 0.0f;
+        }
+
+        logln("........Processing (MT-V17 FPGA Model: ON-FLY y0 buckets (parallel) + RowWindow + 2-Line Cache + DDR Slice PingPong)........");
+
+        // Geometry in resized space
+        const int resized_w = (int)std::lround(WIDTH * resize_factor);
+        const int resized_h = (int)std::lround(HEIGHT * resize_factor);
+        const int crop_w = (int)std::lround(resized_w * panorama_crop_width_scale);
+        const int crop_h = (int)std::lround(resized_h * panorama_crop_height_scale);
+        const int crop_x0 = (resized_w - crop_w) / 2;
+        const int crop_y0 = (resized_h - crop_h) / 2;
+
+        // Maps (ONCE)
+        std::vector<int16_t> cyl_x_q, cyl_y_q;
+        try { loadCylMapsQ(cyl_x_q, cyl_y_q, resized_w, resized_h, exePath); }
+        catch (...) { generateCylMapsQ(cyl_x_q, cyl_y_q, resized_w, resized_h, cylindrical_H_fov_deg, cylindrical_V_fov_deg, 0.0f, exePath); }
+
+        std::vector<int16_t> und_x_q, und_y_q;
+        if (!loadUndistForwardMapsQ(und_x_q, und_y_q, resized_w, resized_h, exePath)) {
+            generateUndistForwardMapsQ(und_x_q, und_y_q, resized_w, resized_h,
+                fx, fy, cx, cy, fx_new, fy_new, cx_new, cy_new,
+                K1, K2, K3, P1, P2, resize_factor);
+            saveUndistForwardMapsQ(und_x_q, und_y_q, exePath);
+        }
+
+        std::vector<int16_t> comp_x_q, comp_y_q;
+        if (!loadComposedMapsQ(comp_x_q, comp_y_q, resized_w, resized_h, exePath)) {
+            composeCylWithUndistQ(cyl_x_q, cyl_y_q, und_x_q, und_y_q, resized_w, resized_h, comp_x_q, comp_y_q);
+            saveComposedMapsQ(comp_x_q, comp_y_q, exePath);
+        }
+
+        // Load all camera frames and convert to YUV422 once (KEEP contiguous buffers; no cam_scan vectors)
+        std::vector<YUV422Image*> framesYUV(NUM_CAMS, nullptr);
+        for (int i = 0; i < NUM_CAMS; ++i) {
+            Image* tmp = readBMP(filenames[i].c_str());
+            if (!tmp) { printf("[ERROR] Failed to load camera %d: %s\n", i, filenames[i].c_str()); return 1; }
+            printf("[INFO] Camera %d (RGB): %dx%d\n", i, tmp->width, tmp->height);
+
+            framesYUV[i] = rgbToYUV422(tmp);
+            freeImage(tmp);
+            if (!framesYUV[i]) { printf("[ERROR] Failed to convert camera %d to YUV422\n", i); return 1; }
+            printf("[INFO] Camera %d converted to YUV422: %dx%d\n", i, framesYUV[i]->width, framesYUV[i]->height);
+
+            if (framesYUV[i]->width != WIDTH || framesYUV[i]->height != HEIGHT) {
+                printf("[FATAL] Camera %d dimensions mismatch. Expected %dx%d, got %dx%d\n",
+                    i, WIDTH, HEIGHT, framesYUV[i]->width, framesYUV[i]->height);
+                return 1;
+            }
+        }
+
+        // Per-camera target widths
+        const int overlap_resized = (int)std::lround(overlap_px * resize_factor);
+        const int pano_w_crop = NUM_CAMS * crop_w - (NUM_CAMS - 1) * overlap_resized;
+        const double scale_x = (double)TARGET_W / (double)pano_w_crop;
+
+        int overlap_target = (int)std::llround(overlap_resized * scale_x);
+        int per_cam_w_base = (int)std::llround(crop_w * scale_x);
+
+        std::vector<int> per_cam_w(NUM_CAMS, per_cam_w_base);
+        {
+            int total_now = NUM_CAMS * per_cam_w_base - (NUM_CAMS - 1) * overlap_target;
+            int delta = TARGET_W - total_now;
+            for (int i = 0; delta > 0 && i < NUM_CAMS; ++i, --delta) per_cam_w[i]++;
+            for (int i = 0; delta < 0 && i < NUM_CAMS; ++i, ++delta) if (per_cam_w[i] > 1) per_cam_w[i]--;
+        }
+        const int per_cam_h = crop_h;
+        int per_cam_w_max = 0;
+        for (int w : per_cam_w) per_cam_w_max = std::max(per_cam_w_max, w);
+
+        // Base maps (original coords) ONCE
+        std::vector<int32_t> base_x_q16, base_y_q16;
+        buildBaseMapsOriginal(comp_x_q, comp_y_q, resized_w, resized_h, crop_x0, crop_y0, crop_w, crop_h,
+            per_cam_w_max, resize_factor, base_x_q16, base_y_q16);
+
+        // Feather alpha
+        const int cw_out = TARGET_W / 2;
+        std::vector<uint16_t> alphaY(std::max(overlap_target, 1));
+        std::vector<uint16_t> alphaC(std::max(overlap_target / 2, 1));
+        {
+            StageTimer _t(ST_BLEND);
+            if (overlap_target > 0) {
+                const double inv_overlap = 1.0 / overlap_target;
+                const double gamma = 1.0 / std::max<float>(0.1f, feather_strength);
+                for (int x = 0; x < overlap_target; ++x) {
+                    double t = (x + 0.5) * inv_overlap;
+                    double s = std::pow(t, gamma);
+                    alphaY[x] = (uint16_t)std::lround(s * 65535.0);
+                }
+            }
+            int overlapC_local = overlap_target / 2;
+            if (overlapC_local > 0) {
+                const double inv_overlap = 1.0 / overlapC_local;
+                const double gamma = 1.0 / std::max<float>(0.1f, feather_strength);
+                for (int x = 0; x < overlapC_local; ++x) {
+                    double t = (x + 0.5) * inv_overlap;
+                    double s = std::pow(t, gamma);
+                    alphaC[x] = (uint16_t)std::lround(s * 65535.0);
+                }
+            }
+        }
+
+        // Capture dir
+        std::wstring captureDirW = CAPTURE_DIR_W;
+        CreateDirectoryW(captureDirW.c_str(), NULL);
+
+        // Row window
+        RowWindow rowWindow;
+        rowWindow.init(NUM_CAMS, per_cam_h, per_cam_w);
+
+        // Sync
+        SimpleBarrier rowBarrier(NUM_CAMS + 1);
+        std::atomic<bool> shutdownFlag(false);
+        std::atomic<int> current_y0(0);
+
+        // Shared per-frame cam params (read-only during y0 loop)
+        std::vector<int32_t> y_shift_q_cam(NUM_CAMS, 0);
+        std::vector<int16_t> c15_cam(NUM_CAMS, 0);
+        std::vector<int16_t> s15_cam(NUM_CAMS, 0);
+
+        // Shared spans per frame
+        std::vector<std::vector<int16_t>> spanMin_cam_sy, spanMax_cam_sy;
+
+        // Cache hit counters
+        std::atomic<uint64_t> cache_ok(0), cache_violation(0);
+
+        // Peak schedule size (bytes) across all workers for this frame
+        std::atomic<size_t> peakScheduleBytesAtomic(0);
+
+        // Workers threads: build runs + render for their camera
+        std::vector<std::thread> workers;
+        workers.reserve(NUM_CAMS);
+
+        // constants for mapping bounds
+        const int32_t cx_q = (int32_t)((WIDTH / 2.0f) * (1 << WFIX_SHIFT));
+        const int32_t cy_q = (int32_t)((HEIGHT / 2.0f) * (1 << WFIX_SHIFT));
+        const int32_t max_x_q = (int32_t)((WIDTH - 2) << WFIX_SHIFT);
+        const int32_t max_y_q = (int32_t)((HEIGHT - 2) << WFIX_SHIFT);
+
+        for (int cam = 0; cam < NUM_CAMS; ++cam) {
+            workers.emplace_back([&, cam]() {
+                LineCache cache;
+                std::vector<RowRun> localRuns;
+                size_t localPeakBytes = 0;
+
+                while (true) {
+                    rowBarrier.wait(); // start y0 phase
+
+                    if (shutdownFlag.load(std::memory_order_acquire)) {
+                        rowBarrier.wait(); // end phase
+                        break;
+                    }
+
+                    int y0 = current_y0.load(std::memory_order_relaxed);
+                    if (y0 < 0 || y0 >= HEIGHT - 1) {
+                        rowBarrier.wait();
+                        continue;
+                    }
+
+                    // 1) Build schedule ON THE FLY here (parallel across cams)
+                    build_runs_for_y0_on_the_fly_rowptr(
+                        y0,
+                        per_cam_w[cam],
+                        per_cam_h,
+                        per_cam_w_max,
+                        base_x_q16, base_y_q16,
+                        cx_q, cy_q, max_x_q, max_y_q,
+                        y_shift_q_cam[cam],
+                        c15_cam[cam], s15_cam[cam],
+                        spanMin_cam_sy[cam], spanMax_cam_sy[cam],
+                        localRuns,
+                        localPeakBytes
+                    );
+
+                    // publish peak schedule bytes (atomic max)
+                    {
+                        size_t cur = peakScheduleBytesAtomic.load(std::memory_order_relaxed);
+                        while (localPeakBytes > cur &&
+                            !peakScheduleBytesAtomic.compare_exchange_weak(cur, localPeakBytes, std::memory_order_relaxed)) {
+                            // loop
+                        }
+                    }
+
+                    // 2) Render using 2-line cache
+                    StageTimer _r(ST_RENDER);
+
+                    const unsigned char* Y0 = framesYUV[cam]->Y + (size_t)y0 * (size_t)WIDTH;
+                    const unsigned char* U0 = framesYUV[cam]->U + (size_t)y0 * (size_t)(WIDTH / 2);
+                    const unsigned char* V0 = framesYUV[cam]->V + (size_t)y0 * (size_t)(WIDTH / 2);
+
+                    const unsigned char* Y1 = framesYUV[cam]->Y + (size_t)(y0 + 1) * (size_t)WIDTH;
+                    const unsigned char* U1 = framesYUV[cam]->U + (size_t)(y0 + 1) * (size_t)(WIDTH / 2);
+                    const unsigned char* V1 = framesYUV[cam]->V + (size_t)(y0 + 1) * (size_t)(WIDTH / 2);
+
+                    cache.loadRowPtr(0, Y0, U0, V0, y0);
+                    cache.loadRowPtr(1, Y1, U1, V1, y0 + 1);
+
+                    const int wCam = per_cam_w[cam];
+                    const int cwCam = wCam / 2;
+
+                    uint64_t okLocal = 0;
+                    uint64_t vioLocal = 0;
+
+                    for (const RowRun& r : localRuns) {
+                        if (r.sy >= (uint16_t)per_cam_h) continue;
+
+                        int slot = rowWindow.allocate_slot_for_sy((int)r.sy);
+                        if (slot < 0) continue; // bounded buffer: drop
+
+                        unsigned char* dstY = rowWindow.rowY(cam, slot);
+                        unsigned char* dstU = rowWindow.rowU(cam, slot);
+                        unsigned char* dstV = rowWindow.rowV(cam, slot);
+
+                        int32_t ax0 = r.ax0_q16;
+                        int32_t ay0 = r.ay0_q16;
+                        int32_t dax = ((int32_t)r.dax_q12_4) << DRUN_TO_Q16;
+                        int32_t day = ((int32_t)r.day_q12_4) << DRUN_TO_Q16;
+
+                        int ox0 = (int)r.ox0;
+                        int len = (int)r.len;
+                        if (ox0 < 0 || ox0 >= wCam) continue;
+                        if (len <= 0) continue;
+                        if (ox0 + len > wCam) len = wCam - ox0;
+
+                        for (int i = 0; i < len; ++i) {
+                            int ox = ox0 + i;
+
+                            int32_t ax_q = ax0 + (int32_t)((int64_t)i * dax);
+                            int32_t ay_q = ay0 + (int32_t)((int64_t)i * day);
+
+                            int y_chk = (ay_q >> WFIX_SHIFT);
+                            if (y_chk != y0) { vioLocal++; continue; }
+                            okLocal++;
+
+                            int x0 = (ax_q >> WFIX_SHIFT);
+                            if ((unsigned)x0 >= (unsigned)(WIDTH - 1)) continue;
+
+                            uint32_t wx = (uint32_t)(ax_q & 0xFFFF);
+                            uint32_t wy = (uint32_t)(ay_q & 0xFFFF);
+
+                            uint32_t W_x0 = 65536u - wx;
+                            uint32_t W_x1 = wx;
+                            uint32_t W_y0 = 65536u - wy;
+                            uint32_t W_y1 = wy;
+
+                            uint32_t W00 = (uint32_t)(((uint64_t)W_x0 * W_y0) >> 16);
+                            uint32_t W10 = (uint32_t)(((uint64_t)W_x1 * W_y0) >> 16);
+                            uint32_t W01 = (uint32_t)(((uint64_t)W_x0 * W_y1) >> 16);
+                            uint32_t W11 = (uint32_t)(((uint64_t)W_x1 * W_y1) >> 16);
+
+                            const unsigned char* p0Y = cache.Y[0].data() + x0;
+                            const unsigned char* p2Y = cache.Y[1].data() + x0;
+
+                            int Y_val = (int)((p0Y[0] * W00 + p0Y[1] * W10 + p2Y[0] * W01 + p2Y[1] * W11) >> 16);
+                            dstY[ox] = sat_u8(Y_val);
+
+                            int32_t ax_ch_q = ax_q >> 1;
+                            int xch0 = (ax_ch_q >> WFIX_SHIFT);
+                            if ((unsigned)xch0 >= (unsigned)((WIDTH / 2) - 1)) continue;
+
+                            uint32_t wx_ch = (uint32_t)(ax_ch_q & 0xFFFF);
+                            uint32_t Wcx0 = 65536u - wx_ch;
+                            uint32_t Wcx1 = wx_ch;
+
+                            uint32_t Wc00 = (uint32_t)(((uint64_t)Wcx0 * W_y0) >> 16);
+                            uint32_t Wc10 = (uint32_t)(((uint64_t)Wcx1 * W_y0) >> 16);
+                            uint32_t Wc01 = (uint32_t)(((uint64_t)Wcx0 * W_y1) >> 16);
+                            uint32_t Wc11 = (uint32_t)(((uint64_t)Wcx1 * W_y1) >> 16);
+
+                            const unsigned char* p0U = cache.U[0].data() + xch0;
+                            const unsigned char* p2U = cache.U[1].data() + xch0;
+
+                            const unsigned char* p0V = cache.V[0].data() + xch0;
+                            const unsigned char* p2V = cache.V[1].data() + xch0;
+
+                            int U_val = (int)((p0U[0] * Wc00 + p0U[1] * Wc10 + p2U[0] * Wc01 + p2U[1] * Wc11) >> 16);
+                            int V_val = (int)((p0V[0] * Wc00 + p0V[1] * Wc10 + p2V[0] * Wc01 + p2V[1] * Wc11) >> 16);
+
+                            int cidx = ox >> 1;
+                            if ((unsigned)cidx < (unsigned)cwCam) {
+                                dstU[cidx] = sat_u8(U_val);
+                                dstV[cidx] = sat_u8(V_val);
+                            }
+                        }
+                    }
+
+                    cache_ok.fetch_add(okLocal, std::memory_order_relaxed);
+                    cache_violation.fetch_add(vioLocal, std::memory_order_relaxed);
+
+                    rowBarrier.wait(); // end y0 phase
+                }
+                });
+        }
+
+        // pano slice/DDR output
+        PanoSlicePingPong panoOut;
+        panoOut.init(TARGET_W, TARGET_H, WINDOW_H);
+        panoOut.clear_active();
+
+        const int ypad = (TARGET_H - per_cam_h) / 2;
+
+        // Timing
+        std::vector<double> frame_ms(NUM_FRAMES, 0.0);
+        auto total_t0 = std::chrono::high_resolution_clock::now();
+
+        for (int f = 0; f < NUM_FRAMES; ++f) {
+            reset_stats();
+            cache_ok.store(0);
+            cache_violation.store(0);
+            peakScheduleBytesAtomic.store(0);
+
+            rowWindow.reset_mappings();
+
+            std::fill(panoOut.ddrY.begin(), panoOut.ddrY.end(), (unsigned char)0);
+            std::fill(panoOut.ddrU.begin(), panoOut.ddrU.end(), (unsigned char)128);
+            std::fill(panoOut.ddrV.begin(), panoOut.ddrV.end(), (unsigned char)128);
+            MEM_WRITE((uint64_t)panoOut.ddrY.size() + (uint64_t)panoOut.ddrU.size() + (uint64_t)panoOut.ddrV.size());
+
+            panoOut.active = 0;
+            panoOut.started = false;
+            panoOut.base_py = -1;
+            panoOut.fill = 0;
+            panoOut.clear_active();
+
+            auto frame_t0 = std::chrono::high_resolution_clock::now();
+            printf("\n[Frame %d] start\n", f);
+
+            // IMU -> per cam
+            for (int cam = 0; cam < NUM_CAMS; ++cam) {
+                float roll_cam = 0.0f, pitch_cam = 0.0f, yaw_cam_deg = 0.0f;
+                convert_rpy_sensor_to_cam(
+                    roll_Sensor, pitch_Sensor,
+                    (cam < (int)yaw_off.size() ? yaw_off[cam] : 0.0f),
+                    (cam < (int)pit_off.size() ? pit_off[cam] : 0.0f),
+                    (cam < (int)rol_off.size() ? rol_off[cam] : 0.0f),
+                    &roll_cam, &pitch_cam, &yaw_cam_deg
+                );
+
+                int y_shift_px = (int)std::lround(PITCH_TO_TRANSLATION_FACTOR * pitch_cam);
+                y_shift_q_cam[cam] = (int32_t)y_shift_px << WFIX_SHIFT;
+
+                int16_t c15 = 0, s15 = 0;
+                get_cos_sin_q15(-roll_cam, &c15, &s15);
+                c15_cam[cam] = c15;
+                s15_cam[cam] = s15;
+            }
+
+            // Precompute spans and global maxY0Bound per sy (one-time per frame)
+            std::vector<int> maxY0Bound_sy;
+            precompute_spans_and_bounds(
+                per_cam_h, per_cam_w_max,
+                base_x_q16, base_y_q16,
+                per_cam_w,
+                y_shift_q_cam,
+                c15_cam, s15_cam,
+                cx_q, cy_q, max_x_q, max_y_q,
+                spanMin_cam_sy, spanMax_cam_sy,
+                maxY0Bound_sy
+            );
+
+            // Streaming-safe emit logic
+            std::vector<unsigned char> row_ready((size_t)per_cam_h, 0);
+            int sy_out = 0;
+
+            // Source-driven execution over y0 (main thread just coordinates)
+            for (int y0 = 0; y0 < HEIGHT - 1; ++y0) {
+                current_y0.store(y0, std::memory_order_relaxed);
+                rowBarrier.wait(); // start workers (they build schedule + render)
+                rowBarrier.wait(); // wait done
+
+                for (int sy = 0; sy < per_cam_h; ++sy) {
+                    if (maxY0Bound_sy[sy] == y0) row_ready[sy] = 1;
+                }
+
+                while (sy_out < per_cam_h && row_ready[sy_out]) {
+                    int py = sy_out + ypad;
+                    unsigned char* dstY = nullptr;
+                    unsigned char* dstU = nullptr;
+                    unsigned char* dstV = nullptr;
+
+                    if (panoOut.begin_row(py, dstY, dstU, dstV)) {
+                        blend_row_sy_into_dst(
+                            sy_out,
+                            TARGET_W,
+                            overlap_target,
+                            alphaY, alphaC,
+                            per_cam_w,
+                            rowWindow,
+                            dstY, dstU, dstV
+                        );
+                        panoOut.end_row();
+                    }
+
+                    rowWindow.free_sy(sy_out);
+                    row_ready[sy_out] = 0;
+                    sy_out++;
+                }
+            }
+
+            // Emit remaining rows
+            for (int sy = sy_out; sy < per_cam_h; ++sy) {
+                int py = sy + ypad;
+                unsigned char* dstY = nullptr;
+                unsigned char* dstU = nullptr;
+                unsigned char* dstV = nullptr;
+
+                if (panoOut.begin_row(py, dstY, dstU, dstV)) {
+                    blend_row_sy_into_dst(
+                        sy,
+                        TARGET_W,
+                        overlap_target,
+                        alphaY, alphaC,
+                        per_cam_w,
+                        rowWindow,
+                        dstY, dstU, dstV
+                    );
+                    panoOut.end_row();
+                }
+                rowWindow.free_sy(sy);
+            }
+
+            panoOut.finalize();
+
+            uint64_t ok = cache_ok.load(std::memory_order_relaxed);
+            uint64_t vio = cache_violation.load(std::memory_order_relaxed);
+            printf("[CACHE] ok=%llu violation=%llu\n", (unsigned long long)ok, (unsigned long long)vio);
+
+            size_t peakScheduleBytes = peakScheduleBytesAtomic.load(std::memory_order_relaxed);
+            printf("[MEM] Peak per-y0 schedule bytes (per-cam max observed): %.2f KB (%.2f MB)\n",
+                peakScheduleBytes / 1024.0, peakScheduleBytes / (1024.0 * 1024.0));
+
+            print_internal_memory_report_v17(NUM_CAMS, WIDTH, TARGET_W, TARGET_H, per_cam_w, peakScheduleBytes, WINDOW_H);
+
+            // Save
+            if (SAVE_EVERY_K > 0 && ((f + 1) % SAVE_EVERY_K == 0)) {
+                YUV422Image panoDDR{};
+                panoDDR.width = TARGET_W;
+                panoDDR.height = TARGET_H;
+                panoDDR.Y = panoOut.ddrY.data();
+                panoDDR.U = panoOut.ddrU.data();
+                panoDDR.V = panoOut.ddrV.data();
+
+                std::string yuvPath = SaveYUVFilePath(captureDirW, L"panorama_v17_onfly_parallel_sched_ddr_pingpong_yuv422", f);
+                if (writeYUV422(yuvPath.c_str(), &panoDDR)) printf("[Saved YUV] %s\n", yuvPath.c_str());
+                else printf("[ERROR] writeYUV422 failed for frame %d\n", f);
+
+                std::string bmpPath = SaveImageFilePath(captureDirW, L"panorama_v17_onfly_parallel_sched_ddr_pingpong_yuv422", f);
+                Image* panoBGR = yuv422ToBGR(&panoDDR);
+                if (panoBGR) {
+                    writeBMP(bmpPath.c_str(), panoBGR);
+                    printf("[Saved BMP] %s\n", bmpPath.c_str());
+                    freeImage(panoBGR);
+                }
+                else {
+                    printf("[ERROR] yuv422ToBGR failed for frame %d\n", f);
+                }
+            }
+
+            auto frame_t1 = std::chrono::high_resolution_clock::now();
+            double ms = std::chrono::duration<double, std::milli>(frame_t1 - frame_t0).count();
+            frame_ms[f] = ms;
+            printf("[Frame %d] time %.3f ms (%.2f FPS)\n", f, ms, 1000.0 / ms);
+
+            print_stats_summary("PROFILING SUMMARY (MT-V17 OnFly (parallel sched+render) + RowWindow + DDR Slice PingPong, YUV422 end-to-end)");
+        }
+
+        auto total_t1 = std::chrono::high_resolution_clock::now();
+        double total_ms = std::chrono::duration<double, std::milli>(total_t1 - total_t0).count();
+        double throughput_fps = 1000.0 * NUM_FRAMES / total_ms;
+
+        double sum_ms = 0.0;
+        for (int i = 0; i < NUM_FRAMES; ++i) sum_ms += frame_ms[i];
+        double avg_ms = (NUM_FRAMES > 0) ? sum_ms / NUM_FRAMES : 0.0;
+        double latency_fps = avg_ms > 0.0 ? 1000.0 / avg_ms : 0.0;
+
+        printf("\n===== MULTI-FRAME SUMMARY (MT-V17) =====\n");
+        printf("Frames: %d\n", NUM_FRAMES);
+        printf("Avg latency per frame: %.3f ms (%.2f FPS)\n", avg_ms, latency_fps);
+        printf("Total time: %.3f ms (Throughput %.2f FPS)\n", total_ms, throughput_fps);
+
+        // Shutdown workers
+        shutdownFlag.store(true, std::memory_order_release);
+        current_y0.store(0, std::memory_order_relaxed);
+        rowBarrier.wait();
+        rowBarrier.wait();
+        for (auto& th : workers) if (th.joinable()) th.join();
+
+        // Cleanup
+        for (auto* fimg : framesYUV) freeYUV422ImageHeap(fimg);
+
+        return 0;
+    }
+    catch (const std::exception& e) {
+        printf("[FATAL] exception: %s\n", e.what());
+        return 1;
+    }
+    catch (...) {
+        printf("[FATAL] unknown exception\n");
+        return 1;
+    }
+}
