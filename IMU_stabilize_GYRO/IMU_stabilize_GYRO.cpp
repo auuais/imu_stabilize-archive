@@ -1,19 +1,7 @@
-﻿// IMU_stabilize_GYRO_MT_V18_rowrun_fpga_model_BASE_RUNS_FUSED.cpp
+﻿// IMU_stabilize_GYRO_MT_V17_rowrun_fpga_model_ROW_WINDOW_ONFLY_BUCKETS_DDR_SLICE.cpp
 //
-// V18 (Requested changes):
-// 1) Base maps moved to int16 Q12.4 (original-space) => immediate bandwidth cut.
-// 2) Remove full base arrays:
-//    - Build per-sy BaseRun compression (linear segments in Q12.4) once.
-//    - No base_x/base_y full-frame storage.
-// 3) Fuse schedule + render in worker loop:
-//    - Workers no longer store RowRuns; they detect runs and render immediately.
-//
-// Build: MSVC /std:c++17
-// Requires: ini_manager.h and your ini/map binaries.
-//
-// Notes:
-// - Uses same I/O, INI robustness, DDR ping-pong, RowWindow, 2-line cache, profiling layout as V17.
-// - Span precompute still uses 3-point sampling (ox=0, mid, last) per (cam,sy) to enable streaming-safe output.
+// V17 (PC-time optimizations + Release path robustness):
+
 
 #define _CRT_SECURE_NO_WARNINGS
 #define NOMINMAX
@@ -47,11 +35,11 @@
 
 // ===================== Global switches =====================
 #ifndef NUM_FRAMES
-#define NUM_FRAMES          30
+#define NUM_FRAMES          1
 #endif
 
 #ifndef SAVE_EVERY_K
-#define SAVE_EVERY_K        0   // 0 = save none; 1 = save all; 30 = every 30th
+#define SAVE_EVERY_K        1   // 0 = save none; 1 = save all; 30 = every 30th
 #endif
 
 #ifndef STRIP_H
@@ -64,23 +52,15 @@
 
 // ===================== Fixed-point constants =====================
 static const int WFIX_SHIFT = 16;   // Q16.16
-static const int MAP_SHIFT = 4;    // Q12.4 (for LUT maps)
+static const int MAP_SHIFT = 4;    // Q12.4
 static const int MAP_SCALE = (1 << MAP_SHIFT);
 
-// Base in ORIGINAL space stored as int16 Q12.4 (pixel * 16)
-static const int BASE_SHIFT = 4;                     // Q12.4
-static const int BASE_TO_Q16 = (WFIX_SHIFT - BASE_SHIFT); // 12
-
 // RowRun delta stored as Q12.4 (int16), promoted to Q16.16 by << 12
-static const int DRUN_SHIFT = 4;                         // Q12.4
-static const int DRUN_TO_Q16 = (WFIX_SHIFT - DRUN_SHIFT); // 12
+static const int DRUN_SHIFT = 4;                        // Q12.4
+static const int DRUN_TO_Q16 = (WFIX_SHIFT - DRUN_SHIFT);// 12
 
 #ifndef RUN_TOL_Q16
-#define RUN_TOL_Q16         (512) // 1/256 pixel in Q16.16
-#endif
-
-#ifndef BASE_RUN_TOL_Q12_4
-#define BASE_RUN_TOL_Q12_4  (2)   // 2 LSB of Q12.4 => 0.125 px
+#define RUN_TOL_Q16         (256) // 1/256 pixel in Q16.16
 #endif
 
 // ===================== Logging =====================
@@ -339,6 +319,7 @@ static Image* readBMP(const char* filename) {
 
     fseek(fp, bfh.bfOffBits, SEEK_SET);
 
+    // NOTE: This reads rows as stored (BMP can be bottom-up). For your pipeline, orientation is usually irrelevant.
     for (int i = 0; i < img->height; ++i) {
         size_t got = fread(img->data + (size_t)i * img->width * 3, 1, (size_t)img->width * 3, fp);
         MEM_READ(got);
@@ -461,25 +442,36 @@ static inline bool file_exists(const std::filesystem::path& p) {
 }
 
 static std::filesystem::path pick_imu_ini(const std::filesystem::path& exePath, int argc, char** argv) {
-    if (argc >= 2 && argv[1] && argv[1][0]) return std::filesystem::path(StringToWString(argv[1]));
+    if (argc >= 2 && argv[1] && argv[1][0]) {
+        return std::filesystem::path(StringToWString(argv[1]));
+    }
     std::filesystem::path exeIni = exePath; exeIni.replace_extension(L".ini");
     if (file_exists(exeIni)) return exeIni;
+
     std::filesystem::path imuIni = exePath.parent_path() / L"imu.ini";
     if (file_exists(imuIni)) return imuIni;
+
+    // fallback: try IMU.ini
     std::filesystem::path imuIni2 = exePath.parent_path() / L"IMU.ini";
     if (file_exists(imuIni2)) return imuIni2;
-    return exeIni;
+
+    return exeIni; // will fail later with clear error
 }
 
 static std::filesystem::path pick_params_ini(const std::filesystem::path& exePath, int argc, char** argv) {
-    if (argc >= 3 && argv[2] && argv[2][0]) return std::filesystem::path(StringToWString(argv[2]));
-    return exePath.parent_path() / L"parameters.ini";
+    if (argc >= 3 && argv[2] && argv[2][0]) {
+        return std::filesystem::path(StringToWString(argv[2]));
+    }
+    std::filesystem::path p = exePath.parent_path() / L"parameters.ini";
+    return p;
 }
 
 static std::string make_abs_if_relative(const std::string& in, const std::filesystem::path& baseDir) {
     if (in.empty()) return in;
     std::filesystem::path p = std::filesystem::path(StringToWString(in));
-    if (p.is_relative()) p = baseDir / p;
+    if (p.is_relative()) {
+        p = baseDir / p;
+    }
     return WStringToUtf8(p.wstring());
 }
 
@@ -830,162 +822,76 @@ static void convert_rpy_sensor_to_cam(double roll_sys1, double pitch_sys1,
     *yaw_deg_out = (float)(yawX * 180.0 / M_PI);
 }
 
-// ===================== BaseRun compression (per sy) =====================
-#pragma pack(push, 1)
-struct BaseRun {
-    uint16_t ox0;
-    uint16_t len;
-    int16_t  bx0_q12_4;
-    int16_t  by0_q12_4;
-    int16_t  dbx_q12_4;
-    int16_t  dby_q12_4;
-};
-#pragma pack(pop)
-
-// Build a single sy row (per_cam_w_max) base coords in ORIGINAL space (Q12.4), then compress into BaseRuns.
-static void buildBaseRunsOriginalQ12_4(
-    const std::vector<int16_t>& comp_x_q, // resized space (Q12.4)
+// ===================== Build per-row base maps in ORIGINAL space =====================
+static void buildBaseMapsOriginal(
+    const std::vector<int16_t>& comp_x_q,
     const std::vector<int16_t>& comp_y_q,
     int resized_w, int resized_h,
     int crop_x0, int crop_y0,
     int crop_w, int crop_h,
     int per_cam_w_max,
     float resize_factor_local,
-    std::vector<std::vector<BaseRun>>& outRunsPerSy,
-    size_t& outTotalBytes)
+    std::vector<int32_t>& base_x_q16,
+    std::vector<int32_t>& base_y_q16)
 {
     StageTimer _t(ST_MAPS);
 
-    outRunsPerSy.clear();
-    outRunsPerSy.resize((size_t)crop_h);
-    outTotalBytes = 0;
+    base_x_q16.resize((size_t)per_cam_w_max * crop_h);
+    base_y_q16.resize((size_t)per_cam_w_max * crop_h);
 
     const double sx = (double)crop_w / (double)per_cam_w_max;
+    const float  inv_resize = 1.0f / resize_factor_local;
+    const float  q16_scale = (float)(1 << WFIX_SHIFT);
 
-    // Clamp bounds in ORIGINAL space but stored as Q12.4
-    const int32_t minX_q = 0;
-    const int32_t minY_q = 0;
-    const int32_t maxX_q = ((WIDTH - 1) << BASE_SHIFT);
-    const int32_t maxY_q = ((HEIGHT - 1) << BASE_SHIFT);
-
-    // temp row buffers (exact base Q12.4 for one sy) - freed each loop
-    std::vector<int16_t> rowBX;
-    std::vector<int16_t> rowBY;
-    rowBX.resize((size_t)per_cam_w_max);
-    rowBY.resize((size_t)per_cam_w_max);
-
-    auto clamp_i16 = [](int32_t v)->int16_t {
-        v = clampi((int)v, -32768, 32767);
-        return (int16_t)v;
-        };
-
-    for (int sy = 0; sy < crop_h; ++sy) {
-        int src_y = clampi(crop_y0 + sy, 0, resized_h - 1);
+    for (int y = 0; y < crop_h; ++y) {
+        int src_y = clampi(crop_y0 + y, 0, resized_h - 1);
         const int16_t* rowX = &comp_x_q[(size_t)src_y * resized_w];
         const int16_t* rowY = &comp_y_q[(size_t)src_y * resized_w];
 
-        // Build exact base for this row in Q12.4 original:
-        // src_x(original,Q12.4) ~= round( comp_x(resized,Q12.4) / resize_factor )
-        // Same for y. (Because Q12.4 scale is identical: *16)
-        for (int ox = 0; ox < per_cam_w_max; ++ox) {
-            double u = crop_x0 + (ox + 0.5) * sx - 0.5;
-            int iu0 = (int)std::floor(u);
+        for (int x = 0; x < per_cam_w_max; ++x) {
+            double u = crop_x0 + (x + 0.5) * sx - 0.5;
+            int iu0 = clampi((int)std::floor(u), 0, resized_w - 2);
             double tx = u - iu0;
-            if (iu0 < 0) { iu0 = 0; tx = 0.0; }
-            if (iu0 > resized_w - 2) { iu0 = resized_w - 2; tx = 1.0; }
+            if (tx < 0.0) tx = 0.0;
+            if (tx > 1.0) tx = 1.0;
 
-            // fixed-ish 8-bit weight
-            int wx8 = (int)std::lround(tx * 256.0);
-            if (wx8 < 0) wx8 = 0;
-            if (wx8 > 256) wx8 = 256;
+            float v00x = rowX[iu0] / (float)MAP_SCALE;
+            float v10x = rowX[iu0 + 1] / (float)MAP_SCALE;
+            float src_x_r = v00x + (v10x - v00x) * (float)tx;
 
-            int32_t v00x = (int32_t)rowX[iu0];
-            int32_t v10x = (int32_t)rowX[iu0 + 1];
-            int32_t v00y = (int32_t)rowY[iu0];
-            int32_t v10y = (int32_t)rowY[iu0 + 1];
+            float v00y = rowY[iu0] / (float)MAP_SCALE;
+            float v10y = rowY[iu0 + 1] / (float)MAP_SCALE;
+            float src_y_r = v00y + (v10y - v00y) * (float)tx;
 
-            int32_t src_x_r_q = v00x + (((v10x - v00x) * wx8) >> 8); // Q12.4 in resized
-            int32_t src_y_r_q = v00y + (((v10y - v00y) * wx8) >> 8);
+            float src_x = src_x_r * inv_resize;
+            float src_y = src_y_r * inv_resize;
 
-            // Convert resized->original in Q12.4:
-            // original_q = round(resized_q / resize_factor)
-            double oxq = (double)src_x_r_q / (double)resize_factor_local;
-            double oyq = (double)src_y_r_q / (double)resize_factor_local;
+            src_x = std::max(0.0f, std::min(src_x, (float)(WIDTH - 1)));
+            src_y = std::max(0.0f, std::min(src_y, (float)(HEIGHT - 1)));
 
-            int32_t bxq = (int32_t)std::llround(oxq);
-            int32_t byq = (int32_t)std::llround(oyq);
+            int32_t qx16 = (int32_t)std::lround(src_x * q16_scale);
+            int32_t qy16 = (int32_t)std::lround(src_y * q16_scale);
 
-            bxq = clampi((int)bxq, (int)minX_q, (int)maxX_q);
-            byq = clampi((int)byq, (int)minY_q, (int)maxY_q);
-
-            rowBX[(size_t)ox] = clamp_i16(bxq);
-            rowBY[(size_t)ox] = clamp_i16(byq);
+            base_x_q16[(size_t)y * per_cam_w_max + x] = qx16;
+            base_y_q16[(size_t)y * per_cam_w_max + x] = qy16;
         }
-
-        // Compress into BaseRuns
-        std::vector<BaseRun>& runs = outRunsPerSy[(size_t)sy];
-        runs.clear();
-        runs.reserve(1024);
-
-        int ox = 0;
-        while (ox < per_cam_w_max) {
-            int16_t bx0 = rowBX[(size_t)ox];
-            int16_t by0 = rowBY[(size_t)ox];
-
-            int16_t dbx = 0;
-            int16_t dby = 0;
-            if (ox + 1 < per_cam_w_max) {
-                dbx = (int16_t)clampi((int)rowBX[(size_t)ox + 1] - (int)bx0, -32768, 32767);
-                dby = (int16_t)clampi((int)rowBY[(size_t)ox + 1] - (int)by0, -32768, 32767);
-            }
-            else {
-                dbx = (int16_t)(1 << BASE_SHIFT); // ~ +1px
-                dby = 0;
-            }
-
-            int len = 1;
-            for (int ox2 = ox + 1; ox2 < per_cam_w_max; ++ox2) {
-                int i = ox2 - ox;
-                int32_t bxP = (int32_t)bx0 + (int32_t)i * (int32_t)dbx;
-                int32_t byP = (int32_t)by0 + (int32_t)i * (int32_t)dby;
-
-                int32_t bxE = (int32_t)rowBX[(size_t)ox2];
-                int32_t byE = (int32_t)rowBY[(size_t)ox2];
-
-                int32_t ex = bxP - bxE; if (ex < 0) ex = -ex;
-                int32_t ey = byP - byE; if (ey < 0) ey = -ey;
-
-                if (ex > BASE_RUN_TOL_Q12_4 || ey > BASE_RUN_TOL_Q12_4) break;
-                len++;
-            }
-
-            BaseRun br{};
-            br.ox0 = (uint16_t)ox;
-            br.len = (uint16_t)len;
-            br.bx0_q12_4 = bx0;
-            br.by0_q12_4 = by0;
-            br.dbx_q12_4 = dbx;
-            br.dby_q12_4 = dby;
-            runs.push_back(br);
-
-            ox += len;
-        }
-
-        outTotalBytes += runs.size() * sizeof(BaseRun);
     }
 
-    printf("[INFO] BaseRuns built: %d rows, total BaseRun bytes = %.2f KB\n",
-        crop_h, outTotalBytes / 1024.0);
+    printf("[INFO] Base maps in original space built (per_cam_w_max x crop_h, Q16.16).\r\n");
 }
 
-// ===================== RowRun delta helper =====================
-static inline int16_t qdelta_q12_4_from_q16(int32_t dq16) {
-    // round from Q16.16 to Q12.4 (shift right 12)
-    int32_t v = (dq16 >= 0) ? (dq16 + (1 << (DRUN_TO_Q16 - 1))) : (dq16 - (1 << (DRUN_TO_Q16 - 1)));
-    v >>= DRUN_TO_Q16;
-    v = clampi(v, -32768, 32767);
-    return (int16_t)v;
-}
+// ===================== RowRun schedule =====================
+#pragma pack(push, 1)
+struct RowRun {
+    uint16_t sy;
+    uint16_t ox0;
+    uint16_t len;
+    int32_t  ax0_q16;
+    int32_t  ay0_q16;
+    int16_t  dax_q12_4;
+    int16_t  day_q12_4;
+};
+#pragma pack(pop)
 
 // ===================== 2-line BRAM cache =====================
 struct LineCache {
@@ -996,9 +902,9 @@ struct LineCache {
 
     LineCache() {
         rowId.fill(-1);
-        for (auto& buf : Y) buf.resize((size_t)WIDTH);
-        for (auto& buf : U) buf.resize((size_t)WIDTH / 2);
-        for (auto& buf : V) buf.resize((size_t)WIDTH / 2);
+        for (auto& buf : Y) buf.resize(WIDTH);
+        for (auto& buf : U) buf.resize(WIDTH / 2);
+        for (auto& buf : V) buf.resize(WIDTH / 2);
     }
 
     void loadRowPtr(int parity,
@@ -1127,145 +1033,218 @@ struct RowWindow {
     inline unsigned char* rowV(int camId, int slot) { return &cam[camId].V[(size_t)slot * cam[camId].cw]; }
 };
 
-// ===================== BaseRun evaluation helpers =====================
-struct BaseRunCursor {
-    const std::vector<BaseRun>* runs = nullptr;
-    size_t runIdx = 0;
-    BaseRun cur{};
-    int curStart = 0;
-    int curEnd = 0;
-
-    void init(const std::vector<BaseRun>& r) {
-        runs = &r;
-        runIdx = 0;
-        if (!r.empty()) {
-            cur = r[0];
-            curStart = (int)cur.ox0;
-            curEnd = curStart + (int)cur.len;
-        }
-        else {
-            cur = BaseRun{};
-            curStart = 0;
-            curEnd = 0;
-        }
-    }
-
-    inline bool ensure_ox(int ox) {
-        if (!runs) return false;
-        while ((int)runIdx < (int)runs->size() && ox >= curEnd) {
-            runIdx++;
-            if (runIdx >= runs->size()) return false;
-            cur = (*runs)[runIdx];
-            curStart = (int)cur.ox0;
-            curEnd = curStart + (int)cur.len;
-        }
-        return (ox >= curStart && ox < curEnd);
-    }
-
-    inline bool eval_q12_4(int ox, int16_t& bx, int16_t& by) {
-        if (!ensure_ox(ox)) return false;
-        int i = ox - curStart;
-        int32_t bx32 = (int32_t)cur.bx0_q12_4 + (int32_t)i * (int32_t)cur.dbx_q12_4;
-        int32_t by32 = (int32_t)cur.by0_q12_4 + (int32_t)i * (int32_t)cur.dby_q12_4;
-        bx = (int16_t)clampi((int)bx32, -32768, 32767);
-        by = (int16_t)clampi((int)by32, -32768, 32767);
-        return true;
-    }
-};
-
-// Compute affine ax/ay from base Q12.4 original -> output Q16.16 + y0 check.
-static inline bool compute_axay_from_base_q12_4(
-    int16_t bx_q12_4, int16_t by_q12_4,
-    int32_t cx_q16, int32_t cy_q16,
-    int32_t max_x_q16, int32_t max_y_q16,
-    int32_t y_shift_q16,
+// ===================== On-the-fly mapping ax/ay (row-pointer based, less overhead) =====================
+static inline bool compute_axay_for_dest_rowptr(
+    int ox,
+    int pcw,
+    const int32_t* baseX_row, // points to base_x_q16[sy*per_cam_w_max]
+    const int32_t* baseY_row,
+    int32_t cx_q, int32_t cy_q,
+    int32_t max_x_q, int32_t max_y_q,
+    int32_t y_shift_q,
     int16_t c15, int16_t s15,
-    int32_t& ax_q16, int32_t& ay_q16,
-    int& y0_out)
-{
-    // Promote base Q12.4 -> Q16.16
-    int32_t bx_q16 = ((int32_t)bx_q12_4) << BASE_TO_Q16;
-    int32_t by_q16 = ((int32_t)by_q12_4) << BASE_TO_Q16;
+    int32_t& ax_q, int32_t& ay_q,
+    int& y0_out,
+    uint64_t& local_reads_bytes
+) {
+    if ((unsigned)ox >= (unsigned)pcw) return false;
 
-    by_q16 += y_shift_q16;
+    int32_t bx_q = baseX_row[ox];
+    int32_t by_q = baseY_row[ox];
+    local_reads_bytes += 8;
 
-    int32_t dx_q = bx_q16 - cx_q16;
-    int32_t dy_q = by_q16 - cy_q16;
+    by_q += y_shift_q;
+
+    int32_t dx_q = bx_q - cx_q;
+    int32_t dy_q = by_q - cy_q;
 
     int64_t tmpx = (int64_t)c15 * dx_q + (int64_t)s15 * dy_q;
     int64_t tmpy = -(int64_t)s15 * dx_q + (int64_t)c15 * dy_q;
 
-    ax_q16 = (int32_t)(tmpx >> 15) + cx_q16;
-    ay_q16 = (int32_t)(tmpy >> 15) + cy_q16;
+    ax_q = (int32_t)(tmpx >> 15) + cx_q;
+    ay_q = (int32_t)(tmpy >> 15) + cy_q;
 
-    if (ax_q16 < 0 || ax_q16 > max_x_q16 || ay_q16 < 0 || ay_q16 > max_y_q16) return false;
+    if (ax_q < 0 || ax_q > max_x_q || ay_q < 0 || ay_q > max_y_q) return false;
 
-    int y0 = (ay_q16 >> WFIX_SHIFT);
+    int y0 = (ay_q >> WFIX_SHIFT);
     if (y0 < 0 || y0 >= HEIGHT - 1) return false;
 
     y0_out = y0;
     return true;
 }
 
-// ===================== Precompute y0 spans per (cam,sy) and a global maxY0Bound[sy] =====================
-static void precompute_spans_and_bounds_from_baseruns(
+static void build_runs_for_y0_on_the_fly_rowptr(
+    int y0_target,
+    int pcw,
     int per_cam_h,
+    int per_cam_w_max,
+    const std::vector<int32_t>& base_x_q16,
+    const std::vector<int32_t>& base_y_q16,
+    int32_t cx_q, int32_t cy_q,
+    int32_t max_x_q, int32_t max_y_q,
+    int32_t y_shift_q,
+    int16_t c15, int16_t s15,
+    const std::vector<int16_t>& spanMin_sy,
+    const std::vector<int16_t>& spanMax_sy,
+    std::vector<RowRun>& outRuns,
+    size_t& outPeakBytes // updated by caller if desired
+) {
+    StageTimer _t(ST_SCHED);
+
+    outRuns.clear();
+    if (outRuns.capacity() < 4096) outRuns.reserve(4096);
+
+    auto q_delta = [](int32_t dq16)->int16_t {
+        int32_t v = (dq16 >= 0) ? (dq16 + (1 << (DRUN_TO_Q16 - 1))) : (dq16 - (1 << (DRUN_TO_Q16 - 1)));
+        v >>= DRUN_TO_Q16;
+        v = clampi(v, -32768, 32767);
+        return (int16_t)v;
+        };
+
+    uint64_t local_reads = 0;
+
+    for (int sy = 0; sy < per_cam_h; ++sy) {
+        int16_t mn = spanMin_sy[sy];
+        int16_t mx = spanMax_sy[sy];
+        if (mx < 0) continue;
+        if (y0_target < mn || y0_target > mx) continue;
+
+        const int32_t* rowBX = &base_x_q16[(size_t)sy * (size_t)per_cam_w_max];
+        const int32_t* rowBY = &base_y_q16[(size_t)sy * (size_t)per_cam_w_max];
+
+        int ox = 0;
+        while (ox < pcw) {
+            int32_t ax0, ay0;
+            int y0c = -1;
+            if (!compute_axay_for_dest_rowptr(
+                ox, pcw, rowBX, rowBY,
+                cx_q, cy_q, max_x_q, max_y_q,
+                y_shift_q, c15, s15,
+                ax0, ay0, y0c, local_reads))
+            {
+                ox++;
+                continue;
+            }
+            if (y0c != y0_target) { ox++; continue; }
+
+            int32_t ax1 = ax0, ay1 = ay0;
+            int y0n = y0c;
+            bool has1 = false;
+            if (ox + 1 < pcw) {
+                has1 = compute_axay_for_dest_rowptr(
+                    ox + 1, pcw, rowBX, rowBY,
+                    cx_q, cy_q, max_x_q, max_y_q,
+                    y_shift_q, c15, s15,
+                    ax1, ay1, y0n, local_reads);
+                if (!has1 || y0n != y0_target) has1 = false;
+            }
+
+            int32_t dax_q16_exact = has1 ? (ax1 - ax0) : (1 << WFIX_SHIFT);
+            int32_t day_q16_exact = has1 ? (ay1 - ay0) : 0;
+
+            int16_t dax_q12_4 = q_delta(dax_q16_exact);
+            int16_t day_q12_4 = q_delta(day_q16_exact);
+
+            int start_ox = ox;
+            int len = 1;
+
+            int32_t dax_q16 = ((int32_t)dax_q12_4) << DRUN_TO_Q16;
+            int32_t day_q16 = ((int32_t)day_q12_4) << DRUN_TO_Q16;
+
+            for (int ox2 = ox + 1; ox2 < pcw; ++ox2) {
+                int32_t axE, ayE;
+                int y0E = -1;
+                if (!compute_axay_for_dest_rowptr(
+                    ox2, pcw, rowBX, rowBY,
+                    cx_q, cy_q, max_x_q, max_y_q,
+                    y_shift_q, c15, s15,
+                    axE, ayE, y0E, local_reads))
+                {
+                    break;
+                }
+                if (y0E != y0_target) break;
+
+                int i = ox2 - start_ox;
+                int32_t axP = ax0 + (int32_t)((int64_t)i * dax_q16);
+                int32_t ayP = ay0 + (int32_t)((int64_t)i * day_q16);
+
+                if ((ayP >> WFIX_SHIFT) != y0_target) break;
+
+                int32_t ex = axP - axE; if (ex < 0) ex = -ex;
+                int32_t ey = ayP - ayE; if (ey < 0) ey = -ey;
+                if (ex > RUN_TOL_Q16 || ey > RUN_TOL_Q16) break;
+
+                len++;
+            }
+
+            RowRun rr{};
+            rr.sy = (uint16_t)sy;
+            rr.ox0 = (uint16_t)start_ox;
+            rr.len = (uint16_t)len;
+            rr.ax0_q16 = ax0;
+            rr.ay0_q16 = ay0;
+            rr.dax_q12_4 = dax_q12_4;
+            rr.day_q12_4 = day_q12_4;
+            outRuns.push_back(rr);
+
+            ox += len;
+        }
+    }
+
+    MEM_READ(local_reads);
+
+    size_t bytes = outRuns.size() * sizeof(RowRun);
+    if (bytes > outPeakBytes) outPeakBytes = bytes;
+}
+
+// ===================== Precompute y0 spans per (cam,sy) and a global maxY0Bound[sy] =====================
+static void precompute_spans_and_bounds(
+    int per_cam_h,
+    int per_cam_w_max,
+    const std::vector<int32_t>& base_x_q16,
+    const std::vector<int32_t>& base_y_q16,
     const std::vector<int>& per_cam_w,
-    const std::vector<std::vector<BaseRun>>& baseRunsPerSy,
     const std::vector<int32_t>& y_shift_q_cam,
     const std::vector<int16_t>& c15_cam,
     const std::vector<int16_t>& s15_cam,
-    int32_t cx_q16, int32_t cy_q16,
-    int32_t max_x_q16, int32_t max_y_q16,
+    int32_t cx_q, int32_t cy_q,
+    int32_t max_x_q, int32_t max_y_q,
     std::vector<std::vector<int16_t>>& spanMin_cam_sy,
     std::vector<std::vector<int16_t>>& spanMax_cam_sy,
     std::vector<int>& maxY0Bound_sy
 ) {
     StageTimer _t(ST_SCHED);
 
-    int numCams = (int)per_cam_w.size();
-    spanMin_cam_sy.assign((size_t)numCams, std::vector<int16_t>(per_cam_h, (int16_t)32767));
-    spanMax_cam_sy.assign((size_t)numCams, std::vector<int16_t>(per_cam_h, (int16_t)-1));
+    spanMin_cam_sy.assign((size_t)per_cam_w.size(), std::vector<int16_t>(per_cam_h, (int16_t)32767));
+    spanMax_cam_sy.assign((size_t)per_cam_w.size(), std::vector<int16_t>(per_cam_h, (int16_t)-1));
     maxY0Bound_sy.assign(per_cam_h, -1);
 
-    for (int cam = 0; cam < numCams; ++cam) {
+    uint64_t local_reads = 0;
+
+    for (int cam = 0; cam < (int)per_cam_w.size(); ++cam) {
         int pcw = per_cam_w[cam];
-        int32_t y_shift_q16 = y_shift_q_cam[cam];
+        int32_t y_shift_q = y_shift_q_cam[cam];
         int16_t c15 = c15_cam[cam];
         int16_t s15 = s15_cam[cam];
 
         for (int sy = 0; sy < per_cam_h; ++sy) {
-            const std::vector<BaseRun>& runs = baseRunsPerSy[(size_t)sy];
-            if (runs.empty()) {
-                spanMin_cam_sy[cam][sy] = (int16_t)32767;
-                spanMax_cam_sy[cam][sy] = (int16_t)-1;
-                continue;
-            }
+            const int32_t* rowBX = &base_x_q16[(size_t)sy * (size_t)per_cam_w_max];
+            const int32_t* rowBY = &base_y_q16[(size_t)sy * (size_t)per_cam_w_max];
 
             int oxs[3] = { 0, pcw / 2, pcw - 1 };
             int mn = 1000000;
             int mx = -1000000;
             bool any = false;
 
-            BaseRunCursor cur;
-            cur.init(runs);
-
             for (int k = 0; k < 3; ++k) {
                 int ox = oxs[k];
-                if (ox < 0 || ox >= pcw) continue;
-
-                int16_t bx_q12, by_q12;
-                if (!cur.eval_q12_4(ox, bx_q12, by_q12)) continue;
-
                 int32_t ax, ay;
                 int y0;
-                if (compute_axay_from_base_q12_4(
-                    bx_q12, by_q12,
-                    cx_q16, cy_q16,
-                    max_x_q16, max_y_q16,
-                    y_shift_q16,
-                    c15, s15,
-                    ax, ay, y0))
+                if (compute_axay_for_dest_rowptr(
+                    ox, pcw, rowBX, rowBY,
+                    cx_q, cy_q, max_x_q, max_y_q,
+                    y_shift_q, c15, s15,
+                    ax, ay, y0, local_reads))
                 {
                     any = true;
                     mn = std::min(mn, y0);
@@ -1285,6 +1264,8 @@ static void precompute_spans_and_bounds_from_baseruns(
             if (mx > maxY0Bound_sy[sy]) maxY0Bound_sy[sy] = mx;
         }
     }
+
+    MEM_READ(local_reads);
 }
 
 // ===================== V10-like blending from row window into a destination row buffer =====================
@@ -1381,13 +1362,13 @@ static void blend_row_sy_into_dst(
 }
 
 // ===================== Internal memory report (FPGA model) =====================
-static void print_internal_memory_report_v18(
+static void print_internal_memory_report_v17(
     int numCams,
     int width,
     int targetW,
     int targetH,
     const std::vector<int>& per_cam_w,
-    size_t baseRunsBytes,
+    size_t peakScheduleBytes,
     int sliceH)
 {
     const uint64_t BRAM36_BITS = 36ull * 1024ull;
@@ -1406,16 +1387,16 @@ static void print_internal_memory_report_v18(
     uint64_t sliceBytesOne = 2ull * (uint64_t)targetW * (uint64_t)sliceH;
     uint64_t sliceBytesPingPong = 2ull * sliceBytesOne;
 
-    uint64_t baseBytes = (uint64_t)baseRunsBytes;
+    uint64_t scheduleBytes = (uint64_t)peakScheduleBytes;
     uint64_t ddrPanoBytes = 2ull * (uint64_t)targetW * (uint64_t)targetH;
 
-    uint64_t onChipTotalBytes = lineCacheBytesTotal + rowWindowBytes + sliceBytesPingPong + baseBytes;
+    uint64_t onChipTotalBytes = lineCacheBytesTotal + rowWindowBytes + sliceBytesPingPong + scheduleBytes;
     uint64_t onChipTotalBits = onChipTotalBytes * 8ull;
 
     uint64_t bram36Blocks = ceil_div_u64(onChipTotalBits, BRAM36_BITS);
     uint64_t uramBlocks = ceil_div_u64(onChipTotalBits, URAM_BITS);
 
-    printf("\n===== INTERNAL MEMORY ESTIMATE (V18 MODEL) =====\n");
+    printf("\n===== INTERNAL MEMORY ESTIMATE (V17 MODEL) =====\n");
     printf("LineCache total: %llu bytes (%.2f KB) [per cam=%.2f KB]\n",
         (unsigned long long)lineCacheBytesTotal, lineCacheBytesTotal / 1024.0,
         lineCacheBytesPerCam / 1024.0);
@@ -1423,8 +1404,8 @@ static void print_internal_memory_report_v18(
     printf("RowWindow (WINDOW_H=%d): %llu bytes (%.2f MB)\n",
         WINDOW_H, (unsigned long long)rowWindowBytes, rowWindowBytes / (1024.0 * 1024.0));
 
-    printf("BaseRuns (static): %llu bytes (%.2f KB)\n",
-        (unsigned long long)baseBytes, baseBytes / 1024.0);
+    printf("Schedule (peak per-y0 RowRuns): %llu bytes (%.2f KB)\n",
+        (unsigned long long)scheduleBytes, scheduleBytes / 1024.0);
 
     printf("Pano slice ping-pong (2x, sliceH=%d): %llu bytes (%.2f MB)\n",
         sliceH, (unsigned long long)sliceBytesPingPong, sliceBytesPingPong / (1024.0 * 1024.0));
@@ -1613,6 +1594,7 @@ int main(int argc, char** argv) {
         panorama_crop_height_scale = paramIni.ReadFloat(L"cropping", L"panorama_crop_height_scale", panorama_crop_height_scale);
         panorama_crop_width_scale = paramIni.ReadFloat(L"cropping", L"panorama_crop_width_scale", panorama_crop_width_scale);
 
+        // IMPORTANT: your INI keys had trailing spaces in earlier code; V17 reads without trailing spaces.
         resize_factor = paramIni.ReadFloat(L"resize", L"resize_factor", resize_factor);
         PITCH_TO_TRANSLATION_FACTOR = paramIni.ReadFloat(L"transform", L"pitch_to_translation_factor", PITCH_TO_TRANSLATION_FACTOR);
         YAW_TO_TRANSLATION_FACTOR = paramIni.ReadFloat(L"transform", L"yaw_to_translation_factor", YAW_TO_TRANSLATION_FACTOR);
@@ -1635,9 +1617,10 @@ int main(int argc, char** argv) {
             filenames.push_back(p);
         }
 
+        // Validate paths (Release failure usually shows up here)
         for (int i = 0; i < NUM_CAMS; ++i) {
             if (filenames[i].empty()) {
-                printf("[FATAL] file_%d is empty in IMU ini.\n", i);
+                printf("[FATAL] file_%d is empty in IMU ini. (Release exe-name.ini mismatch?)\n", i);
                 return 1;
             }
             if (!file_exists(std::filesystem::path(StringToWString(filenames[i])))) {
@@ -1661,7 +1644,7 @@ int main(int argc, char** argv) {
             roll_Sensor = pitch_Sensor = yaw_Sensor = 0.0f;
         }
 
-        logln("........Processing (MT-V18 FPGA Model: BaseRuns(Q12.4) + Fused schedule+render in workers + RowWindow + 2-Line Cache + DDR Slice PingPong)........");
+        logln("........Processing (MT-V17 FPGA Model: ON-FLY y0 buckets (parallel) + RowWindow + 2-Line Cache + DDR Slice PingPong)........");
 
         // Geometry in resized space
         const int resized_w = (int)std::lround(WIDTH * resize_factor);
@@ -1690,7 +1673,7 @@ int main(int argc, char** argv) {
             saveComposedMapsQ(comp_x_q, comp_y_q, exePath);
         }
 
-        // Load all camera frames and convert to YUV422 once
+        // Load all camera frames and convert to YUV422 once (KEEP contiguous buffers; no cam_scan vectors)
         std::vector<YUV422Image*> framesYUV(NUM_CAMS, nullptr);
         for (int i = 0; i < NUM_CAMS; ++i) {
             Image* tmp = readBMP(filenames[i].c_str());
@@ -1728,19 +1711,10 @@ int main(int argc, char** argv) {
         int per_cam_w_max = 0;
         for (int w : per_cam_w) per_cam_w_max = std::max(per_cam_w_max, w);
 
-        // Build BaseRuns (original Q12.4), no full base arrays kept
-        std::vector<std::vector<BaseRun>> baseRunsPerSy;
-        size_t baseRunsTotalBytes = 0;
-        buildBaseRunsOriginalQ12_4(
-            comp_x_q, comp_y_q,
-            resized_w, resized_h,
-            crop_x0, crop_y0,
-            crop_w, crop_h,
-            per_cam_w_max,
-            resize_factor,
-            baseRunsPerSy,
-            baseRunsTotalBytes
-        );
+        // Base maps (original coords) ONCE
+        std::vector<int32_t> base_x_q16, base_y_q16;
+        buildBaseMapsOriginal(comp_x_q, comp_y_q, resized_w, resized_h, crop_x0, crop_y0, crop_w, crop_h,
+            per_cam_w_max, resize_factor, base_x_q16, base_y_q16);
 
         // Feather alpha
         const int cw_out = TARGET_W / 2;
@@ -1793,19 +1767,24 @@ int main(int argc, char** argv) {
         // Cache hit counters
         std::atomic<uint64_t> cache_ok(0), cache_violation(0);
 
-        // constants for mapping bounds
-        const int32_t cx_q16 = (int32_t)((WIDTH / 2.0f) * (1 << WFIX_SHIFT));
-        const int32_t cy_q16 = (int32_t)((HEIGHT / 2.0f) * (1 << WFIX_SHIFT));
-        const int32_t max_x_q16 = (int32_t)((WIDTH - 2) << WFIX_SHIFT);
-        const int32_t max_y_q16 = (int32_t)((HEIGHT - 2) << WFIX_SHIFT);
+        // Peak schedule size (bytes) across all workers for this frame
+        std::atomic<size_t> peakScheduleBytesAtomic(0);
 
-        // Workers threads: fused schedule+render
+        // Workers threads: build runs + render for their camera
         std::vector<std::thread> workers;
         workers.reserve(NUM_CAMS);
+
+        // constants for mapping bounds
+        const int32_t cx_q = (int32_t)((WIDTH / 2.0f) * (1 << WFIX_SHIFT));
+        const int32_t cy_q = (int32_t)((HEIGHT / 2.0f) * (1 << WFIX_SHIFT));
+        const int32_t max_x_q = (int32_t)((WIDTH - 2) << WFIX_SHIFT);
+        const int32_t max_y_q = (int32_t)((HEIGHT - 2) << WFIX_SHIFT);
 
         for (int cam = 0; cam < NUM_CAMS; ++cam) {
             workers.emplace_back([&, cam]() {
                 LineCache cache;
+                std::vector<RowRun> localRuns;
+                size_t localPeakBytes = 0;
 
                 while (true) {
                     rowBarrier.wait(); // start y0 phase
@@ -1821,7 +1800,31 @@ int main(int argc, char** argv) {
                         continue;
                     }
 
-                    // Load 2 lines for this y0
+                    // 1) Build schedule ON THE FLY here (parallel across cams)
+                    build_runs_for_y0_on_the_fly_rowptr(
+                        y0,
+                        per_cam_w[cam],
+                        per_cam_h,
+                        per_cam_w_max,
+                        base_x_q16, base_y_q16,
+                        cx_q, cy_q, max_x_q, max_y_q,
+                        y_shift_q_cam[cam],
+                        c15_cam[cam], s15_cam[cam],
+                        spanMin_cam_sy[cam], spanMax_cam_sy[cam],
+                        localRuns,
+                        localPeakBytes
+                    );
+
+                    // publish peak schedule bytes (atomic max)
+                    {
+                        size_t cur = peakScheduleBytesAtomic.load(std::memory_order_relaxed);
+                        while (localPeakBytes > cur &&
+                            !peakScheduleBytesAtomic.compare_exchange_weak(cur, localPeakBytes, std::memory_order_relaxed)) {
+                            // loop
+                        }
+                    }
+
+                    // 2) Render using 2-line cache
                     StageTimer _r(ST_RENDER);
 
                     const unsigned char* Y0 = framesYUV[cam]->Y + (size_t)y0 * (size_t)WIDTH;
@@ -1841,193 +1844,85 @@ int main(int argc, char** argv) {
                     uint64_t okLocal = 0;
                     uint64_t vioLocal = 0;
 
-                    int32_t y_shift_q16 = y_shift_q_cam[cam];
-                    int16_t c15 = c15_cam[cam];
-                    int16_t s15 = s15_cam[cam];
+                    for (const RowRun& r : localRuns) {
+                        if (r.sy >= (uint16_t)per_cam_h) continue;
 
-                    // Fused schedule detection + rendering
-                    // For each sy: traverse BaseRuns segments, detect contiguous RowRuns that map to y0, render immediately.
-                    for (int sy = 0; sy < per_cam_h; ++sy) {
-                        int16_t mn = spanMin_cam_sy[cam][sy];
-                        int16_t mx = spanMax_cam_sy[cam][sy];
-                        if (mx < 0) continue;
-                        if (y0 < mn || y0 > mx) continue;
+                        int slot = rowWindow.allocate_slot_for_sy((int)r.sy);
+                        if (slot < 0) continue; // bounded buffer: drop
 
-                        const std::vector<BaseRun>& brs = baseRunsPerSy[(size_t)sy];
-                        if (brs.empty()) continue;
+                        unsigned char* dstY = rowWindow.rowY(cam, slot);
+                        unsigned char* dstU = rowWindow.rowU(cam, slot);
+                        unsigned char* dstV = rowWindow.rowV(cam, slot);
 
-                        // Allocate slot on-demand once we have any pixels to write for this sy
-                        // (allocate_slot_for_sy is idempotent)
-                        int slot = -1;
-                        unsigned char* dstY = nullptr;
-                        unsigned char* dstU = nullptr;
-                        unsigned char* dstV = nullptr;
+                        int32_t ax0 = r.ax0_q16;
+                        int32_t ay0 = r.ay0_q16;
+                        int32_t dax = ((int32_t)r.dax_q12_4) << DRUN_TO_Q16;
+                        int32_t day = ((int32_t)r.day_q12_4) << DRUN_TO_Q16;
 
-                        for (const BaseRun& br : brs) {
-                            int oxStart = (int)br.ox0;
-                            int oxEnd = oxStart + (int)br.len;
-                            if (oxStart >= wCam) break;
-                            if (oxEnd > wCam) oxEnd = wCam;
-                            if (oxEnd <= oxStart) continue;
+                        int ox0 = (int)r.ox0;
+                        int len = (int)r.len;
+                        if (ox0 < 0 || ox0 >= wCam) continue;
+                        if (len <= 0) continue;
+                        if (ox0 + len > wCam) len = wCam - ox0;
 
-                            // Scan ox within this BaseRun
-                            int ox = oxStart;
-                            while (ox < oxEnd) {
-                                int i0 = ox - oxStart;
-                                int16_t bx0_q12 = (int16_t)clampi((int)((int32_t)br.bx0_q12_4 + (int32_t)i0 * (int32_t)br.dbx_q12_4), -32768, 32767);
-                                int16_t by0_q12 = (int16_t)clampi((int)((int32_t)br.by0_q12_4 + (int32_t)i0 * (int32_t)br.dby_q12_4), -32768, 32767);
+                        for (int i = 0; i < len; ++i) {
+                            int ox = ox0 + i;
 
-                                int32_t ax0_q16, ay0_q16;
-                                int y0c = -1;
-                                if (!compute_axay_from_base_q12_4(
-                                    bx0_q12, by0_q12,
-                                    cx_q16, cy_q16,
-                                    max_x_q16, max_y_q16,
-                                    y_shift_q16, c15, s15,
-                                    ax0_q16, ay0_q16, y0c))
-                                {
-                                    ox++;
-                                    continue;
-                                }
-                                if (y0c != y0) { ox++; continue; }
+                            int32_t ax_q = ax0 + (int32_t)((int64_t)i * dax);
+                            int32_t ay_q = ay0 + (int32_t)((int64_t)i * day);
 
-                                // neighbor for delta estimate
-                                int32_t ax1_q16 = ax0_q16, ay1_q16 = ay0_q16;
-                                bool has1 = false;
-                                if (ox + 1 < oxEnd) {
-                                    int i1 = (ox + 1) - oxStart;
-                                    int16_t bx1_q12 = (int16_t)clampi((int)((int32_t)br.bx0_q12_4 + (int32_t)i1 * (int32_t)br.dbx_q12_4), -32768, 32767);
-                                    int16_t by1_q12 = (int16_t)clampi((int)((int32_t)br.by0_q12_4 + (int32_t)i1 * (int32_t)br.dby_q12_4), -32768, 32767);
-                                    int y0n = -1;
-                                    has1 = compute_axay_from_base_q12_4(
-                                        bx1_q12, by1_q12,
-                                        cx_q16, cy_q16,
-                                        max_x_q16, max_y_q16,
-                                        y_shift_q16, c15, s15,
-                                        ax1_q16, ay1_q16, y0n);
-                                    if (!has1 || y0n != y0) has1 = false;
-                                }
+                            int y_chk = (ay_q >> WFIX_SHIFT);
+                            if (y_chk != y0) { vioLocal++; continue; }
+                            okLocal++;
 
-                                int32_t dax_q16_exact = has1 ? (ax1_q16 - ax0_q16) : (1 << WFIX_SHIFT);
-                                int32_t day_q16_exact = has1 ? (ay1_q16 - ay0_q16) : 0;
+                            int x0 = (ax_q >> WFIX_SHIFT);
+                            if ((unsigned)x0 >= (unsigned)(WIDTH - 1)) continue;
 
-                                int16_t dax_q12_4 = qdelta_q12_4_from_q16(dax_q16_exact);
-                                int16_t day_q12_4 = qdelta_q12_4_from_q16(day_q16_exact);
+                            uint32_t wx = (uint32_t)(ax_q & 0xFFFF);
+                            uint32_t wy = (uint32_t)(ay_q & 0xFFFF);
 
-                                int32_t dax_q16 = ((int32_t)dax_q12_4) << DRUN_TO_Q16;
-                                int32_t day_q16 = ((int32_t)day_q12_4) << DRUN_TO_Q16;
+                            uint32_t W_x0 = 65536u - wx;
+                            uint32_t W_x1 = wx;
+                            uint32_t W_y0 = 65536u - wy;
+                            uint32_t W_y1 = wy;
 
-                                int start_ox = ox;
-                                int len = 1;
+                            uint32_t W00 = (uint32_t)(((uint64_t)W_x0 * W_y0) >> 16);
+                            uint32_t W10 = (uint32_t)(((uint64_t)W_x1 * W_y0) >> 16);
+                            uint32_t W01 = (uint32_t)(((uint64_t)W_x0 * W_y1) >> 16);
+                            uint32_t W11 = (uint32_t)(((uint64_t)W_x1 * W_y1) >> 16);
 
-                                // Extend run within this BaseRun segment
-                                for (int ox2 = ox + 1; ox2 < oxEnd; ++ox2) {
-                                    int j = ox2 - oxStart;
-                                    int16_t bxE_q12 = (int16_t)clampi((int)((int32_t)br.bx0_q12_4 + (int32_t)j * (int32_t)br.dbx_q12_4), -32768, 32767);
-                                    int16_t byE_q12 = (int16_t)clampi((int)((int32_t)br.by0_q12_4 + (int32_t)j * (int32_t)br.dby_q12_4), -32768, 32767);
+                            const unsigned char* p0Y = cache.Y[0].data() + x0;
+                            const unsigned char* p2Y = cache.Y[1].data() + x0;
 
-                                    int32_t axE_q16, ayE_q16;
-                                    int y0E = -1;
-                                    if (!compute_axay_from_base_q12_4(
-                                        bxE_q12, byE_q12,
-                                        cx_q16, cy_q16,
-                                        max_x_q16, max_y_q16,
-                                        y_shift_q16, c15, s15,
-                                        axE_q16, ayE_q16, y0E))
-                                    {
-                                        break;
-                                    }
-                                    if (y0E != y0) break;
+                            int Y_val = (int)((p0Y[0] * W00 + p0Y[1] * W10 + p2Y[0] * W01 + p2Y[1] * W11) >> 16);
+                            dstY[ox] = sat_u8(Y_val);
 
-                                    int ii = ox2 - start_ox;
-                                    int32_t axP = ax0_q16 + (int32_t)((int64_t)ii * dax_q16);
-                                    int32_t ayP = ay0_q16 + (int32_t)((int64_t)ii * day_q16);
+                            int32_t ax_ch_q = ax_q >> 1;
+                            int xch0 = (ax_ch_q >> WFIX_SHIFT);
+                            if ((unsigned)xch0 >= (unsigned)((WIDTH / 2) - 1)) continue;
 
-                                    if ((ayP >> WFIX_SHIFT) != y0) break;
+                            uint32_t wx_ch = (uint32_t)(ax_ch_q & 0xFFFF);
+                            uint32_t Wcx0 = 65536u - wx_ch;
+                            uint32_t Wcx1 = wx_ch;
 
-                                    int32_t ex = axP - axE_q16; if (ex < 0) ex = -ex;
-                                    int32_t ey = ayP - ayE_q16; if (ey < 0) ey = -ey;
-                                    if (ex > RUN_TOL_Q16 || ey > RUN_TOL_Q16) break;
+                            uint32_t Wc00 = (uint32_t)(((uint64_t)Wcx0 * W_y0) >> 16);
+                            uint32_t Wc10 = (uint32_t)(((uint64_t)Wcx1 * W_y0) >> 16);
+                            uint32_t Wc01 = (uint32_t)(((uint64_t)Wcx0 * W_y1) >> 16);
+                            uint32_t Wc11 = (uint32_t)(((uint64_t)Wcx1 * W_y1) >> 16);
 
-                                    len++;
-                                }
+                            const unsigned char* p0U = cache.U[0].data() + xch0;
+                            const unsigned char* p2U = cache.U[1].data() + xch0;
 
-                                // Allocate row slot once we know we will render something for this sy
-                                if (slot < 0) {
-                                    slot = rowWindow.allocate_slot_for_sy(sy);
-                                    if (slot < 0) { // bounded buffer: drop
-                                        // skip this whole sy for this y0
-                                        ox = oxEnd;
-                                        break;
-                                    }
-                                    dstY = rowWindow.rowY(cam, slot);
-                                    dstU = rowWindow.rowU(cam, slot);
-                                    dstV = rowWindow.rowV(cam, slot);
-                                }
+                            const unsigned char* p0V = cache.V[0].data() + xch0;
+                            const unsigned char* p2V = cache.V[1].data() + xch0;
 
-                                // Render this run
-                                for (int ii = 0; ii < len; ++ii) {
-                                    int oxp = start_ox + ii;
+                            int U_val = (int)((p0U[0] * Wc00 + p0U[1] * Wc10 + p2U[0] * Wc01 + p2U[1] * Wc11) >> 16);
+                            int V_val = (int)((p0V[0] * Wc00 + p0V[1] * Wc10 + p2V[0] * Wc01 + p2V[1] * Wc11) >> 16);
 
-                                    int32_t ax_q16 = ax0_q16 + (int32_t)((int64_t)ii * dax_q16);
-                                    int32_t ay_q16 = ay0_q16 + (int32_t)((int64_t)ii * day_q16);
-
-                                    int y_chk = (ay_q16 >> WFIX_SHIFT);
-                                    if (y_chk != y0) { vioLocal++; continue; }
-                                    okLocal++;
-
-                                    int x0 = (ax_q16 >> WFIX_SHIFT);
-                                    if ((unsigned)x0 >= (unsigned)(WIDTH - 1)) continue;
-
-                                    uint32_t wx = (uint32_t)(ax_q16 & 0xFFFF);
-                                    uint32_t wy = (uint32_t)(ay_q16 & 0xFFFF);
-
-                                    uint32_t W_x0 = 65536u - wx;
-                                    uint32_t W_x1 = wx;
-                                    uint32_t W_y0 = 65536u - wy;
-                                    uint32_t W_y1 = wy;
-
-                                    uint32_t W00 = (uint32_t)(((uint64_t)W_x0 * W_y0) >> 16);
-                                    uint32_t W10 = (uint32_t)(((uint64_t)W_x1 * W_y0) >> 16);
-                                    uint32_t W01 = (uint32_t)(((uint64_t)W_x0 * W_y1) >> 16);
-                                    uint32_t W11 = (uint32_t)(((uint64_t)W_x1 * W_y1) >> 16);
-
-                                    const unsigned char* p0Y = cache.Y[0].data() + x0;
-                                    const unsigned char* p2Y = cache.Y[1].data() + x0;
-
-                                    int Y_val = (int)((p0Y[0] * W00 + p0Y[1] * W10 + p2Y[0] * W01 + p2Y[1] * W11) >> 16);
-                                    dstY[oxp] = sat_u8(Y_val);
-
-                                    int32_t ax_ch_q16 = ax_q16 >> 1;
-                                    int xch0 = (ax_ch_q16 >> WFIX_SHIFT);
-                                    if ((unsigned)xch0 >= (unsigned)((WIDTH / 2) - 1)) continue;
-
-                                    uint32_t wx_ch = (uint32_t)(ax_ch_q16 & 0xFFFF);
-                                    uint32_t Wcx0 = 65536u - wx_ch;
-                                    uint32_t Wcx1 = wx_ch;
-
-                                    uint32_t Wc00 = (uint32_t)(((uint64_t)Wcx0 * W_y0) >> 16);
-                                    uint32_t Wc10 = (uint32_t)(((uint64_t)Wcx1 * W_y0) >> 16);
-                                    uint32_t Wc01 = (uint32_t)(((uint64_t)Wcx0 * W_y1) >> 16);
-                                    uint32_t Wc11 = (uint32_t)(((uint64_t)Wcx1 * W_y1) >> 16);
-
-                                    const unsigned char* p0U = cache.U[0].data() + xch0;
-                                    const unsigned char* p2U = cache.U[1].data() + xch0;
-
-                                    const unsigned char* p0V = cache.V[0].data() + xch0;
-                                    const unsigned char* p2V = cache.V[1].data() + xch0;
-
-                                    int U_val = (int)((p0U[0] * Wc00 + p0U[1] * Wc10 + p2U[0] * Wc01 + p2U[1] * Wc11) >> 16);
-                                    int V_val = (int)((p0V[0] * Wc00 + p0V[1] * Wc10 + p2V[0] * Wc01 + p2V[1] * Wc11) >> 16);
-
-                                    int cidx = oxp >> 1;
-                                    if ((unsigned)cidx < (unsigned)cwCam) {
-                                        dstU[cidx] = sat_u8(U_val);
-                                        dstV[cidx] = sat_u8(V_val);
-                                    }
-                                }
-
-                                ox += len; // jump past run
+                            int cidx = ox >> 1;
+                            if ((unsigned)cidx < (unsigned)cwCam) {
+                                dstU[cidx] = sat_u8(U_val);
+                                dstV[cidx] = sat_u8(V_val);
                             }
                         }
                     }
@@ -2055,6 +1950,7 @@ int main(int argc, char** argv) {
             reset_stats();
             cache_ok.store(0);
             cache_violation.store(0);
+            peakScheduleBytesAtomic.store(0);
 
             rowWindow.reset_mappings();
 
@@ -2094,13 +1990,13 @@ int main(int argc, char** argv) {
 
             // Precompute spans and global maxY0Bound per sy (one-time per frame)
             std::vector<int> maxY0Bound_sy;
-            precompute_spans_and_bounds_from_baseruns(
-                per_cam_h,
+            precompute_spans_and_bounds(
+                per_cam_h, per_cam_w_max,
+                base_x_q16, base_y_q16,
                 per_cam_w,
-                baseRunsPerSy,
                 y_shift_q_cam,
                 c15_cam, s15_cam,
-                cx_q16, cy_q16, max_x_q16, max_y_q16,
+                cx_q, cy_q, max_x_q, max_y_q,
                 spanMin_cam_sy, spanMax_cam_sy,
                 maxY0Bound_sy
             );
@@ -2109,10 +2005,10 @@ int main(int argc, char** argv) {
             std::vector<unsigned char> row_ready((size_t)per_cam_h, 0);
             int sy_out = 0;
 
-            // Source-driven execution over y0 (main thread coordinates; workers render fused)
+            // Source-driven execution over y0 (main thread just coordinates)
             for (int y0 = 0; y0 < HEIGHT - 1; ++y0) {
                 current_y0.store(y0, std::memory_order_relaxed);
-                rowBarrier.wait(); // start workers (render)
+                rowBarrier.wait(); // start workers (they build schedule + render)
                 rowBarrier.wait(); // wait done
 
                 for (int sy = 0; sy < per_cam_h; ++sy) {
@@ -2172,7 +2068,11 @@ int main(int argc, char** argv) {
             uint64_t vio = cache_violation.load(std::memory_order_relaxed);
             printf("[CACHE] ok=%llu violation=%llu\n", (unsigned long long)ok, (unsigned long long)vio);
 
-            print_internal_memory_report_v18(NUM_CAMS, WIDTH, TARGET_W, TARGET_H, per_cam_w, baseRunsTotalBytes, WINDOW_H);
+            size_t peakScheduleBytes = peakScheduleBytesAtomic.load(std::memory_order_relaxed);
+            printf("[MEM] Peak per-y0 schedule bytes (per-cam max observed): %.2f KB (%.2f MB)\n",
+                peakScheduleBytes / 1024.0, peakScheduleBytes / (1024.0 * 1024.0));
+
+            print_internal_memory_report_v17(NUM_CAMS, WIDTH, TARGET_W, TARGET_H, per_cam_w, peakScheduleBytes, WINDOW_H);
 
             // Save
             if (SAVE_EVERY_K > 0 && ((f + 1) % SAVE_EVERY_K == 0)) {
@@ -2183,11 +2083,11 @@ int main(int argc, char** argv) {
                 panoDDR.U = panoOut.ddrU.data();
                 panoDDR.V = panoOut.ddrV.data();
 
-                std::string yuvPath = SaveYUVFilePath(captureDirW, L"panorama_v18_baseruns_fused_ddr_pingpong_yuv422", f);
+                std::string yuvPath = SaveYUVFilePath(captureDirW, L"panorama_v17_onfly_parallel_sched_ddr_pingpong_yuv422", f);
                 if (writeYUV422(yuvPath.c_str(), &panoDDR)) printf("[Saved YUV] %s\n", yuvPath.c_str());
                 else printf("[ERROR] writeYUV422 failed for frame %d\n", f);
 
-                std::string bmpPath = SaveImageFilePath(captureDirW, L"panorama_v18_baseruns_fused_ddr_pingpong_yuv422", f);
+                std::string bmpPath = SaveImageFilePath(captureDirW, L"panorama_v17_onfly_parallel_sched_ddr_pingpong_yuv422", f);
                 Image* panoBGR = yuv422ToBGR(&panoDDR);
                 if (panoBGR) {
                     writeBMP(bmpPath.c_str(), panoBGR);
@@ -2204,7 +2104,7 @@ int main(int argc, char** argv) {
             frame_ms[f] = ms;
             printf("[Frame %d] time %.3f ms (%.2f FPS)\n", f, ms, 1000.0 / ms);
 
-            print_stats_summary("PROFILING SUMMARY (MT-V18 BaseRuns(Q12.4) + Fused schedule+render + RowWindow + DDR Slice PingPong, YUV422 end-to-end)");
+            print_stats_summary("PROFILING SUMMARY (MT-V17 OnFly (parallel sched+render) + RowWindow + DDR Slice PingPong, YUV422 end-to-end)");
         }
 
         auto total_t1 = std::chrono::high_resolution_clock::now();
@@ -2216,7 +2116,7 @@ int main(int argc, char** argv) {
         double avg_ms = (NUM_FRAMES > 0) ? sum_ms / NUM_FRAMES : 0.0;
         double latency_fps = avg_ms > 0.0 ? 1000.0 / avg_ms : 0.0;
 
-        printf("\n===== MULTI-FRAME SUMMARY (MT-V18) =====\n");
+        printf("\n===== MULTI-FRAME SUMMARY (MT-V17) =====\n");
         printf("Frames: %d\n", NUM_FRAMES);
         printf("Avg latency per frame: %.3f ms (%.2f FPS)\n", avg_ms, latency_fps);
         printf("Total time: %.3f ms (Throughput %.2f FPS)\n", total_ms, throughput_fps);

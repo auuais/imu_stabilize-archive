@@ -1,0 +1,714 @@
+// IMU_Stabilize_Gyro_linebuffer_YUV_V14_V12plus.cpp
+//
+// V14 (built on V12-source-scatter) — SOURCE-driven scanline streaming + V10-consistent geometry fixes
+//
+// What this version fixes vs your V12:
+// 1) Pano placement (shift + right black):
+//    - Computes layoutW from crop_w/overlap/NUM_CAMS
+//    - Applies xpad = (TARGET_W - layoutW)/2 and adds to all camX0[]
+//    - Optional "tight pano": if [pano] target_w <= 0, TARGET_W = layoutW
+//
+// 2) Forward mapping is now mathematically consistent with the composed chain:
+//    - Source (distorted) -> undistort (iterative) -> cylindrical forward -> IMU affine (IN CYL DOMAIN) -> crop -> pano
+//    - Roll/pitch affine is applied on (xcyl,ycyl) (after cylindrical), not on (xr,yr) before cylindrical.
+//
+// 3) Uses your existing V12/V10-like overlap blending order (RMW in pano; cam0 writes, cam>0 blends on left overlap).
+//
+// 4) NUM_FRAMES and SAVE_FIRST are tunable (read from parameters.ini):
+//    [debug]
+//      num_frames = 30
+//      save_first_frame = 1
+//
+// Notes:
+// - This remains a SOURCE “splat” renderer: it cannot perfectly match V10 destination-gather bilinear,
+//   but the geometry chain is now consistent (undistort + cylindrical + crop + padding + IMU in correct domain).
+// - Still FPGA-model legal: after stream creation, no full-frame reads; only 2-line cache accesses.
+// - Keeps STRIP_H=2 behavior: (y,y+1) loaded sequentially (even though splat uses row y only).
+//
+// Build: same as V12 (Windows + ini_manager.h).
+//
+#define _CRT_SECURE_NO_WARNINGS
+#define NOMINMAX 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <math.h>
+#include <vector>
+#include <string>
+#include <algorithm>
+
+#ifdef _WIN32
+#include <Windows.h>
+#include <Shlwapi.h>
+#pragma comment(lib, "Shlwapi.lib")
+#endif
+
+#include <filesystem>
+#include "ini_manager.h"
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+// ---------------- Parameters (read from ini as before) ----------------
+static int WIDTH, HEIGHT, NUM_CAMS, BUFFER_LINES;
+static float fx, fy, cx, cy;
+static float K1, K2, K3, P1, P2;
+static float roll_Sensor = 0.0f, pitch_Sensor = 0.0f, yaw_Sensor = 0.0f;
+static bool Stabilization = true;
+static float resize_factor = 0.5f;
+
+static float cylindrical_fov_deg;
+static float panorama_crop_height_scale, panorama_crop_width_scale;
+static float PITCH_TO_TRANSLATION_FACTOR;
+static float OVERLAP_RATIO;
+
+static inline float clamp_deg(float v) { return (v > 5.0f) ? 5.0f : ((v < -5.0f) ? -5.0f : v); }
+static inline uint8_t clip_u8(int v) { return (v < 0) ? 0 : (v > 255 ? 255 : (uint8_t)v); }
+
+// ---------------- Simple profiling (QPC) ----------------
+#ifdef _WIN32
+static inline uint64_t qpc_now() { LARGE_INTEGER t; QueryPerformanceCounter(&t); return (uint64_t)t.QuadPart; }
+static inline double qpc_freq() { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return (double)f.QuadPart; }
+#else
+#include <chrono>
+static inline uint64_t qpc_now() { return (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count(); }
+static inline double qpc_freq() { return (double)std::chrono::high_resolution_clock::period::den / (double)std::chrono::high_resolution_clock::period::num; }
+#endif
+
+struct StageTimer { const char* name; uint64_t t0 = 0; double ms = 0; uint64_t calls = 0; };
+static inline void stage_begin(StageTimer& s) { s.t0 = qpc_now(); }
+static inline void stage_end(StageTimer& s) { uint64_t t1 = qpc_now(); s.ms += (double)(t1 - s.t0) * 1000.0 / qpc_freq(); s.calls++; }
+
+// ---------------- BMP I/O (BGR24) ----------------
+#pragma pack(push, 1)
+typedef struct { unsigned short bfType; unsigned int bfSize; unsigned short bfReserved1; unsigned short bfReserved2; unsigned int bfOffBits; } CustomBitmapFileHeader;
+typedef struct { unsigned int biSize; int biWidth; int biHeight; unsigned short biPlanes; unsigned short biBitCount; unsigned int biCompression; unsigned int biSizeImage; int biXPelsPerMeter; int biYPelsPerMeter; unsigned int biClrUsed; unsigned int biClrImportant; } CustomBitmapInfoHeader;
+#pragma pack(pop)
+
+typedef struct { int width, height, channels; unsigned char* data; } Image;
+#define PIXEL(img,y,x,c) ((img)->data[((y)*(img)->width+(x))*(img)->channels+(c)])
+
+static Image* readBMP(const char* filename) {
+    FILE* fp = fopen(filename, "rb"); if (!fp) return NULL;
+    CustomBitmapFileHeader fh; CustomBitmapInfoHeader ih;
+    fread(&fh, sizeof(fh), 1, fp); fread(&ih, sizeof(ih), 1, fp);
+    Image* img = (Image*)malloc(sizeof(Image));
+    img->width = ih.biWidth; img->height = abs(ih.biHeight); img->channels = 3;
+    int row_padded = ((img->width * 3 + 3) / 4) * 4;
+    img->data = (unsigned char*)malloc((size_t)img->width * img->height * 3);
+    fseek(fp, fh.bfOffBits, SEEK_SET);
+    for (int i = 0; i < img->height; i++) {
+        fread(img->data + (size_t)i * img->width * 3, 1, (size_t)img->width * 3, fp);
+        fseek(fp, row_padded - img->width * 3, SEEK_CUR);
+    }
+    fclose(fp); return img;
+}
+static void free_image(Image* img) { if (!img) return; free(img->data); free(img); }
+
+static int writeBMP(const char* filename, const Image* img) {
+    FILE* fp = fopen(filename, "wb"); if (!fp) return 0;
+    int row_padded = ((img->width * 3 + 3) / 4) * 4;
+    int fileSize = 54 + row_padded * img->height;
+    unsigned char fh[14] = { 'B','M',0,0,0,0,0,0,0,0,54,0,0,0 };
+    unsigned char ih[40] = { 0 };
+    unsigned char pad[3] = { 0,0,0 };
+    fh[2] = (unsigned char)(fileSize); fh[3] = (unsigned char)(fileSize >> 8); fh[4] = (unsigned char)(fileSize >> 16); fh[5] = (unsigned char)(fileSize >> 24);
+    ih[0] = 40;
+    ih[4] = (unsigned char)(img->width); ih[5] = (unsigned char)(img->width >> 8); ih[6] = (unsigned char)(img->width >> 16); ih[7] = (unsigned char)(img->width >> 24);
+    ih[8] = (unsigned char)(img->height); ih[9] = (unsigned char)(img->height >> 8); ih[10] = (unsigned char)(img->height >> 16); ih[11] = (unsigned char)(img->height >> 24);
+    ih[12] = 1; ih[14] = 24;
+    fwrite(fh, 1, 14, fp); fwrite(ih, 1, 40, fp);
+    for (int i = 0; i < img->height; i++) {
+        fwrite(img->data + (size_t)i * img->width * 3, 1, (size_t)img->width * 3, fp);
+        fwrite(pad, 1, (size_t)row_padded - img->width * 3, fp);
+    }
+    fclose(fp); return 1;
+}
+
+// ---------------- YUV422 planar ----------------
+struct YUV422Image { int w, h; uint8_t* Y; uint8_t* U; uint8_t* V; };
+
+static YUV422Image* BGR_to_YUV422(const Image* bgr) {
+    YUV422Image* yuv = (YUV422Image*)malloc(sizeof(YUV422Image));
+    yuv->w = bgr->width; yuv->h = bgr->height;
+    int w = yuv->w, h = yuv->h;
+    yuv->Y = (uint8_t*)malloc((size_t)w * h);
+    yuv->U = (uint8_t*)malloc((size_t)(w / 2) * h);
+    yuv->V = (uint8_t*)malloc((size_t)(w / 2) * h);
+
+    for (int y = 0; y < h; y++) {
+        for (int x2 = 0; x2 < w / 2; x2++) {
+            int x0 = x2 * 2;
+            int b0 = PIXEL(bgr, y, x0, 0), g0 = PIXEL(bgr, y, x0, 1), r0 = PIXEL(bgr, y, x0, 2);
+            int b1 = PIXEL(bgr, y, x0 + 1, 0), g1 = PIXEL(bgr, y, x0 + 1, 1), r1 = PIXEL(bgr, y, x0 + 1, 2);
+            auto rgb2y = [](int r, int g, int b)->int { return (int)(0.299 * r + 0.587 * g + 0.114 * b); };
+            auto rgb2u = [](int r, int g, int b)->int { return (int)(-0.169 * r - 0.331 * g + 0.500 * b + 128); };
+            auto rgb2v = [](int r, int g, int b)->int { return (int)(0.500 * r - 0.419 * g - 0.081 * b + 128); };
+            int y0 = rgb2y(r0, g0, b0), y1 = rgb2y(r1, g1, b1);
+            int u0 = rgb2u(r0, g0, b0), u1 = rgb2u(r1, g1, b1);
+            int v0 = rgb2v(r0, g0, b0), v1 = rgb2v(r1, g1, b1);
+            yuv->Y[(size_t)y * w + x0] = clip_u8(y0);
+            yuv->Y[(size_t)y * w + x0 + 1] = clip_u8(y1);
+            yuv->U[(size_t)y * (w / 2) + x2] = clip_u8((u0 + u1) / 2);
+            yuv->V[(size_t)y * (w / 2) + x2] = clip_u8((v0 + v1) / 2);
+        }
+    }
+    return yuv;
+}
+static void free_yuv422(YUV422Image* img) { if (!img) return; free(img->Y); free(img->U); free(img->V); free(img); }
+
+static Image* YUV422_to_BGR24(const YUV422Image* yuv) {
+    Image* out = (Image*)malloc(sizeof(Image));
+    out->width = yuv->w; out->height = yuv->h; out->channels = 3;
+    out->data = (unsigned char*)malloc((size_t)out->width * out->height * 3);
+    for (int y = 0; y < yuv->h; y++) {
+        for (int x2 = 0; x2 < yuv->w / 2; x2++) {
+            int x0 = x2 * 2;
+            int U = yuv->U[(size_t)y * (yuv->w / 2) + x2] - 128;
+            int V = yuv->V[(size_t)y * (yuv->w / 2) + x2] - 128;
+            for (int k = 0; k < 2; k++) {
+                int Y = yuv->Y[(size_t)y * yuv->w + x0 + k];
+                int r = (int)(Y + 1.402 * V);
+                int g = (int)(Y - 0.344136 * U - 0.714136 * V);
+                int b = (int)(Y + 1.772 * U);
+                PIXEL(out, y, x0 + k, 2) = clip_u8(r);
+                PIXEL(out, y, x0 + k, 1) = clip_u8(g);
+                PIXEL(out, y, x0 + k, 0) = clip_u8(b);
+            }
+        }
+    }
+    return out;
+}
+
+// ---------------- IMU conversion (unchanged) ----------------
+static void convert_rpy_sensor_to_cam(
+    double roll_sys1, double pitch_sys1, double yaw_offset, double pitch_offset, double roll_offset,
+    float* roll_deg_out, float* pitch_deg_out, float* yaw_deg_out
+) {
+    double rr = roll_sys1 * M_PI / 180.0, pr = pitch_sys1 * M_PI / 180.0;
+    double ror = roll_offset * M_PI / 180.0, por = pitch_offset * M_PI / 180.0, yor = yaw_offset * M_PI / 180.0;
+    double Rx[3][3] = { {1,0,0},{0,cos(rr),-sin(rr)},{0,sin(rr),cos(rr)} };
+    double Ry[3][3] = { {cos(pr),0,sin(pr)},{0,1,0},{-sin(pr),0,cos(pr)} };
+    double R_sys1[3][3];
+    for (int i = 0; i < 3; i++)for (int j = 0; j < 3; j++)
+        R_sys1[i][j] = Rx[i][0] * Ry[0][j] + Rx[i][1] * Ry[1][j] + Rx[i][2] * Ry[2][j];
+    double Rr[3][3] = { {1,0,0},{0,cos(ror),-sin(ror)},{0,sin(ror),cos(ror)} };
+    double Rp[3][3] = { {cos(por),0,sin(por)},{0,1,0},{-sin(por),0,cos(por)} };
+    double Ryaw[3][3] = { {cos(yor),-sin(yor),0},{sin(yor),cos(yor),0},{0,0,1} };
+    double Rt[3][3], Ro[3][3];
+    for (int i = 0; i < 3; i++)for (int j = 0; j < 3; j++)
+        Rt[i][j] = Ryaw[i][0] * Rp[0][j] + Ryaw[i][1] * Rp[1][j] + Ryaw[i][2] * Rp[2][j];
+    for (int i = 0; i < 3; i++)for (int j = 0; j < 3; j++)
+        Ro[i][j] = Rt[i][0] * Rr[0][j] + Rt[i][1] * Rr[1][j] + Rt[i][2] * Rr[2][j];
+    double R[3][3];
+    for (int i = 0; i < 3; i++)for (int j = 0; j < 3; j++)
+        R[i][j] = R_sys1[i][0] * Ro[0][j] + R_sys1[i][1] * Ro[1][j] + R_sys1[i][2] * Ro[2][j];
+    double pitchX = asin(-R[2][0]);
+    double cyy = cos(pitchX);
+    double rollX, yawX;
+    if (fabs(cyy) > 1e-6) { rollX = atan2(R[2][1], R[2][2]); yawX = atan2(R[1][0], R[0][0]); }
+    else { rollX = 0; yawX = atan2(-R[0][1], R[1][1]); }
+    *roll_deg_out = (float)(rollX * 180.0 / M_PI);
+    *pitch_deg_out = (float)(pitchX * 180.0 / M_PI);
+    *yaw_deg_out = (float)(yawX * 180.0 / M_PI);
+}
+
+// ---------------- Scanline stream + 2-line cache ----------------
+struct ScanlinePacket { std::vector<uint8_t> Y, U, V; };
+struct CameraStream { int w = 0, h = 0; std::vector<ScanlinePacket> rows; };
+
+struct LineCache {
+    int w = 0, h = 0;
+    std::vector<uint8_t> Y[2], U[2], V[2];
+    int cachedRowId[2] = { -1,-1 };
+    uint64_t loads = 0;
+
+    void init(int W, int H) {
+        w = W; h = H;
+        for (int i = 0; i < 2; i++) {
+            Y[i].assign((size_t)w, 0);
+            U[i].assign((size_t)w / 2, 128);
+            V[i].assign((size_t)w / 2, 128);
+            cachedRowId[i] = -999999;
+        }
+        loads = 0;
+    }
+    inline void loadRow(const CameraStream& s, int y) {
+        int slot = y & 1;
+        const ScanlinePacket& p = s.rows[(size_t)y];
+        memcpy(Y[slot].data(), p.Y.data(), (size_t)w);
+        memcpy(U[slot].data(), p.U.data(), (size_t)w / 2);
+        memcpy(V[slot].data(), p.V.data(), (size_t)w / 2);
+        cachedRowId[slot] = y;
+        loads++;
+    }
+    inline uint8_t getY(int y, int x)  const { return Y[y & 1][(size_t)x]; }
+    inline uint8_t getU(int y, int x2) const { return U[y & 1][(size_t)x2]; }
+    inline uint8_t getV(int y, int x2) const { return V[y & 1][(size_t)x2]; }
+};
+
+// ---------------- Feather blend (left overlap only, sequential cam order) ----------------
+static inline uint8_t lerp_u8(uint8_t a, uint8_t b, uint16_t alpha) {
+    uint32_t ia = 65535 - alpha;
+    return (uint8_t)((a * ia + b * alpha) >> 16);
+}
+static inline uint16_t alpha_from_left_overlap(int ox, int overlap) {
+    if (overlap <= 0) return 65535;
+    if (ox <= 0) return 0;
+    if (ox >= overlap) return 65535;
+    return (uint16_t)((uint64_t)ox * 65535ULL / (uint64_t)overlap);
+}
+
+// ---------------- Cyl params consistent with V10 inverse map generator ----------------
+struct CylParams {
+    float fx_r, fy_r, cx_r, cy_r;   // resized intrinsics used by V10 map
+    float fx_cyl, fy_cyl, cx_cyl, cy_cyl;
+};
+
+// ---------------- Undistort (iterative) in normalized coords ----------------
+// Input: distorted normalized (xd,yd)
+// Output: undistorted normalized (xu,yu)
+static inline void undistort_norm_iter(
+    float xd, float yd,
+    float k1, float k2, float k3, float p1, float p2,
+    float* xu_out, float* yu_out
+) {
+    // Start with xd,yd as initial guess
+    float xu = xd;
+    float yu = yd;
+
+    // 5 iterations is typically enough for this level of distortion
+    for (int it = 0; it < 5; it++) {
+        float r2 = xu * xu + yu * yu;
+        float r4 = r2 * r2;
+        float r6 = r4 * r2;
+        float radial = 1.0f + k1 * r2 + k2 * r4 + k3 * r6;
+
+        float dx = 2.0f * p1 * xu * yu + p2 * (r2 + 2.0f * xu * xu);
+        float dy = p1 * (r2 + 2.0f * yu * yu) + 2.0f * p2 * xu * yu;
+
+        // Forward distortion: x_dist = xu*radial + dx
+        // We solve: xd = xu*radial + dx  => xu = (xd - dx)/radial
+        float xu_new = (xd - dx) / radial;
+        float yu_new = (yd - dy) / radial;
+
+        xu = xu_new;
+        yu = yu_new;
+    }
+
+    *xu_out = xu;
+    *yu_out = yu;
+}
+
+// ---------------- Forward cylindrical (in normalized undistorted coords) ----------------
+// Using the same relationship implied by your V10 inverse mapping:
+//
+// inverse (gather): src_x = fx_r*tan(theta)+cx_r, where theta = (xcyl-cx_cyl)/fx_cyl
+// forward: theta = atan(xu), xcyl = theta*fx_cyl + cx_cyl
+//
+// inverse y: src_y = fy_r * ((ycyl-cy_cyl)/fy_cyl)/cos(theta) + cy_r
+// forward: yu = (src_y-cy_r)/fy_r => ycyl = yu*fy_cyl*cos(theta) + cy_cyl
+//
+static inline void forwardCyl_norm(
+    const CylParams& p,
+    float xu, float yu,
+    float* xcyl, float* ycyl
+) {
+    float theta = atanf(xu);
+    float c = cosf(theta);
+    *xcyl = theta * p.fx_cyl + p.cx_cyl;
+    *ycyl = yu * p.fy_cyl * c + p.cy_cyl;
+}
+
+// ---------------- Cam runtime ----------------
+struct CamRun {
+    LineCache cache;
+    int camX0 = 0;
+    float roll_deg = 0;          // already with V10 sign applied (as in V12)
+    float y_shift_cyl = 0;       // pitch translation in CYL pixels (resized/cyl domain)
+};
+
+// ---------------- Source->Dest mapping per pixel (V14-fixed chain) ----------------
+static inline bool mapSourceToPano_V14(
+    int x, int y,
+    int cam,
+    const CamRun& cr,
+    const CylParams& cp,
+    int resized_w, int resized_h,
+    int crop_x0, int crop_y0, int crop_w, int crop_h,
+    int TARGET_W, int TARGET_H,
+    int overlap,
+    int* out_px, int* out_py, int* out_ox
+) {
+    // 1) scale source pixel -> resized pixel coords (distorted)
+    float xr = (float)x * resize_factor;
+    float yr = (float)y * resize_factor;
+
+    // 2) normalized distorted coords
+    float xd = (xr - cp.cx_r) / cp.fx_r;
+    float yd = (yr - cp.cy_r) / cp.fy_r;
+
+    // 3) undistort (solve for xu,yu)
+    float xu, yu;
+    undistort_norm_iter(xd, yd, K1, K2, K3, P1, P2, &xu, &yu);
+
+    // 4) forward cylindrical (to cyl image coords in resized domain)
+    float xcyl, ycyl;
+    forwardCyl_norm(cp, xu, yu, &xcyl, &ycyl);
+
+    // 5) IMU affine in CYL domain (roll rotation around cyl center, pitch translation in cyl-y)
+    // Pitch: translate ycyl by y_shift_cyl (already includes your factor and sign)
+    ycyl += cr.y_shift_cyl;
+
+    // Roll: rotate around (cx_cyl, cy_cyl) in cyl pixel coords
+    float angle = cr.roll_deg * (float)(M_PI / 180.0f);
+    float ca = cosf(angle), sa = sinf(angle);
+    float dx = xcyl - cp.cx_cyl;
+    float dy = ycyl - cp.cy_cyl;
+    float xcr = dx * ca - dy * sa;
+    float ycr = dx * sa + dy * ca;
+    xcyl = xcr + cp.cx_cyl;
+    ycyl = ycr + cp.cy_cyl;
+
+    // 6) crop
+    int tx = (int)lroundf(xcyl);
+    int ty = (int)lroundf(ycyl);
+
+    int ox = tx - crop_x0;
+    int oy = ty - crop_y0;
+    if ((unsigned)ox >= (unsigned)crop_w) return false;
+    if ((unsigned)oy >= (unsigned)crop_h) return false;
+
+    // 7) pano vertical padding (same as V12/V10 style)
+    int ypad = (TARGET_H - crop_h) / 2; if (ypad < 0) ypad = 0;
+
+    int px = cr.camX0 + ox;
+    int py = ypad + oy;
+    if ((unsigned)px >= (unsigned)TARGET_W) return false;
+    if ((unsigned)py >= (unsigned)TARGET_H) return false;
+
+    *out_px = px; *out_py = py; *out_ox = ox;
+    return true;
+}
+
+// ---------------- Write source sample into pano (random-write, left overlap blend) ----------------
+static inline void splatToPano_V10order(
+    int cam, int overlap,
+    int px, int py, int ox,
+    uint8_t yv, uint8_t uv, uint8_t vv,
+    YUV422Image& pano
+) {
+    // Y
+    uint8_t* dstY = &pano.Y[(size_t)py * (size_t)pano.w + (size_t)px];
+    if (cam == 0) {
+        *dstY = yv;
+    }
+    else {
+        if (ox < overlap) {
+            uint16_t a = alpha_from_left_overlap(ox, overlap);
+            *dstY = lerp_u8(*dstY, yv, a);
+        }
+        else {
+            *dstY = yv;
+        }
+    }
+
+    // UV (half width)
+    int px2 = px >> 1;
+    uint8_t* dstU = &pano.U[(size_t)py * (size_t)(pano.w / 2) + (size_t)px2];
+    uint8_t* dstV = &pano.V[(size_t)py * (size_t)(pano.w / 2) + (size_t)px2];
+
+    if (cam == 0) {
+        *dstU = uv; *dstV = vv;
+    }
+    else {
+        int ox2 = ox >> 1;
+        int overlap2 = overlap >> 1;
+        if (ox2 < overlap2) {
+            uint16_t a = alpha_from_left_overlap(ox2, overlap2);
+            *dstU = lerp_u8(*dstU, uv, a);
+            *dstV = lerp_u8(*dstV, vv, a);
+        }
+        else {
+            *dstU = uv; *dstV = vv;
+        }
+    }
+}
+
+// ---------------- Windows helpers ----------------
+#ifdef _WIN32
+static std::string WStringToUtf8(const std::wstring& w) {
+    if (w.empty()) return {};
+    int sz = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    std::string out(sz, 0);
+    WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), &out[0], sz, nullptr, nullptr);
+    return out;
+}
+static std::string SaveImageFilePath(const std::wstring& captureDir, const std::wstring& prefix) {
+    SYSTEMTIME st; GetLocalTime(&st);
+    wchar_t buf[512];
+    swprintf_s(buf, 512, L"%s\\%04d%02d%02d_%02d%02d%02d_%s.bmp",
+        captureDir.c_str(), st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, prefix.c_str());
+    return WStringToUtf8(std::wstring(buf));
+}
+#endif
+
+int main() {
+#ifdef _WIN32
+    wchar_t szPath[MAX_PATH] = L"";
+    GetModuleFileNameW(NULL, szPath, MAX_PATH);
+    std::filesystem::path exePath(szPath);
+    std::filesystem::path imuIniPath = exePath; imuIniPath.replace_extension(L".ini");
+    std::filesystem::path paramsIniPath = exePath; paramsIniPath.replace_filename(L"parameters.ini");
+
+    INIManager imuIni(imuIniPath);
+    INIManager paramIni(paramsIniPath);
+
+    WIDTH = paramIni.ReadInteger(L"image", L"width", 1920);
+    HEIGHT = paramIni.ReadInteger(L"image", L"height", 1080);
+    NUM_CAMS = paramIni.ReadInteger(L"image", L"num_cams", 6);
+    BUFFER_LINES = paramIni.ReadInteger(L"image", L"buffer_lines", 15);
+
+    fx = paramIni.ReadFloat(L"calibration", L"fx", 1204.505857f);
+    fy = paramIni.ReadFloat(L"calibration", L"fy", 1204.505857f);
+    float cx_ratio = paramIni.ReadFloat(L"calibration", L"cx_ratio", 0.5f);
+    float cy_ratio = paramIni.ReadFloat(L"calibration", L"cy_ratio", 0.5f);
+    cx = WIDTH * cx_ratio; cy = HEIGHT * cy_ratio;
+
+    K1 = paramIni.ReadFloat(L"calibration", L"k1", -0.343698f);
+    K2 = paramIni.ReadFloat(L"calibration", L"k2", 0.105503f);
+    K3 = paramIni.ReadFloat(L"calibration", L"k3", 0.0f);
+    P1 = paramIni.ReadFloat(L"calibration", L"p1", -0.001558f);
+    P2 = paramIni.ReadFloat(L"calibration", L"p2", -0.002416f);
+
+    cylindrical_fov_deg = paramIni.ReadFloat(L"projection", L"cylindrical_fov_deg", 60.0f);
+    panorama_crop_height_scale = paramIni.ReadFloat(L"cropping", L"panorama_crop_height_scale", 0.80f);
+    panorama_crop_width_scale = paramIni.ReadFloat(L"cropping", L"panorama_crop_width_scale", 0.80f);
+    PITCH_TO_TRANSLATION_FACTOR = paramIni.ReadFloat(L"transform", L"pitch_to_translation_factor", -17.44153917818162f) * resize_factor;
+    OVERLAP_RATIO = paramIni.ReadFloat(L"blend", L"overlap_ratio", 0.1f);
+
+    // Debug controls (tunable)
+    int NUM_FRAMES = paramIni.ReadInteger(L"debug", L"num_frames", 30);
+    int SAVE_FIRST = paramIni.ReadInteger(L"debug", L"save_first_frame", 1);
+
+    Stabilization = imuIni.ReadBoolean(L"Sensor_Orientation", L"stabilization", true);
+    if (Stabilization) {
+        roll_Sensor = clamp_deg(imuIni.ReadFloat(L"Sensor_Orientation", L"roll", 0.0f));
+        pitch_Sensor = clamp_deg(imuIni.ReadFloat(L"Sensor_Orientation", L"pitch", 0.0f));
+        yaw_Sensor = clamp_deg(imuIni.ReadFloat(L"Sensor_Orientation", L"yaw", 0.0f));
+    }
+    else roll_Sensor = pitch_Sensor = yaw_Sensor = 0.0f;
+
+    std::vector<std::string> filenames;
+    for (int i = 0; i < NUM_CAMS; i++) {
+        std::wstring key = L"file_" + std::to_wstring(i);
+        filenames.push_back(WStringToUtf8(imuIni.ReadString(L"images", key, L"")));
+    }
+
+    auto yaw_offset_cam = imuIni.ReadFloatArray(L"offset", L"yaw");
+    auto pitch_offset_cam = imuIni.ReadFloatArray(L"offset", L"pitch");
+    auto roll_offset_cam = imuIni.ReadFloatArray(L"offset", L"roll");
+
+    // Target geometry: allow "tight pano" if target_w <= 0
+    int TARGET_W_cfg = paramIni.ReadInteger(L"pano", L"target_w", 3840);
+    int TARGET_H = paramIni.ReadInteger(L"pano", L"target_h", 480);
+
+    int resized_w = (int)llround((double)WIDTH * resize_factor);
+    int resized_h = (int)llround((double)HEIGHT * resize_factor);
+
+    // Crop in cylindrical image (resized domain)
+    int crop_w = (int)llround((double)resized_w * panorama_crop_width_scale);
+    int crop_h = (int)llround((double)resized_h * panorama_crop_height_scale);
+    int crop_x0 = (resized_w - crop_w) / 2;
+    int crop_y0 = (resized_h - crop_h) / 2;
+
+    int overlap = (int)llround(OVERLAP_RATIO * (float)crop_w);
+    overlap = std::max(0, std::min(overlap, crop_w));
+
+    // Compute layoutW + xpad to fix left-shift / right-black
+    int layoutW = crop_w + (NUM_CAMS - 1) * (crop_w - overlap);
+    int TARGET_W = TARGET_W_cfg;
+    if (TARGET_W_cfg <= 0) {
+        TARGET_W = layoutW; // tight pano mode
+    }
+    int xpad = (TARGET_W - layoutW) / 2;
+    if (xpad < 0) xpad = 0;
+
+    // Pano placement offsets (apply xpad to all starts)
+    std::vector<int> camX0(NUM_CAMS, 0);
+    for (int c = 1; c < NUM_CAMS; c++) camX0[c] = camX0[c - 1] + (crop_w - overlap);
+    for (int c = 0; c < NUM_CAMS; c++) camX0[c] += xpad;
+
+    // Cyl params consistent with V10 map generator
+    float fov_h_rad = cylindrical_fov_deg * (float)(M_PI / 180.0);
+    float fov_v_rad = 51.3f * (float)(M_PI / 180.0); // keep the same vertical used in your generator
+    CylParams cp;
+    cp.fx_r = fx * resize_factor;
+    cp.fy_r = fy * resize_factor;
+    cp.cx_r = cx * resize_factor;
+    cp.cy_r = cy * resize_factor;
+    cp.fx_cyl = resized_w / (2.0f * tanf(fov_h_rad / 2.0f));
+    cp.fy_cyl = resized_h / (2.0f * tanf(fov_v_rad / 2.0f));
+    cp.cx_cyl = resized_w * 0.5f;
+    cp.cy_cyl = resized_h * 0.5f;
+
+    // Capture dir
+    PathRemoveFileSpecW(szPath);
+    std::wstring dirCapture = std::wstring(szPath) + L"\\Capture";
+    CreateDirectoryW(dirCapture.c_str(), NULL);
+
+    printf("[V14(V12+)] Roll=%.3f Pitch=%.3f Yaw=%.3f\n", roll_Sensor, pitch_Sensor, yaw_Sensor);
+    printf("[V14(V12+)] resized=%dx%d crop=%dx%d overlap=%d layoutW=%d TARGET_W=%d xpad=%d TARGET_H=%d frames=%d save_first=%d\n",
+        resized_w, resized_h, crop_w, crop_h, overlap, layoutW, TARGET_W, xpad, TARGET_H, NUM_FRAMES, SAVE_FIRST);
+
+    // -------- Stage: stream build (BMP->YUV->ScanlinePackets, then FREE YUV) --------
+    StageTimer st_io = { "I/O + stream build",0,0,0 };
+    stage_begin(st_io);
+
+    std::vector<CameraStream> streams(NUM_CAMS);
+    std::vector<float> roll_cam(NUM_CAMS, 0), pitch_cam(NUM_CAMS, 0), yaw_cam(NUM_CAMS, 0);
+
+    for (int cam = 0; cam < NUM_CAMS; cam++) {
+        float r = 0, p = 0, yaw = 0;
+        convert_rpy_sensor_to_cam(
+            roll_Sensor, pitch_Sensor,
+            (cam < (int)yaw_offset_cam.size() ? yaw_offset_cam[cam] : 0.0f),
+            (cam < (int)pitch_offset_cam.size() ? pitch_offset_cam[cam] : 0.0f),
+            (cam < (int)roll_offset_cam.size() ? roll_offset_cam[cam] : 0.0f),
+            &r, &p, &yaw
+        );
+        roll_cam[cam] = r; pitch_cam[cam] = p; yaw_cam[cam] = yaw;
+
+        Image* bgr = readBMP(filenames[cam].c_str());
+        if (!bgr) { printf("[ERROR] readBMP cam=%d %s\n", cam, filenames[cam].c_str()); return 1; }
+        YUV422Image* yuv = BGR_to_YUV422(bgr);
+        free_image(bgr);
+
+        CameraStream cs; cs.w = yuv->w; cs.h = yuv->h;
+        cs.rows.resize((size_t)cs.h);
+        for (int yy = 0; yy < cs.h; yy++) {
+            ScanlinePacket pkt;
+            pkt.Y.resize((size_t)cs.w);
+            pkt.U.resize((size_t)cs.w / 2);
+            pkt.V.resize((size_t)cs.w / 2);
+            memcpy(pkt.Y.data(), yuv->Y + (size_t)yy * cs.w, (size_t)cs.w);
+            memcpy(pkt.U.data(), yuv->U + (size_t)yy * (cs.w / 2), (size_t)cs.w / 2);
+            memcpy(pkt.V.data(), yuv->V + (size_t)yy * (cs.w / 2), (size_t)cs.w / 2);
+            cs.rows[(size_t)yy] = std::move(pkt);
+        }
+        free_yuv422(yuv); // PURGE full-frame source
+        streams[cam] = std::move(cs);
+    }
+
+    stage_end(st_io);
+
+    // Cam runtime
+    std::vector<CamRun> cams(NUM_CAMS);
+    for (int cam = 0; cam < NUM_CAMS; cam++) {
+        cams[cam].cache.init(WIDTH, HEIGHT);
+        cams[cam].camX0 = camX0[cam];
+
+        // Keep your V12/V10 sign convention:
+        cams[cam].roll_deg = -roll_cam[cam];
+
+        // Pitch translation: now applied in CYL domain.
+        // Use the same magnitude/sign you were using in V12, but as a cyl-space y shift.
+        // V12 used: y_shift_resized = -(PITCH_TO_TRANSLATION_FACTOR * pitch_cam)
+        // We keep that exact sign to preserve behavior, but apply after cylindrical.
+        cams[cam].y_shift_cyl = -(PITCH_TO_TRANSLATION_FACTOR * pitch_cam[cam]);
+    }
+
+    // -------- Multi-frame run --------
+    StageTimer st_render = { "render source-scan",0,0,0 };
+    uint64_t mapped = 0, skipped = 0;
+
+    for (int f = 0; f < NUM_FRAMES; f++) {
+        stage_begin(st_render);
+
+        // output pano buffer (random write)
+        YUV422Image pano; pano.w = TARGET_W; pano.h = TARGET_H;
+        pano.Y = (uint8_t*)malloc((size_t)TARGET_W * TARGET_H);
+        pano.U = (uint8_t*)malloc((size_t)(TARGET_W / 2) * TARGET_H);
+        pano.V = (uint8_t*)malloc((size_t)(TARGET_W / 2) * TARGET_H);
+        memset(pano.Y, 0, (size_t)TARGET_W * TARGET_H);
+        memset(pano.U, 128, (size_t)(TARGET_W / 2) * TARGET_H);
+        memset(pano.V, 128, (size_t)(TARGET_W / 2) * TARGET_H);
+
+        mapped = 0; skipped = 0;
+
+        // sequential SOURCE walk per camera (keeps V10 blend order)
+        for (int cam = 0; cam < NUM_CAMS; cam++) {
+            LineCache& lc = cams[cam].cache;
+
+            // stream scanlines
+            for (int y = 0; y < HEIGHT; y++) {
+                lc.loadRow(streams[cam], y);
+                // ensure (y+1) also exists in cache (STRIP_H=2 discipline)
+                if (y + 1 < HEIGHT) lc.loadRow(streams[cam], y + 1);
+
+                for (int x = 0; x < WIDTH; x++) {
+                    int px, py, ox;
+                    if (!mapSourceToPano_V14(
+                        x, y, cam, cams[cam], cp, resized_w, resized_h,
+                        crop_x0, crop_y0, crop_w, crop_h, TARGET_W, TARGET_H, overlap,
+                        &px, &py, &ox))
+                    {
+                        skipped++; continue;
+                    }
+
+                    // read source sample from cache (only current row y)
+                    int x2 = x >> 1;
+                    uint8_t yv = lc.getY(y, x);
+                    uint8_t uv = lc.getU(y, x2);
+                    uint8_t vv = lc.getV(y, x2);
+
+                    splatToPano_V10order(cam, overlap, px, py, ox, yv, uv, vv, pano);
+                    mapped++;
+                }
+            }
+        }
+
+        stage_end(st_render);
+
+        if (f == 0 && SAVE_FIRST) {
+            Image* outBgr = YUV422_to_BGR24(&pano);
+            std::string outPath = SaveImageFilePath(dirCapture, L"panorama_V14_V12plus");
+            writeBMP(outPath.c_str(), outBgr);
+            printf("[V14(V12+)] Saved: %s\n", outPath.c_str());
+            free_image(outBgr);
+        }
+
+        free(pano.Y); free(pano.U); free(pano.V);
+    }
+
+    // report
+    double avg_ms = st_render.ms / (double)std::max(1, NUM_FRAMES);
+    double fps = (avg_ms > 0.0) ? (1000.0 / avg_ms) : 0.0;
+
+    size_t perCamCacheBytes = (size_t)2 * WIDTH + (size_t)2 * (WIDTH / 2) + (size_t)2 * (WIDTH / 2);
+    size_t allCacheBytes = (size_t)NUM_CAMS * perCamCacheBytes;
+    size_t panoBytes = (size_t)TARGET_W * TARGET_H + (size_t)(TARGET_W / 2) * TARGET_H + (size_t)(TARGET_W / 2) * TARGET_H;
+
+    printf("\n===== V14(V12+) PROFILING =====\n");
+    printf("Stage I/O + stream build  | calls:%3llu | time:%9.3f ms\n", (unsigned long long)st_io.calls, st_io.ms);
+    printf("Stage render source-scan  | calls:%3llu | time:%9.3f ms | avg:%7.3f ms/frame | fps:%6.2f\n",
+        (unsigned long long)st_render.calls, st_render.ms, avg_ms, fps);
+
+    printf("\n===== V14(V12+) MAPPING STATS =====\n");
+    printf("mapped=%llu skipped=%llu (skipRate=%.6f)\n",
+        (unsigned long long)mapped, (unsigned long long)skipped,
+        (mapped + skipped) ? (double)skipped / (double)(mapped + skipped) : 0.0);
+
+    printf("\n===== V14(V12+) MEMORY REPORT =====\n");
+    printf("Per-camera 2-line cache: %zu bytes (~%.3f KB)\n", perCamCacheBytes, perCamCacheBytes / 1024.0);
+    printf("All caches total:        %zu bytes (~%.3f KB)\n", allCacheBytes, allCacheBytes / 1024.0);
+    printf("One pano frame (YUV422): %zu bytes (~%.3f MB)\n", panoBytes, panoBytes / (1024.0 * 1024.0));
+
+    return 0;
+#else
+    printf("This file expects the Windows ini_manager.\n");
+    return 1;
+#endif
+}
