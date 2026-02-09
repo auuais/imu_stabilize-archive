@@ -151,6 +151,7 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="..\x64\Debug\IMU_stabilize_GYRO.ini" />
+    <None Include="parameters.ini" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

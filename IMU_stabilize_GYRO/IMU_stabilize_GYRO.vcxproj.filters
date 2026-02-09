@@ -34,5 +34,6 @@
     <None Include="..\x64\Debug\IMU_stabilize_GYRO.ini">
       <Filter>Debug</Filter>
     </None>
+    <None Include="parameters.ini" />
   </ItemGroup>
 </Project>

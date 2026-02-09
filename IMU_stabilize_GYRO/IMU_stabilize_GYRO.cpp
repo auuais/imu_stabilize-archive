@@ -1,6 +1,6 @@
-﻿// IMU_stabilize_GYRO_MT_V17_rowrun_fpga_model_ROW_WINDOW_ONFLY_BUCKETS_DDR_SLICE.cpp
+﻿// IMU_stabilize_GYRO_MT_V19.cpp
 //
-// V17 (PC-time optimizations + Release path robustness):
+// V19 (PC-time optimizations + Release path robustness):
 
 
 #define _CRT_SECURE_NO_WARNINGS
@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <mutex>
 #include <condition_variable>
+#include <memory>
 
 #include "ini_manager.h"
 
@@ -42,13 +43,20 @@
 #define SAVE_EVERY_K        1   // 0 = save none; 1 = save all; 30 = every 30th
 #endif
 
-#ifndef STRIP_H
-#define STRIP_H             2   // hard constraint
+#ifndef SCANLINE_BUFFER
+#define SCANLINE_BUFFER     2   // hard constraint
 #endif
 
-#ifndef WINDOW_H
-#define WINDOW_H            120 // active destination-row slots (bounded on-chip model)
+#ifndef ACTIVE_BUFFER
+#define ACTIVE_BUFFER       180 // active destination-row slots (fixed for FPGA - sized for worst case: IR 640x480)
 #endif
+
+#ifndef PING_PONG_PUSH_BUFFER
+#define PING_PONG_PUSH_BUFFER 32  // pano slice ping-pong height
+#endif
+
+static constexpr int FIXED_INPUT_W = 1920;
+static constexpr int FIXED_OUTPUT_W = 3840;
 
 // ===================== Fixed-point constants =====================
 static const int WFIX_SHIFT = 16;   // Q16.16
@@ -145,6 +153,10 @@ static inline void print_stats_summary(const char* header) {
 static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 static inline unsigned char sat_u8(int v) { return (v < 0) ? 0 : (v > 255 ? 255 : (unsigned char)v); }
 static inline uint64_t ceil_div_u64(uint64_t a, uint64_t b) { return (a + b - 1) / b; }
+
+static inline uint64_t yuv422_bytes(int w, int h) {
+    return (uint64_t)w * (uint64_t)h * 2ull;
+}
 
 // ===================== Image struct (RGB for I/O only) =====================
 typedef struct { int width, height, channels; unsigned char* data; } Image;
@@ -462,8 +474,23 @@ static std::filesystem::path pick_params_ini(const std::filesystem::path& exePat
     if (argc >= 3 && argv[2] && argv[2][0]) {
         return std::filesystem::path(StringToWString(argv[2]));
     }
-    std::filesystem::path p = exePath.parent_path() / L"parameters.ini";
-    return p;
+    auto try_paths = [&](const std::vector<std::filesystem::path>& candidates) -> std::filesystem::path {
+        for (const auto& p : candidates) {
+            if (file_exists(p)) return p;
+        }
+        return candidates.empty() ? exePath : candidates.back();
+    };
+
+    std::filesystem::path exeDir = exePath.parent_path();
+    std::filesystem::path parentDir = exeDir.parent_path();
+
+    // Prefer unified; then legacy; search exe dir then parent dir (project root).
+    return try_paths({
+        exeDir / L"parameters_unified.ini",
+        exeDir / L"parameters.ini",
+        parentDir / L"parameters_unified.ini",
+        parentDir / L"parameters.ini"
+    });
 }
 
 static std::string make_abs_if_relative(const std::string& in, const std::filesystem::path& baseDir) {
@@ -486,6 +513,161 @@ static float resize_factor = 0.5f;
 static float PITCH_TO_TRANSLATION_FACTOR = -17.44153917818162f, YAW_TO_TRANSLATION_FACTOR = 17.84f;
 static float roll_Sensor = 0.0f, pitch_Sensor = 0.0f, yaw_Sensor = 0.0f;
 static int   TARGET_W = 3840, TARGET_H = 480;
+static float feather_strength = 1.0f;
+
+// ===================== Mode / Config =====================
+enum OutputMode : int {
+    MODE_BLACKOUT                 = 0x00,
+    MODE_EO_PANO_STAB             = 0x01,
+    MODE_IR_PANO_STAB             = 0x02,
+    MODE_EO_PANO_NO_STAB          = 0x03,
+    MODE_IR_PANO_NO_STAB          = 0x06,
+    MODE_EO_UNDIST_CAM1           = 0x07,
+    MODE_EO_UNDIST_CAM6           = 0x0C,
+    MODE_IR_UNDIST_CAM1           = 0x0D,
+    MODE_IR_UNDIST_CAM6           = 0x12,
+    MODE_STATUS                   = 0x13
+};
+
+struct CameraConfig {
+    int   width = 1920;
+    int   height = 1080;
+    int   num_cams = 6;
+
+    float fx = 1204.505857f;
+    float fy = 1204.505857f;
+    float cx_ratio = 0.5f;
+    float cy_ratio = 0.5f;
+
+    float fx_dist = 1204.505857f;
+    float fy_dist = 1204.505857f;
+    float cx_dist = 947.559f;
+    float cy_dist = 534.965f;
+
+    float k1 = -0.343698f;
+    float k2 = 0.105503f;
+    float k3 = 0.0f;
+    float p1 = -0.001558f;
+    float p2 = -0.002416f;
+
+    float resize_factor = 0.5f;
+    float cyl_h_fov = 77.0f;
+    float cyl_v_fov = 51.3f;
+
+    float pano_crop_h = 0.70f;
+    float pano_crop_w = 0.70f;
+
+    bool use_nearest_neighbor = false;
+
+    float pitch_to_translation_factor = -17.44f;
+    float yaw_to_translation_factor   = 17.84f;
+
+    int   overlap_px = 100;
+    float feather_strength = 1.0f;
+
+    int   pano_width = 3840;
+    int   pano_height = 480;
+
+    // offsets
+    std::vector<float> yaw_off;
+    std::vector<float> pitch_off;
+    std::vector<float> roll_off;
+
+    // image files
+    std::vector<std::string> filenames;
+};
+
+static CameraConfig loadCameraConfig(INIManager& ini, bool isEO, const std::filesystem::path& baseDir) {
+    CameraConfig cfg;
+    const wchar_t* camSec = isEO ? L"eo_camera" : L"ir_camera";
+    const wchar_t* imgSec = isEO ? L"eo_images" : L"ir_images";
+    const wchar_t* offSec = isEO ? L"eo_offset" : L"ir_offset";
+
+    cfg.width = ini.ReadInteger(camSec, L"width", cfg.width);
+    cfg.height = ini.ReadInteger(camSec, L"height", cfg.height);
+    cfg.num_cams = ini.ReadInteger(camSec, L"num_cams", cfg.num_cams);
+
+    cfg.fx = ini.ReadFloat(camSec, L"fx", cfg.fx);
+    cfg.fy = ini.ReadFloat(camSec, L"fy", cfg.fy);
+    cfg.cx_ratio = ini.ReadFloat(camSec, L"cx_ratio", cfg.cx_ratio);
+    cfg.cy_ratio = ini.ReadFloat(camSec, L"cy_ratio", cfg.cy_ratio);
+
+    cfg.fx_dist = ini.ReadFloat(camSec, L"fx_dist", cfg.fx_dist);
+    cfg.fy_dist = ini.ReadFloat(camSec, L"fy_dist", cfg.fy_dist);
+    cfg.cx_dist = ini.ReadFloat(camSec, L"cx_dist", cfg.cx_dist);
+    cfg.cy_dist = ini.ReadFloat(camSec, L"cy_dist", cfg.cy_dist);
+
+    cfg.k1 = ini.ReadFloat(camSec, L"k1", cfg.k1);
+    cfg.k2 = ini.ReadFloat(camSec, L"k2", cfg.k2);
+    cfg.k3 = ini.ReadFloat(camSec, L"k3", cfg.k3);
+    cfg.p1 = ini.ReadFloat(camSec, L"p1", cfg.p1);
+    cfg.p2 = ini.ReadFloat(camSec, L"p2", cfg.p2);
+
+    cfg.resize_factor = ini.ReadFloat(camSec, L"resize_factor", cfg.resize_factor);
+    cfg.cyl_h_fov = ini.ReadFloat(camSec, L"cylindrical_H_fov_deg", cfg.cyl_h_fov);
+    cfg.cyl_v_fov = ini.ReadFloat(camSec, L"cylindrical_V_fov_deg", cfg.cyl_v_fov);
+
+    cfg.pano_crop_h = ini.ReadFloat(camSec, L"panorama_crop_height_scale", cfg.pano_crop_h);
+    cfg.pano_crop_w = ini.ReadFloat(camSec, L"panorama_crop_width_scale", cfg.pano_crop_w);
+
+    cfg.pitch_to_translation_factor = ini.ReadFloat(camSec, L"pitch_to_translation_factor", cfg.pitch_to_translation_factor);
+    cfg.yaw_to_translation_factor   = ini.ReadFloat(camSec, L"yaw_to_translation_factor", cfg.yaw_to_translation_factor);
+
+    cfg.overlap_px = ini.ReadInteger(camSec, L"overlap_px", cfg.overlap_px);
+    cfg.feather_strength = ini.ReadFloat(camSec, L"feather_strength", cfg.feather_strength);
+
+    cfg.pano_width = ini.ReadInteger(camSec, L"pano_width", cfg.pano_width);
+    cfg.pano_height = ini.ReadInteger(camSec, L"pano_height", cfg.pano_height);
+
+    cfg.use_nearest_neighbor = ini.ReadBoolean(camSec, L"use_nearest_neighbor", cfg.use_nearest_neighbor);
+
+    cfg.yaw_off = ini.ReadFloatArray(offSec, L"yaw");
+    cfg.pitch_off = ini.ReadFloatArray(offSec, L"pitch");
+    cfg.roll_off = ini.ReadFloatArray(offSec, L"roll");
+
+    cfg.filenames.reserve(cfg.num_cams);
+    for (int i = 0; i < cfg.num_cams; ++i) {
+        std::wstring key = L"file_" + std::to_wstring(i);
+        std::string p = WStringToUtf8(ini.ReadString(imgSec, key, L""));
+        p = make_abs_if_relative(p, baseDir);
+        cfg.filenames.push_back(p);
+    }
+    return cfg;
+}
+
+static void applyCameraConfig(const CameraConfig& cfg) {
+    WIDTH = cfg.width;
+    HEIGHT = cfg.height;
+    NUM_CAMS = cfg.num_cams;
+
+    fx = cfg.fx;
+    fy = cfg.fy;
+    cx = WIDTH * cfg.cx_ratio;
+    cy = HEIGHT * cfg.cy_ratio;
+
+    fx_new = cfg.fx_dist;
+    fy_new = cfg.fy_dist;
+    cx_new = cfg.cx_dist;
+    cy_new = cfg.cy_dist;
+
+    K1 = cfg.k1; K2 = cfg.k2; K3 = cfg.k3; P1 = cfg.p1; P2 = cfg.p2;
+
+    cylindrical_H_fov_deg = cfg.cyl_h_fov;
+    cylindrical_V_fov_deg = cfg.cyl_v_fov;
+
+    panorama_crop_height_scale = cfg.pano_crop_h;
+    panorama_crop_width_scale = cfg.pano_crop_w;
+
+    resize_factor = cfg.resize_factor;
+    PITCH_TO_TRANSLATION_FACTOR = cfg.pitch_to_translation_factor;
+    YAW_TO_TRANSLATION_FACTOR   = cfg.yaw_to_translation_factor;
+
+    overlap_px = cfg.overlap_px;
+    feather_strength = cfg.feather_strength;
+
+    TARGET_W = cfg.pano_width;
+    TARGET_H = cfg.pano_height;
+}
 
 // ===================== Angle LUT (±5°, 0.25°) Q1.15 =====================
 struct AngleLUTEntry { int16_t c; int16_t s; };
@@ -516,14 +698,16 @@ static inline void get_cos_sin_q15(float deg, int16_t* c, int16_t* s) {
 }
 
 // ===================== Maps (Q12.4) =====================
+static std::wstring sensor_prefix(bool isEO) { return isEO ? L"eo" : L"ir"; }
+
 static void loadCylMapsQ(std::vector<int16_t>& mapx, std::vector<int16_t>& mapy,
-    int w, int h, const std::filesystem::path& exePath)
+    int w, int h, const std::filesystem::path& exePath, const std::wstring& prefix)
 {
     StageTimer _t(ST_MAPS);
     mapx.resize((size_t)w * h);
     mapy.resize((size_t)w * h);
-    auto px = exePath.parent_path() / "map_x_q.bin";
-    auto py = exePath.parent_path() / "map_y_q.bin";
+    auto px = exePath.parent_path() / (prefix + L"_map_x_q.bin");
+    auto py = exePath.parent_path() / (prefix + L"_map_y_q.bin");
     FILE* fxp = fopen(px.string().c_str(), "rb");
     FILE* fyp = fopen(py.string().c_str(), "rb");
     if (!fxp || !fyp) {
@@ -537,11 +721,11 @@ static void loadCylMapsQ(std::vector<int16_t>& mapx, std::vector<int16_t>& mapy,
 }
 
 static void saveCylMapsQ(const std::vector<int16_t>& mapx, const std::vector<int16_t>& mapy,
-    const std::filesystem::path& exePath)
+    const std::filesystem::path& exePath, const std::wstring& prefix)
 {
     StageTimer _t(ST_MAPS);
-    auto px = exePath.parent_path() / "map_x_q.bin";
-    auto py = exePath.parent_path() / "map_y_q.bin";
+    auto px = exePath.parent_path() / (prefix + L"_map_x_q.bin");
+    auto py = exePath.parent_path() / (prefix + L"_map_y_q.bin");
     FILE* fxp = fopen(px.string().c_str(), "wb");
     FILE* fyp = fopen(py.string().c_str(), "wb");
     fwrite(mapx.data(), sizeof(int16_t), mapx.size(), fxp); MEM_WRITE(sizeof(int16_t) * mapx.size()); fclose(fxp);
@@ -551,7 +735,7 @@ static void saveCylMapsQ(const std::vector<int16_t>& mapx, const std::vector<int
 
 static void generateCylMapsQ(std::vector<int16_t>& mapx, std::vector<int16_t>& mapy,
     int w, int h, float fov_h_deg, float fov_v_deg, float x_shift,
-    const std::filesystem::path& exePath)
+    const std::filesystem::path& exePath, const std::wstring& prefix)
 {
     StageTimer _t(ST_MAPS);
     mapx.resize((size_t)w * h);
@@ -585,18 +769,18 @@ static void generateCylMapsQ(std::vector<int16_t>& mapx, std::vector<int16_t>& m
             mapy[(size_t)y * w + x] = (int16_t)qy;
         }
     }
-    saveCylMapsQ(mapx, mapy, exePath);
+    saveCylMapsQ(mapx, mapy, exePath, prefix);
 }
 
-static std::filesystem::path undXPath(const std::filesystem::path& exe) { return exe.parent_path() / L"und_x_q.bin"; }
-static std::filesystem::path undYPath(const std::filesystem::path& exe) { return exe.parent_path() / L"und_y_q.bin"; }
+static std::filesystem::path undXPath(const std::filesystem::path& exe, const std::wstring& prefix) { return exe.parent_path() / (prefix + L"_und_x_q.bin"); }
+static std::filesystem::path undYPath(const std::filesystem::path& exe, const std::wstring& prefix) { return exe.parent_path() / (prefix + L"_und_y_q.bin"); }
 
 static bool loadUndistForwardMapsQ(std::vector<int16_t>& udx_q, std::vector<int16_t>& udy_q,
-    int w, int h, const std::filesystem::path& exe)
+    int w, int h, const std::filesystem::path& exe, const std::wstring& prefix)
 {
     StageTimer _t(ST_UNDISTMAP);
-    auto px = undXPath(exe);
-    auto py = undYPath(exe);
+    auto px = undXPath(exe, prefix);
+    auto py = undYPath(exe, prefix);
     FILE* fxp = fopen(px.string().c_str(), "rb");
     FILE* fyp = fopen(py.string().c_str(), "rb");
     if (!fxp || !fyp) {
@@ -613,11 +797,11 @@ static bool loadUndistForwardMapsQ(std::vector<int16_t>& udx_q, std::vector<int1
 }
 
 static void saveUndistForwardMapsQ(const std::vector<int16_t>& udx_q, const std::vector<int16_t>& udy_q,
-    const std::filesystem::path& exe)
+    const std::filesystem::path& exe, const std::wstring& prefix)
 {
     StageTimer _t(ST_UNDISTMAP);
-    auto px = undXPath(exe);
-    auto py = undYPath(exe);
+    auto px = undXPath(exe, prefix);
+    auto py = undYPath(exe, prefix);
     FILE* fxp = fopen(px.string().c_str(), "wb");
     FILE* fyp = fopen(py.string().c_str(), "wb");
     fwrite(udx_q.data(), sizeof(int16_t), udx_q.size(), fxp); MEM_WRITE(sizeof(int16_t) * udx_q.size()); fclose(fxp);
@@ -676,15 +860,15 @@ static void generateUndistForwardMapsQ(
     printf("[INFO] Forward undistort maps (Q12.4) built.\r\n");
 }
 
-static std::filesystem::path compXPath(const std::filesystem::path& exe) { return exe.parent_path() / L"comp_x_q.bin"; }
-static std::filesystem::path compYPath(const std::filesystem::path& exe) { return exe.parent_path() / L"comp_y_q.bin"; }
+static std::filesystem::path compXPath(const std::filesystem::path& exe, const std::wstring& prefix) { return exe.parent_path() / (prefix + L"_comp_x_q.bin"); }
+static std::filesystem::path compYPath(const std::filesystem::path& exe, const std::wstring& prefix) { return exe.parent_path() / (prefix + L"_comp_y_q.bin"); }
 
 static bool loadComposedMapsQ(std::vector<int16_t>& ox, std::vector<int16_t>& oy,
-    int w, int h, const std::filesystem::path& exe)
+    int w, int h, const std::filesystem::path& exe, const std::wstring& prefix)
 {
     StageTimer _t(ST_UNDISTMAP);
-    auto px = compXPath(exe);
-    auto py = compYPath(exe);
+    auto px = compXPath(exe, prefix);
+    auto py = compYPath(exe, prefix);
     FILE* fxp = fopen(px.string().c_str(), "rb");
     FILE* fyp = fopen(py.string().c_str(), "rb");
     if (!fxp || !fyp) {
@@ -701,11 +885,11 @@ static bool loadComposedMapsQ(std::vector<int16_t>& ox, std::vector<int16_t>& oy
 }
 
 static void saveComposedMapsQ(const std::vector<int16_t>& ox, const std::vector<int16_t>& oy,
-    const std::filesystem::path& exe)
+    const std::filesystem::path& exe, const std::wstring& prefix)
 {
     StageTimer _t(ST_UNDISTMAP);
-    auto px = compXPath(exe);
-    auto py = compYPath(exe);
+    auto px = compXPath(exe, prefix);
+    auto py = compYPath(exe, prefix);
     FILE* fxp = fopen(px.string().c_str(), "wb");
     FILE* fyp = fopen(py.string().c_str(), "wb");
     fwrite(ox.data(), sizeof(int16_t), ox.size(), fxp); MEM_WRITE(sizeof(int16_t) * ox.size()); fclose(fxp);
@@ -880,6 +1064,45 @@ static void buildBaseMapsOriginal(
     printf("[INFO] Base maps in original space built (per_cam_w_max x crop_h, Q16.16).\r\n");
 }
 
+static std::filesystem::path baseXPath(const std::filesystem::path& exe, const std::wstring& prefix) { return exe.parent_path() / (prefix + L"_base_x_q16.bin"); }
+static std::filesystem::path baseYPath(const std::filesystem::path& exe, const std::wstring& prefix) { return exe.parent_path() / (prefix + L"_base_y_q16.bin"); }
+
+static bool loadBaseMapsQ16(std::vector<int32_t>& bx, std::vector<int32_t>& by,
+    int per_cam_w_max, int crop_h,
+    const std::filesystem::path& exe, const std::wstring& prefix)
+{
+    StageTimer _t(ST_MAPS);
+    auto px = baseXPath(exe, prefix);
+    auto py = baseYPath(exe, prefix);
+    FILE* fxp = fopen(px.string().c_str(), "rb");
+    FILE* fyp = fopen(py.string().c_str(), "rb");
+    if (!fxp || !fyp) {
+        if (fxp) fclose(fxp);
+        if (fyp) fclose(fyp);
+        return false;
+    }
+    size_t n = (size_t)per_cam_w_max * crop_h;
+    bx.resize(n);
+    by.resize(n);
+    fread(bx.data(), sizeof(int32_t), n, fxp); MEM_READ(sizeof(int32_t) * n); fclose(fxp);
+    fread(by.data(), sizeof(int32_t), n, fyp); MEM_READ(sizeof(int32_t) * n); fclose(fyp);
+    printf("[INFO] Base maps (Q16.16) loaded from disk.\r\n");
+    return true;
+}
+
+static void saveBaseMapsQ16(const std::vector<int32_t>& bx, const std::vector<int32_t>& by,
+    const std::filesystem::path& exe, const std::wstring& prefix)
+{
+    StageTimer _t(ST_MAPS);
+    auto px = baseXPath(exe, prefix);
+    auto py = baseYPath(exe, prefix);
+    FILE* fxp = fopen(px.string().c_str(), "wb");
+    FILE* fyp = fopen(py.string().c_str(), "wb");
+    fwrite(bx.data(), sizeof(int32_t), bx.size(), fxp); MEM_WRITE(sizeof(int32_t) * bx.size()); fclose(fxp);
+    fwrite(by.data(), sizeof(int32_t), by.size(), fyp); MEM_WRITE(sizeof(int32_t) * by.size()); fclose(fyp);
+    printf("[INFO] Base maps (Q16.16) saved to disk.\r\n");
+}
+
 // ===================== RowRun schedule =====================
 #pragma pack(push, 1)
 struct RowRun {
@@ -895,16 +1118,20 @@ struct RowRun {
 
 // ===================== 2-line BRAM cache =====================
 struct LineCache {
-    std::array<std::vector<unsigned char>, STRIP_H> Y;
-    std::array<std::vector<unsigned char>, STRIP_H> U;
-    std::array<std::vector<unsigned char>, STRIP_H> V;
-    std::array<int, STRIP_H> rowId;
+    std::array<std::vector<unsigned char>, SCANLINE_BUFFER> Y;
+    std::array<std::vector<unsigned char>, SCANLINE_BUFFER> U;
+    std::array<std::vector<unsigned char>, SCANLINE_BUFFER> V;
+    std::array<int, SCANLINE_BUFFER> rowId;
+    int lineW = 0;
+    int chromaW = 0;
 
     LineCache() {
         rowId.fill(-1);
-        for (auto& buf : Y) buf.resize(WIDTH);
-        for (auto& buf : U) buf.resize(WIDTH / 2);
-        for (auto& buf : V) buf.resize(WIDTH / 2);
+        lineW = WIDTH;
+        chromaW = WIDTH / 2;
+        for (auto& buf : Y) buf.resize(FIXED_INPUT_W);
+        for (auto& buf : U) buf.resize(FIXED_INPUT_W / 2);
+        for (auto& buf : V) buf.resize(FIXED_INPUT_W / 2);
     }
 
     void loadRowPtr(int parity,
@@ -913,11 +1140,11 @@ struct LineCache {
         const unsigned char* scanV,
         int row)
     {
-        memcpy(Y[parity].data(), scanY, (size_t)WIDTH);
-        memcpy(U[parity].data(), scanU, (size_t)(WIDTH / 2));
-        memcpy(V[parity].data(), scanV, (size_t)(WIDTH / 2));
+        memcpy(Y[parity].data(), scanY, (size_t)lineW);
+        memcpy(U[parity].data(), scanU, (size_t)chromaW);
+        memcpy(V[parity].data(), scanV, (size_t)chromaW);
         rowId[parity] = row;
-        MEM_WRITE((uint64_t)WIDTH + (uint64_t)(WIDTH / 2) + (uint64_t)(WIDTH / 2));
+        MEM_WRITE((uint64_t)lineW + (uint64_t)chromaW + (uint64_t)chromaW);
     }
 };
 
@@ -949,50 +1176,54 @@ struct RowWindow {
     int numCams = 0;
     int per_cam_h = 0;
     std::vector<int> per_cam_w;
+    int fixed_w = FIXED_OUTPUT_W;
+    int fixed_cw = FIXED_OUTPUT_W / 2;
 
     std::vector<int> sy_to_slot;     // [per_cam_h] -> slot or -1
-    std::vector<int> slot_sy;        // [WINDOW_H] -> sy or -1
+    std::vector<int> slot_sy;        // [ACTIVE_BUFFER] -> sy or -1
     std::vector<int> free_slots;     // stack
+    std::unique_ptr<std::atomic<int>[]> sy_next_cam;
+    int sy_next_cam_size = 0;
+    std::mutex mtx;
 
-    struct CamBuf {
-        int w = 0;
-        int cw = 0;
-        std::vector<unsigned char> Y;
-        std::vector<unsigned char> U;
-        std::vector<unsigned char> V;
-    };
-    std::vector<CamBuf> cam;
+    std::vector<unsigned char> Y;
+    std::vector<unsigned char> U;
+    std::vector<unsigned char> V;
 
     void init(int nCams, int pch, const std::vector<int>& pcw) {
         numCams = nCams;
         per_cam_h = pch;
         per_cam_w = pcw;
         sy_to_slot.assign(per_cam_h, -1);
-        slot_sy.assign(WINDOW_H, -1);
+        slot_sy.assign(ACTIVE_BUFFER, -1);
+        sy_next_cam_size = per_cam_h;
+        sy_next_cam = std::make_unique<std::atomic<int>[]>(per_cam_h);
+        for (int i = 0; i < sy_next_cam_size; ++i) {
+            sy_next_cam[i].store(0, std::memory_order_relaxed);
+        }
 
         free_slots.clear();
-        free_slots.reserve(WINDOW_H);
-        for (int i = WINDOW_H - 1; i >= 0; --i) free_slots.push_back(i);
+        free_slots.reserve(ACTIVE_BUFFER);
+        for (int i = ACTIVE_BUFFER - 1; i >= 0; --i) free_slots.push_back(i);
 
-        cam.resize(numCams);
-        for (int c = 0; c < numCams; ++c) {
-            cam[c].w = per_cam_w[c];
-            cam[c].cw = per_cam_w[c] / 2;
-            cam[c].Y.assign((size_t)WINDOW_H * cam[c].w, 0);
-            cam[c].U.assign((size_t)WINDOW_H * cam[c].cw, 128);
-            cam[c].V.assign((size_t)WINDOW_H * cam[c].cw, 128);
-        }
+        Y.assign((size_t)ACTIVE_BUFFER * fixed_w, 0);
+        U.assign((size_t)ACTIVE_BUFFER * fixed_cw, 128);
+        V.assign((size_t)ACTIVE_BUFFER * fixed_cw, 128);
     }
 
     void reset_mappings() {
         std::fill(sy_to_slot.begin(), sy_to_slot.end(), -1);
         std::fill(slot_sy.begin(), slot_sy.end(), -1);
+        for (int i = 0; i < sy_next_cam_size; ++i) {
+            sy_next_cam[i].store(0, std::memory_order_relaxed);
+        }
         free_slots.clear();
-        free_slots.reserve(WINDOW_H);
-        for (int i = WINDOW_H - 1; i >= 0; --i) free_slots.push_back(i);
+        free_slots.reserve(ACTIVE_BUFFER);
+        for (int i = ACTIVE_BUFFER - 1; i >= 0; --i) free_slots.push_back(i);
     }
 
     int allocate_slot_for_sy(int sy) {
+        std::lock_guard<std::mutex> lock(mtx);
         if ((unsigned)sy >= (unsigned)per_cam_h) return -1;
         int& slot = sy_to_slot[sy];
         if (slot >= 0) return slot;
@@ -1004,22 +1235,19 @@ struct RowWindow {
         slot_sy[freeSlot] = sy;
         slot = freeSlot;
 
-        for (int c = 0; c < numCams; ++c) {
-            unsigned char* y = &cam[c].Y[(size_t)freeSlot * cam[c].w];
-            unsigned char* u = &cam[c].U[(size_t)freeSlot * cam[c].cw];
-            unsigned char* v = &cam[c].V[(size_t)freeSlot * cam[c].cw];
-            memset(y, 0, (size_t)cam[c].w);
-            memset(u, 128, (size_t)cam[c].cw);
-            memset(v, 128, (size_t)cam[c].cw);
-        }
-
-        uint64_t bytes = 0;
-        for (int c = 0; c < numCams; ++c) bytes += (uint64_t)cam[c].w + 2ull * (uint64_t)cam[c].cw;
-        MEM_WRITE(bytes);
+        unsigned char* y = &Y[(size_t)freeSlot * (size_t)fixed_w];
+        unsigned char* u = &U[(size_t)freeSlot * (size_t)fixed_cw];
+        unsigned char* v = &V[(size_t)freeSlot * (size_t)fixed_cw];
+        memset(y, 0, (size_t)fixed_w);
+        memset(u, 128, (size_t)fixed_cw);
+        memset(v, 128, (size_t)fixed_cw);
+        sy_next_cam[sy].store(0, std::memory_order_release);
+        MEM_WRITE((uint64_t)fixed_w + 2ull * (uint64_t)fixed_cw);
         return freeSlot;
     }
 
     void free_sy(int sy) {
+        std::lock_guard<std::mutex> lock(mtx);
         if ((unsigned)sy >= (unsigned)per_cam_h) return;
         int slot = sy_to_slot[sy];
         if (slot < 0) return;
@@ -1028,9 +1256,19 @@ struct RowWindow {
         free_slots.push_back(slot);
     }
 
-    inline unsigned char* rowY(int camId, int slot) { return &cam[camId].Y[(size_t)slot * cam[camId].w]; }
-    inline unsigned char* rowU(int camId, int slot) { return &cam[camId].U[(size_t)slot * cam[camId].cw]; }
-    inline unsigned char* rowV(int camId, int slot) { return &cam[camId].V[(size_t)slot * cam[camId].cw]; }
+    void wait_for_cam_turn(int sy, int camId) {
+        while (sy_next_cam[sy].load(std::memory_order_acquire) != camId) {
+            std::this_thread::yield();
+        }
+    }
+
+    void finish_cam(int sy) {
+        sy_next_cam[sy].fetch_add(1, std::memory_order_release);
+    }
+
+    inline unsigned char* rowY(int slot) { return &Y[(size_t)slot * (size_t)fixed_w]; }
+    inline unsigned char* rowU(int slot) { return &U[(size_t)slot * (size_t)fixed_cw]; }
+    inline unsigned char* rowV(int slot) { return &V[(size_t)slot * (size_t)fixed_cw]; }
 };
 
 // ===================== On-the-fly mapping ax/ay (row-pointer based, less overhead) =====================
@@ -1073,6 +1311,98 @@ static inline bool compute_axay_for_dest_rowptr(
     return true;
 }
 
+struct Y0SyIndex {
+    int globalMin = 0;
+    int rangeSize = 0;
+    std::vector<int32_t> offsets;
+    std::vector<uint16_t> sy;
+};
+
+struct RoiRect {
+    int x0 = 0;
+    int y0 = 0;
+    int w = 0;
+    int h = 0;
+};
+
+static RoiRect compute_undistort_roi(
+    int w, int h,
+    float fx_src, float fy_src, float cx_src, float cy_src,
+    float fx_und, float fy_und, float cx_und, float cy_und,
+    float k1, float k2, float k3, float p1, float p2)
+{
+    int minX = w;
+    int maxX = -1;
+    int minY = h;
+    int maxY = -1;
+
+    const float inv_fx_und = 1.0f / fx_und;
+    const float inv_fy_und = 1.0f / fy_und;
+    const float max_x = (float)(w - 1);
+    const float max_y = (float)(h - 1);
+
+    for (int v = 0; v < h; ++v) {
+        const float yn = ((float)v - cy_und) * inv_fy_und;
+        const float yn2 = yn * yn;
+        const float p1_2yn = 2.0f * p1 * yn;
+        const float p2_2 = 2.0f * p2;
+
+        int rowMin = w;
+        int rowMax = -1;
+        for (int u = 0; u < w; ++u) {
+            const float xn = ((float)u - cx_und) * inv_fx_und;
+            const float xn2 = xn * xn;
+            const float r2 = xn2 + yn2;
+            const float r4 = r2 * r2;
+            const float r6 = r4 * r2;
+
+            const float radial = 1.0f + k1 * r2 + k2 * r4 + k3 * r6;
+            const float dx = p1_2yn * xn + p2 * (r2 + 2.0f * xn2);
+            const float dy = p1 * (r2 + 2.0f * yn2) + p2_2 * xn * yn;
+
+            const float xd = xn * radial + dx;
+            const float yd = yn * radial + dy;
+
+            const float src_x = xd * fx_src + cx_src;
+            const float src_y = yd * fy_src + cy_src;
+
+            if (src_x < 0.0f || src_x > max_x || src_y < 0.0f || src_y > max_y) {
+                continue;
+            }
+
+            rowMin = std::min(rowMin, u);
+            rowMax = std::max(rowMax, u);
+        }
+
+        if (rowMax >= 0) {
+            minY = std::min(minY, v);
+            maxY = std::max(maxY, v);
+            minX = std::min(minX, rowMin);
+            maxX = std::max(maxX, rowMax);
+        }
+    }
+
+    if (maxX < 0 || maxY < 0) {
+        return { 0, 0, w, h };
+    }
+
+    int x0 = clampi(minX, 0, w - 1);
+    int x1 = clampi(maxX, 0, w - 1);
+    int y0 = clampi(minY, 0, h - 1);
+    int y1 = clampi(maxY, 0, h - 1);
+
+    if (x0 % 2 != 0) x0 = std::max(0, x0 - 1);
+    if (((x1 - x0 + 1) % 2) != 0) {
+        if (x1 + 1 < w) {
+            x1++;
+        } else if (x0 > 0) {
+            x0--;
+        }
+    }
+
+    return { x0, y0, x1 - x0 + 1, y1 - y0 + 1 };
+}
+
 static void build_runs_for_y0_on_the_fly_rowptr(
     int y0_target,
     int pcw,
@@ -1086,6 +1416,7 @@ static void build_runs_for_y0_on_the_fly_rowptr(
     int16_t c15, int16_t s15,
     const std::vector<int16_t>& spanMin_sy,
     const std::vector<int16_t>& spanMax_sy,
+    const Y0SyIndex& y0_to_sy_flat,
     std::vector<RowRun>& outRuns,
     size_t& outPeakBytes // updated by caller if desired
 ) {
@@ -1103,11 +1434,22 @@ static void build_runs_for_y0_on_the_fly_rowptr(
 
     uint64_t local_reads = 0;
 
-    for (int sy = 0; sy < per_cam_h; ++sy) {
-        int16_t mn = spanMin_sy[sy];
-        int16_t mx = spanMax_sy[sy];
-        if (mx < 0) continue;
-        if (y0_target < mn || y0_target > mx) continue;
+    // Use reverse index to find only sy rows that map to y0_target
+    const uint16_t* syList = nullptr;
+    int syCount = 0;
+    if (!y0_to_sy_flat.offsets.empty()) {
+        int localIdx = y0_target - y0_to_sy_flat.globalMin;
+        if (localIdx >= 0 && localIdx < y0_to_sy_flat.rangeSize) {
+            int off0 = y0_to_sy_flat.offsets[(size_t)localIdx];
+            int off1 = y0_to_sy_flat.offsets[(size_t)localIdx + 1];
+            syCount = off1 - off0;
+            syList = y0_to_sy_flat.sy.data() + off0;
+        }
+    }
+
+    for (int si = 0; si < syCount; ++si) {
+        int sy = (int)syList[si];
+        if (sy < 0 || sy >= per_cam_h) continue;
 
         const int32_t* rowBX = &base_x_q16[(size_t)sy * (size_t)per_cam_w_max];
         const int32_t* rowBY = &base_y_q16[(size_t)sy * (size_t)per_cam_w_max];
@@ -1211,7 +1553,8 @@ static void precompute_spans_and_bounds(
     int32_t max_x_q, int32_t max_y_q,
     std::vector<std::vector<int16_t>>& spanMin_cam_sy,
     std::vector<std::vector<int16_t>>& spanMax_cam_sy,
-    std::vector<int>& maxY0Bound_sy
+    std::vector<int>& maxY0Bound_sy,
+    std::vector<Y0SyIndex>& y0_to_sy_cam
 ) {
     StageTimer _t(ST_SCHED);
 
@@ -1231,25 +1574,33 @@ static void precompute_spans_and_bounds(
             const int32_t* rowBX = &base_x_q16[(size_t)sy * (size_t)per_cam_w_max];
             const int32_t* rowBY = &base_y_q16[(size_t)sy * (size_t)per_cam_w_max];
 
-            int oxs[3] = { 0, pcw / 2, pcw - 1 };
             int mn = 1000000;
             int mx = -1000000;
             bool any = false;
+            for (int ox = 0; ox < pcw; ++ox) {
+                int32_t bx_q = rowBX[ox];
+                int32_t by_q = rowBY[ox];
+                local_reads += 8;
 
-            for (int k = 0; k < 3; ++k) {
-                int ox = oxs[k];
-                int32_t ax, ay;
-                int y0;
-                if (compute_axay_for_dest_rowptr(
-                    ox, pcw, rowBX, rowBY,
-                    cx_q, cy_q, max_x_q, max_y_q,
-                    y_shift_q, c15, s15,
-                    ax, ay, y0, local_reads))
-                {
-                    any = true;
-                    mn = std::min(mn, y0);
-                    mx = std::max(mx, y0);
-                }
+                by_q += y_shift_q;
+
+                int32_t dx_q = bx_q - cx_q;
+                int32_t dy_q = by_q - cy_q;
+
+                int64_t tmpx = (int64_t)c15 * dx_q + (int64_t)s15 * dy_q;
+                int64_t tmpy = -(int64_t)s15 * dx_q + (int64_t)c15 * dy_q;
+
+                int32_t ax_q = (int32_t)(tmpx >> 15) + cx_q;
+                int32_t ay_q = (int32_t)(tmpy >> 15) + cy_q;
+
+                if (ax_q < 0 || ax_q > max_x_q || ay_q < 0 || ay_q > max_y_q) continue;
+
+                int y0 = (ay_q >> WFIX_SHIFT);
+                if (y0 < 0 || y0 >= HEIGHT - 1) continue;
+
+                any = true;
+                mn = std::min(mn, y0);
+                mx = std::max(mx, y0);
             }
 
             if (!any) {
@@ -1266,6 +1617,73 @@ static void precompute_spans_and_bounds(
     }
 
     MEM_READ(local_reads);
+
+    // Build reverse index: for each cam, y0 -> list of sy rows whose span includes y0
+    int numCams = (int)per_cam_w.size();
+    y0_to_sy_cam.resize((size_t)numCams);
+    for (int cam = 0; cam < numCams; ++cam) {
+        // Find global y0 range for this cam
+        int globalMin = INT32_MAX, globalMax = -1;
+        for (int sy = 0; sy < per_cam_h; ++sy) {
+            int16_t mn = spanMin_cam_sy[cam][sy];
+            int16_t mx = spanMax_cam_sy[cam][sy];
+            if (mx < 0) continue;
+            if (mn < globalMin) globalMin = mn;
+            if (mx > globalMax) globalMax = mx;
+        }
+        if (globalMax < 0) {
+            y0_to_sy_cam[cam] = {};
+            continue;
+        }
+        int rangeSize = globalMax - globalMin + 1;
+        // Flat encoding: [rangeSize offset entries] [sy data...]
+        // For simplicity, use a vector<vector<int16_t>> per cam keyed by y0
+        // But that's too many vectors. Instead, store as a flat list with a start/count index.
+        // Actually, use simple approach: vector<int16_t> with sentinel-separated lists per y0.
+        // For efficiency, build count per y0, then flatten.
+        std::vector<int> count((size_t)rangeSize, 0);
+        for (int sy = 0; sy < per_cam_h; ++sy) {
+            int16_t mn = spanMin_cam_sy[cam][sy];
+            int16_t mx = spanMax_cam_sy[cam][sy];
+            if (mx < 0) continue;
+            for (int y0 = mn; y0 <= mx; ++y0) {
+                if (y0 >= globalMin && y0 <= globalMax)
+                    count[y0 - globalMin]++;
+            }
+        }
+        // Build offset table: first rangeSize+1 entries are offsets, then data
+        std::vector<int> offset((size_t)rangeSize + 1, 0);
+        for (int i = 0; i < rangeSize; ++i)
+            offset[i + 1] = offset[i] + count[i];
+        int totalEntries = offset[rangeSize];
+
+        // Flat storage: [globalMin(as int16), globalMax(as int16), rangeSize+1 offsets(as int16), totalEntries sy values(as int16)]
+        // But offsets can exceed int16. Use int16 for sy values, pack offsets differently.
+        // Simpler: store as flat int16_t vector: header + per-y0 blocks separated by -1 sentinel
+        // Most efficient for the use case: just store (globalMin, rangeSize, offsets..., sy_data...)
+        // Since this is PC simulation, use a straightforward flat vector.
+        auto& flat = y0_to_sy_cam[cam];
+        flat.globalMin = globalMin;
+        flat.rangeSize = rangeSize;
+        flat.offsets.assign(offset.begin(), offset.end());
+        flat.sy.assign((size_t)totalEntries, 0);
+
+        // Fill sy data
+        std::vector<int> pos = offset; // write cursors
+        for (int sy = 0; sy < per_cam_h; ++sy) {
+            int16_t mn = spanMin_cam_sy[cam][sy];
+            int16_t mx = spanMax_cam_sy[cam][sy];
+            if (mx < 0) continue;
+            for (int y0 = mn; y0 <= mx; ++y0) {
+                if (y0 >= globalMin && y0 <= globalMax) {
+                    int idx = y0 - globalMin;
+                    flat.sy[(size_t)pos[idx]] = (uint16_t)sy;
+                    pos[idx]++;
+                }
+            }
+        }
+    }
+    printf("[INFO] Reverse index y0->sy built for %d cameras.\n", numCams);
 }
 
 // ===================== V10-like blending from row window into a destination row buffer =====================
@@ -1291,74 +1709,14 @@ static void blend_row_sy_into_dst(
     if (slot < 0) return;
 
     StageTimer _b(ST_BLEND);
-
-    {
-        const int w0 = per_cam_w[0];
-        const int cw0 = w0 / 2;
-        const unsigned char* srcY0 = rw.rowY(0, slot);
-        const unsigned char* srcU0 = rw.rowU(0, slot);
-        const unsigned char* srcV0 = rw.rowV(0, slot);
-        memcpy(dstYRow, srcY0, (size_t)w0);
-        memcpy(dstURow, srcU0, (size_t)cw0);
-        memcpy(dstVRow, srcV0, (size_t)cw0);
-        MEM_READ((uint64_t)w0 + 2ull * (uint64_t)cw0);
-        MEM_WRITE((uint64_t)w0 + 2ull * (uint64_t)cw0);
-    }
-
-    int curxY = per_cam_w[0];
-    int curxC = per_cam_w[0] / 2;
-
-    for (int i = 1; i < (int)per_cam_w.size(); ++i) {
-        const int w = per_cam_w[i];
-        const int cw = w / 2;
-
-        const unsigned char* srcY = rw.rowY(i, slot);
-        const unsigned char* srcU = rw.rowU(i, slot);
-        const unsigned char* srcV = rw.rowV(i, slot);
-
-        int ovY = overlap_target;
-        if (ovY > w) ovY = w;
-        if (ovY > curxY) ovY = curxY;
-
-        int ovC = overlap_target / 2;
-        if (ovC > cw) ovC = cw;
-        if (ovC > curxC) ovC = curxC;
-
-        for (int x = 0; x < ovY; ++x) {
-            unsigned a = alphaY[std::min(x, (int)alphaY.size() - 1)];
-            size_t dp = (size_t)(curxY - ovY + x);
-            size_t sp = (size_t)x;
-            unsigned prev = dstYRow[dp];
-            unsigned curr = srcY[sp];
-            dstYRow[dp] = (unsigned char)((prev * (65536u - a) + curr * a) >> 16);
-        }
-        int tailY = w - ovY;
-        if (tailY > 0) memcpy(&dstYRow[(size_t)curxY], &srcY[(size_t)ovY], (size_t)tailY);
-        curxY += tailY;
-
-        for (int x = 0; x < ovC; ++x) {
-            unsigned a = alphaC[std::min(x, (int)alphaC.size() - 1)];
-            size_t dp = (size_t)(curxC - ovC + x);
-            size_t sp = (size_t)x;
-
-            unsigned uprev = dstURow[dp];
-            unsigned ucurr = srcU[sp];
-            dstURow[dp] = (unsigned char)((uprev * (65536u - a) + ucurr * a) >> 16);
-
-            unsigned vprev = dstVRow[dp];
-            unsigned vcurr = srcV[sp];
-            dstVRow[dp] = (unsigned char)((vprev * (65536u - a) + vcurr * a) >> 16);
-        }
-        int tailC = cw - ovC;
-        if (tailC > 0) {
-            memcpy(&dstURow[(size_t)curxC], &srcU[(size_t)ovC], (size_t)tailC);
-            memcpy(&dstVRow[(size_t)curxC], &srcV[(size_t)ovC], (size_t)tailC);
-        }
-        curxC += tailC;
-
-        MEM_READ((uint64_t)w + 2ull * (uint64_t)cw);
-        MEM_WRITE((uint64_t)w + 2ull * (uint64_t)cw);
-    }
+    const unsigned char* srcY = rw.rowY(slot);
+    const unsigned char* srcU = rw.rowU(slot);
+    const unsigned char* srcV = rw.rowV(slot);
+    memcpy(dstYRow, srcY, (size_t)TARGET_W);
+    memcpy(dstURow, srcU, (size_t)cw_out);
+    memcpy(dstVRow, srcV, (size_t)cw_out);
+    MEM_READ((uint64_t)TARGET_W + 2ull * (uint64_t)cw_out);
+    MEM_WRITE((uint64_t)TARGET_W + 2ull * (uint64_t)cw_out);
 }
 
 // ===================== Internal memory report (FPGA model) =====================
@@ -1369,22 +1727,19 @@ static void print_internal_memory_report_v17(
     int targetH,
     const std::vector<int>& per_cam_w,
     size_t peakScheduleBytes,
+    int rowWindowH,
     int sliceH)
 {
     const uint64_t BRAM36_BITS = 36ull * 1024ull;
     const uint64_t URAM_BITS = 288ull * 1024ull;
 
     uint64_t lineCacheBytesPerCam =
-        (uint64_t)STRIP_H * ((uint64_t)width + (uint64_t)(width / 2) + (uint64_t)(width / 2));
+        (uint64_t)SCANLINE_BUFFER * ((uint64_t)FIXED_INPUT_W + (uint64_t)(FIXED_INPUT_W / 2) + (uint64_t)(FIXED_INPUT_W / 2));
     uint64_t lineCacheBytesTotal = lineCacheBytesPerCam * (uint64_t)numCams;
 
-    uint64_t rowWindowBytes = 0;
-    for (int cam = 0; cam < numCams; ++cam) {
-        uint64_t w = (uint64_t)per_cam_w[cam];
-        rowWindowBytes += (uint64_t)WINDOW_H * (2ull * w);
-    }
+    uint64_t rowWindowBytes = (uint64_t)rowWindowH * (2ull * (uint64_t)FIXED_OUTPUT_W);
 
-    uint64_t sliceBytesOne = 2ull * (uint64_t)targetW * (uint64_t)sliceH;
+    uint64_t sliceBytesOne = 2ull * (uint64_t)FIXED_OUTPUT_W * (uint64_t)sliceH;
     uint64_t sliceBytesPingPong = 2ull * sliceBytesOne;
 
     uint64_t scheduleBytes = (uint64_t)peakScheduleBytes;
@@ -1396,13 +1751,13 @@ static void print_internal_memory_report_v17(
     uint64_t bram36Blocks = ceil_div_u64(onChipTotalBits, BRAM36_BITS);
     uint64_t uramBlocks = ceil_div_u64(onChipTotalBits, URAM_BITS);
 
-    printf("\n===== INTERNAL MEMORY ESTIMATE (V17 MODEL) =====\n");
+    printf("\n===== INTERNAL MEMORY ESTIMATE (V19 MODEL) =====\n");
     printf("LineCache total: %llu bytes (%.2f KB) [per cam=%.2f KB]\n",
         (unsigned long long)lineCacheBytesTotal, lineCacheBytesTotal / 1024.0,
         lineCacheBytesPerCam / 1024.0);
 
-    printf("RowWindow (WINDOW_H=%d): %llu bytes (%.2f MB)\n",
-        WINDOW_H, (unsigned long long)rowWindowBytes, rowWindowBytes / (1024.0 * 1024.0));
+    printf("RowWindow (ACTIVE_BUFFER=%d): %llu bytes (%.2f MB)\n",
+        rowWindowH, (unsigned long long)rowWindowBytes, rowWindowBytes / (1024.0 * 1024.0));
 
     printf("Schedule (peak per-y0 RowRuns): %llu bytes (%.2f KB)\n",
         (unsigned long long)scheduleBytes, scheduleBytes / 1024.0);
@@ -1423,12 +1778,14 @@ static void print_internal_memory_report_v17(
     printf("==============================================\n");
 }
 
-// ===================== DDR slice ping-pong =====================
+// ===================== For DDR write slice ping-pong =====================
 struct PanoSlicePingPong {
+    int storageW = 0;
     int targetW = 0;
     int targetH = 0;
     int sliceH = 0;
-    int cw_out = 0;
+    int storageCw = 0;
+    int targetCw = 0;
 
     struct SliceBuf {
         std::vector<unsigned char> Y;
@@ -1450,17 +1807,19 @@ struct PanoSlicePingPong {
         targetW = W;
         targetH = H;
         sliceH = sliceH_;
-        cw_out = targetW / 2;
+        storageW = FIXED_OUTPUT_W;
+        storageCw = storageW / 2;
+        targetCw = targetW / 2;
 
         for (int i = 0; i < 2; ++i) {
-            slice[i].Y.assign((size_t)targetW * sliceH, 0);
-            slice[i].U.assign((size_t)cw_out * sliceH, 128);
-            slice[i].V.assign((size_t)cw_out * sliceH, 128);
+            slice[i].Y.assign((size_t)storageW * sliceH, 0);
+            slice[i].U.assign((size_t)storageCw * sliceH, 128);
+            slice[i].V.assign((size_t)storageCw * sliceH, 128);
         }
 
         ddrY.assign((size_t)targetW * targetH, 0);
-        ddrU.assign((size_t)cw_out * targetH, 128);
-        ddrV.assign((size_t)cw_out * targetH, 128);
+        ddrU.assign((size_t)targetCw * targetH, 128);
+        ddrV.assign((size_t)targetCw * targetH, 128);
 
         active = 0;
         base_py = -1;
@@ -1484,16 +1843,19 @@ struct PanoSlicePingPong {
         if (base_py + rows > targetH) rows = targetH - base_py;
         if (rows <= 0) return;
 
-        size_t yBytes = (size_t)targetW * rows;
-        size_t cBytes = (size_t)cw_out * rows;
         size_t yOff = (size_t)base_py * (size_t)targetW;
-        size_t cOff = (size_t)base_py * (size_t)cw_out;
+        size_t cOff = (size_t)base_py * (size_t)targetCw;
+        const unsigned char* srcY = slice[active].Y.data();
+        const unsigned char* srcU = slice[active].U.data();
+        const unsigned char* srcV = slice[active].V.data();
 
-        memcpy(ddrY.data() + yOff, slice[active].Y.data(), yBytes);
-        memcpy(ddrU.data() + cOff, slice[active].U.data(), cBytes);
-        memcpy(ddrV.data() + cOff, slice[active].V.data(), cBytes);
+        for (int r = 0; r < rows; ++r) {
+            memcpy(ddrY.data() + yOff + (size_t)r * targetW, srcY + (size_t)r * storageW, (size_t)targetW);
+            memcpy(ddrU.data() + cOff + (size_t)r * targetCw, srcU + (size_t)r * storageCw, (size_t)targetCw);
+            memcpy(ddrV.data() + cOff + (size_t)r * targetCw, srcV + (size_t)r * storageCw, (size_t)targetCw);
+        }
 
-        MEM_WRITE((uint64_t)yBytes + 2ull * (uint64_t)cBytes);
+        MEM_WRITE((uint64_t)targetW * rows + 2ull * (uint64_t)targetCw * rows);
 
         active ^= 1;
         clear_active();
@@ -1525,9 +1887,9 @@ struct PanoSlicePingPong {
             fill = 0;
         }
 
-        outY = slice[active].Y.data() + (size_t)fill * (size_t)targetW;
-        outU = slice[active].U.data() + (size_t)fill * (size_t)cw_out;
-        outV = slice[active].V.data() + (size_t)fill * (size_t)cw_out;
+        outY = slice[active].Y.data() + (size_t)fill * (size_t)storageW;
+        outU = slice[active].U.data() + (size_t)fill * (size_t)storageCw;
+        outV = slice[active].V.data() + (size_t)fill * (size_t)storageCw;
         return true;
     }
 
@@ -1538,6 +1900,67 @@ struct PanoSlicePingPong {
 
     void finalize() { flush_active_to_ddr(); }
 };
+
+// ===================== Build undistort base maps in ORIGINAL space (identity crop, 1:1) =====================
+// For undistortion, the "composed map" is the undistortion forward map alone (no cylindrical).
+// We build base_x_q16 / base_y_q16 of size (WIDTH x HEIGHT) in Q16.16, mapping each destination
+// pixel (u,v) to its source coordinate.  Border replicate is applied.
+// This feeds directly into the same RowRun / LineCache / RowWindow pipeline as panorama.
+static void buildUndistBaseMapsOriginal(
+    int w, int h,
+    float fx_src, float fy_src, float cx_src, float cy_src,
+    float fx_und, float fy_und, float cx_und, float cy_und,
+    float k1, float k2, float k3, float p1, float p2,
+    std::vector<int32_t>& base_x_q16,
+    std::vector<int32_t>& base_y_q16)
+{
+    StageTimer _t(ST_UNDISTMAP);
+
+    base_x_q16.resize((size_t)w * h);
+    base_y_q16.resize((size_t)w * h);
+
+    const float inv_fx_und = 1.0f / fx_und;
+    const float inv_fy_und = 1.0f / fy_und;
+    const float q16_scale = (float)(1 << WFIX_SHIFT);
+    const float max_x = (float)(w - 1);
+    const float max_y = (float)(h - 1);
+
+    for (int v = 0; v < h; ++v) {
+        const float yn = ((float)v - cy_und) * inv_fy_und;
+        const float yn2 = yn * yn;
+        const float p1_2yn = 2.0f * p1 * yn;
+        const float p2_2 = 2.0f * p2;
+
+        for (int u = 0; u < w; ++u) {
+            const float xn = ((float)u - cx_und) * inv_fx_und;
+            const float xn2 = xn * xn;
+            const float r2 = xn2 + yn2;
+            const float r4 = r2 * r2;
+            const float r6 = r4 * r2;
+
+            const float radial = 1.0f + k1 * r2 + k2 * r4 + k3 * r6;
+            const float dx = p1_2yn * xn + p2 * (r2 + 2.0f * xn2);
+            const float dy = p1 * (r2 + 2.0f * yn2) + p2_2 * xn * yn;
+
+            const float xd = xn * radial + dx;
+            const float yd = yn * radial + dy;
+
+            float src_x = xd * fx_src + cx_src;
+            float src_y = yd * fy_src + cy_src;
+
+            // Border replicate
+            if (src_x < 0.0f) src_x = 0.0f;
+            if (src_y < 0.0f) src_y = 0.0f;
+            if (src_x > max_x) src_x = max_x;
+            if (src_y > max_y) src_y = max_y;
+
+            size_t idx = (size_t)v * w + u;
+            base_x_q16[idx] = (int32_t)std::lround(src_x * q16_scale);
+            base_y_q16[idx] = (int32_t)std::lround(src_y * q16_scale);
+        }
+    }
+    printf("[INFO] Undistort base maps built (Q16.16, %dx%d, border-replicate).\r\n", w, h);
+}
 
 // ===================== Main =====================
 int main(int argc, char** argv) {
@@ -1559,61 +1982,92 @@ int main(int argc, char** argv) {
             printf("[FATAL] parameters.ini not found. Place it next to exe or pass argv[2].\n");
             return 1;
         }
-        if (!file_exists(imuIniPath)) {
-            printf("[FATAL] IMU ini not found. Place exe-name.ini or imu.ini next to exe, or pass argv[1].\n");
+        bool imuIniAvailable = file_exists(imuIniPath);
+
+        // Read parameters (unified file)
+        INIManager paramIni(paramsIniPath);
+
+        int modeVal = paramIni.ReadInteger(L"output", L"mode", MODE_EO_PANO_STAB);
+        OutputMode mode = (OutputMode)modeVal;
+
+        bool isEO = true;
+        bool isPanorama = true;
+        switch (mode) {
+        case MODE_EO_PANO_STAB:
+        case MODE_EO_PANO_NO_STAB:
+            isEO = true; isPanorama = true; break;
+        case MODE_IR_PANO_STAB:
+        case MODE_IR_PANO_NO_STAB:
+            isEO = false; isPanorama = true; break;
+        default:
+            if (mode >= MODE_EO_UNDIST_CAM1 && mode <= MODE_EO_UNDIST_CAM6) { isEO = true; isPanorama = false; break; }
+            if (mode >= MODE_IR_UNDIST_CAM1 && mode <= MODE_IR_UNDIST_CAM6) { isEO = false; isPanorama = false; break; }
+            if (mode == MODE_BLACKOUT || mode == MODE_STATUS) { isPanorama = true; isEO = true; break; }
+            break;
+        }
+
+        CameraConfig camCfg = loadCameraConfig(paramIni, isEO, exePath.parent_path());
+        applyCameraConfig(camCfg);
+
+        if (WIDTH > FIXED_INPUT_W) {
+            printf("[FATAL] WIDTH=%d exceeds FIXED_INPUT_W=%d\n", WIDTH, FIXED_INPUT_W);
+            return 1;
+        }
+        if (TARGET_W > FIXED_OUTPUT_W) {
+            printf("[FATAL] TARGET_W=%d exceeds FIXED_OUTPUT_W=%d\n", TARGET_W, FIXED_OUTPUT_W);
             return 1;
         }
 
-        // Read parameters
-        INIManager paramIni(paramsIniPath);
-        WIDTH = paramIni.ReadInteger(L"image", L"width", WIDTH);
-        HEIGHT = paramIni.ReadInteger(L"image", L"height", HEIGHT);
-        NUM_CAMS = paramIni.ReadInteger(L"image", L"num_cams", NUM_CAMS);
+        // IMU / stabilization - read from sensor-specific section for test data
+        // (In real-time operation, there's one IMU for both sensors, but test images were captured at different orientations)
+        auto clamp5 = [&](float v) { return v > 5.0f ? 5.0f : (v < -5.0f ? -5.0f : v); };
+        const wchar_t* orientSec = isEO ? L"eo_orientation" : L"ir_orientation";
+        
+        // Try sensor-specific section first, then fall back to legacy [Sensor_Orientation]
+        bool StabilizationIni = paramIni.ReadBoolean(orientSec, L"stabilization", 
+                                    paramIni.ReadBoolean(L"Sensor_Orientation", L"stabilization", true));
+        if (StabilizationIni) {
+            roll_Sensor = clamp5(paramIni.ReadFloat(orientSec, L"roll", 
+                                    paramIni.ReadFloat(L"Sensor_Orientation", L"roll", 0.0f)));
+            pitch_Sensor = clamp5(paramIni.ReadFloat(orientSec, L"pitch", 
+                                    paramIni.ReadFloat(L"Sensor_Orientation", L"pitch", 0.0f)));
+            yaw_Sensor = clamp5(paramIni.ReadFloat(orientSec, L"yaw", 
+                                    paramIni.ReadFloat(L"Sensor_Orientation", L"yaw", 0.0f)));
+        }
+        else {
+            roll_Sensor = pitch_Sensor = yaw_Sensor = 0.0f;
+        }
+        
+        printf("[ORIENTATION] Using %s: roll=%.2f pitch=%.2f yaw=%.2f stabilization=%s\n",
+               isEO ? "eo_orientation" : "ir_orientation",
+               roll_Sensor, pitch_Sensor, yaw_Sensor,
+               StabilizationIni ? "true" : "false");
 
-        fx = paramIni.ReadFloat(L"calibration", L"fx", fx);
-        fy = paramIni.ReadFloat(L"calibration", L"fy", fy);
-        float cx_ratio = paramIni.ReadFloat(L"calibration", L"cx_ratio", 0.5f);
-        float cy_ratio = paramIni.ReadFloat(L"calibration", L"cy_ratio", 0.5f);
-        cx = WIDTH * cx_ratio;
-        cy = HEIGHT * cy_ratio;
+        // Mode-based stabilization override
+        if (mode == MODE_EO_PANO_NO_STAB || mode == MODE_IR_PANO_NO_STAB || !isPanorama) {
+            roll_Sensor = pitch_Sensor = yaw_Sensor = 0.0f;
+            printf("[ORIENTATION] Stabilization disabled by mode\n");
+        }
 
-        fx_new = paramIni.ReadFloat(L"calibration", L"fx_dist", fx_new);
-        fy_new = paramIni.ReadFloat(L"calibration", L"fy_dist", fy_new);
-        cx_new = paramIni.ReadFloat(L"calibration", L"cx_dist", cx_new);
-        cy_new = paramIni.ReadFloat(L"calibration", L"cy_dist", cy_new);
-
-        K1 = paramIni.ReadFloat(L"calibration", L"k1", K1);
-        K2 = paramIni.ReadFloat(L"calibration", L"k2", K2);
-        K3 = paramIni.ReadFloat(L"calibration", L"k3", K3);
-        P1 = paramIni.ReadFloat(L"calibration", L"p1", P1);
-        P2 = paramIni.ReadFloat(L"calibration", L"p2", P2);
-
-        cylindrical_H_fov_deg = paramIni.ReadFloat(L"projection", L"cylindrical_H_fov_deg", cylindrical_H_fov_deg);
-        cylindrical_V_fov_deg = paramIni.ReadFloat(L"projection", L"cylindrical_V_fov_deg", cylindrical_V_fov_deg);
-
-        panorama_crop_height_scale = paramIni.ReadFloat(L"cropping", L"panorama_crop_height_scale", panorama_crop_height_scale);
-        panorama_crop_width_scale = paramIni.ReadFloat(L"cropping", L"panorama_crop_width_scale", panorama_crop_width_scale);
-
-        // IMPORTANT: your INI keys had trailing spaces in earlier code; V17 reads without trailing spaces.
-        resize_factor = paramIni.ReadFloat(L"resize", L"resize_factor", resize_factor);
-        PITCH_TO_TRANSLATION_FACTOR = paramIni.ReadFloat(L"transform", L"pitch_to_translation_factor", PITCH_TO_TRANSLATION_FACTOR);
-        YAW_TO_TRANSLATION_FACTOR = paramIni.ReadFloat(L"transform", L"yaw_to_translation_factor", YAW_TO_TRANSLATION_FACTOR);
-
-        overlap_px = paramIni.ReadInteger(L"blend", L"overlap_px", overlap_px);
-        float feather_strength = paramIni.ReadFloat(L"blend", L"feather_strength", 1.0f);
-
-        TARGET_W = paramIni.ReadInteger(L"output", L"target_w", TARGET_W);
-        TARGET_H = paramIni.ReadInteger(L"output", L"target_h", TARGET_H);
-
-        // IMU ini
-        INIManager imuIni(imuIniPath);
+        // IMU ini (for compatibility: images/offset fallback)
+        std::unique_ptr<INIManager> imuIniPtr;
+        if (imuIniAvailable) {
+            imuIniPtr = std::make_unique<INIManager>(imuIniPath);
+        }
 
         // Input files
         std::vector<std::string> filenames; filenames.reserve(NUM_CAMS);
         for (int i = 0; i < NUM_CAMS; ++i) {
-            std::wstring key = L"file_" + std::to_wstring(i);
-            std::string p = WStringToUtf8(imuIni.ReadString(L"images", key, L""));
-            p = make_abs_if_relative(p, exePath.parent_path());
+            std::string p = (i < (int)camCfg.filenames.size()) ? camCfg.filenames[i] : "";
+            if (p.empty() && imuIniPtr) {
+                std::wstring key = L"file_" + std::to_wstring(i);
+                p = WStringToUtf8(imuIniPtr->ReadString(L"images", key, L""));
+                p = make_abs_if_relative(p, exePath.parent_path());
+            }
+            if (p.empty()) {
+                printf("[FATAL] file_%d missing in unified ini and no IMU ini fallback.\n", i);
+                return 1;
+            }
             filenames.push_back(p);
         }
 
@@ -1629,22 +2083,14 @@ int main(int argc, char** argv) {
             }
         }
 
-        std::vector<float> yaw_off = imuIni.ReadFloatArray(L"offset", L"yaw");
-        std::vector<float> pit_off = imuIni.ReadFloatArray(L"offset", L"pitch");
-        std::vector<float> rol_off = imuIni.ReadFloatArray(L"offset", L"roll");
+        std::vector<float> yaw_off = camCfg.yaw_off;
+        std::vector<float> pit_off = camCfg.pitch_off;
+        std::vector<float> rol_off = camCfg.roll_off;
+        if (yaw_off.empty() && imuIniPtr) yaw_off = imuIniPtr->ReadFloatArray(L"offset", L"yaw");
+        if (pit_off.empty() && imuIniPtr) pit_off = imuIniPtr->ReadFloatArray(L"offset", L"pitch");
+        if (rol_off.empty() && imuIniPtr) rol_off = imuIniPtr->ReadFloatArray(L"offset", L"roll");
 
-        auto clamp5 = [&](float v) { return v > 5.0f ? 5.0f : (v < -5.0f ? -5.0f : v); };
-        bool StabilizationIni = imuIni.ReadBoolean(L"Sensor_Orientation", L"stabilization", true);
-        if (StabilizationIni) {
-            roll_Sensor = clamp5(imuIni.ReadFloat(L"Sensor_Orientation", L"roll", 0.0f));
-            pitch_Sensor = clamp5(imuIni.ReadFloat(L"Sensor_Orientation", L"pitch", 0.0f));
-            yaw_Sensor = clamp5(imuIni.ReadFloat(L"Sensor_Orientation", L"yaw", 0.0f));
-        }
-        else {
-            roll_Sensor = pitch_Sensor = yaw_Sensor = 0.0f;
-        }
-
-        logln("........Processing (MT-V17 FPGA Model: ON-FLY y0 buckets (parallel) + RowWindow + 2-Line Cache + DDR Slice PingPong)........");
+        logln("........Processing (MT-V19 FPGA Model: ON-FLY y0 buckets (parallel) + RowWindow + 2-Line Cache + DDR Slice PingPong)........");
 
         // Geometry in resized space
         const int resized_w = (int)std::lround(WIDTH * resize_factor);
@@ -1654,23 +2100,25 @@ int main(int argc, char** argv) {
         const int crop_x0 = (resized_w - crop_w) / 2;
         const int crop_y0 = (resized_h - crop_h) / 2;
 
+        std::wstring mapPrefix = sensor_prefix(isEO);
+
         // Maps (ONCE)
         std::vector<int16_t> cyl_x_q, cyl_y_q;
-        try { loadCylMapsQ(cyl_x_q, cyl_y_q, resized_w, resized_h, exePath); }
-        catch (...) { generateCylMapsQ(cyl_x_q, cyl_y_q, resized_w, resized_h, cylindrical_H_fov_deg, cylindrical_V_fov_deg, 0.0f, exePath); }
+        try { loadCylMapsQ(cyl_x_q, cyl_y_q, resized_w, resized_h, exePath, mapPrefix); }
+        catch (...) { generateCylMapsQ(cyl_x_q, cyl_y_q, resized_w, resized_h, cylindrical_H_fov_deg, cylindrical_V_fov_deg, 0.0f, exePath, mapPrefix); }
 
         std::vector<int16_t> und_x_q, und_y_q;
-        if (!loadUndistForwardMapsQ(und_x_q, und_y_q, resized_w, resized_h, exePath)) {
+        if (!loadUndistForwardMapsQ(und_x_q, und_y_q, resized_w, resized_h, exePath, mapPrefix)) {
             generateUndistForwardMapsQ(und_x_q, und_y_q, resized_w, resized_h,
                 fx, fy, cx, cy, fx_new, fy_new, cx_new, cy_new,
                 K1, K2, K3, P1, P2, resize_factor);
-            saveUndistForwardMapsQ(und_x_q, und_y_q, exePath);
+            saveUndistForwardMapsQ(und_x_q, und_y_q, exePath, mapPrefix);
         }
 
         std::vector<int16_t> comp_x_q, comp_y_q;
-        if (!loadComposedMapsQ(comp_x_q, comp_y_q, resized_w, resized_h, exePath)) {
+        if (!loadComposedMapsQ(comp_x_q, comp_y_q, resized_w, resized_h, exePath, mapPrefix)) {
             composeCylWithUndistQ(cyl_x_q, cyl_y_q, und_x_q, und_y_q, resized_w, resized_h, comp_x_q, comp_y_q);
-            saveComposedMapsQ(comp_x_q, comp_y_q, exePath);
+            saveComposedMapsQ(comp_x_q, comp_y_q, exePath, mapPrefix);
         }
 
         // Load all camera frames and convert to YUV422 once (KEEP contiguous buffers; no cam_scan vectors)
@@ -1692,6 +2140,407 @@ int main(int argc, char** argv) {
             }
         }
 
+        // Individual (undistorted) modes - uses the SAME panorama HW pipeline:
+        //   LineCache (2-line BRAM) → RowRun schedule → RowWindow → PanoSlicePingPong → DDR
+        // Differences from panorama: numCams=1, no cylindrical, no feather blend, output=WIDTHxHEIGHT
+        if (!isPanorama) {
+            int camIdx = -1;
+            bool camEO = isEO;
+            if (mode >= MODE_EO_UNDIST_CAM1 && mode <= MODE_EO_UNDIST_CAM6) {
+                camIdx = mode - MODE_EO_UNDIST_CAM1;
+                camEO = true;
+            }
+            else if (mode >= MODE_IR_UNDIST_CAM1 && mode <= MODE_IR_UNDIST_CAM6) {
+                camIdx = mode - MODE_IR_UNDIST_CAM1;
+                camEO = false;
+            }
+
+            if (camIdx < 0 || camIdx >= NUM_CAMS) {
+                printf("[FATAL] Unsupported individual mode 0x%02X\n", modeVal);
+                for (auto* fimg : framesYUV) freeYUV422ImageHeap(fimg);
+                return 1;
+            }
+
+            std::wstring captureDirW = CAPTURE_DIR_W;
+            CreateDirectoryW(captureDirW.c_str(), NULL);
+
+            // ---- Build undistort base maps (same format as panorama base_x_q16/base_y_q16) ----
+            // For undistortion: per_cam_w = {WIDTH}, per_cam_h = HEIGHT, numCams = 1
+            // No crop, no resize, no cylindrical — just the undistortion forward map.
+            const int und_num_cams = 1;
+            const int und_per_cam_w = WIDTH;
+            const int und_per_cam_h = HEIGHT;
+            const int und_per_cam_w_max = WIDTH;
+
+            std::vector<int32_t> und_base_x_q16, und_base_y_q16;
+            buildUndistBaseMapsOriginal(
+                WIDTH, HEIGHT,
+                fx, fy, cx, cy,
+                fx_new, fy_new, cx_new, cy_new,
+                K1, K2, K3, P1, P2,
+                und_base_x_q16, und_base_y_q16);
+
+            // ---- Precompute spans and reverse index (same as panorama) ----
+            const int32_t und_cx_q = (int32_t)((WIDTH / 2.0f) * (1 << WFIX_SHIFT));
+            const int32_t und_cy_q = (int32_t)((HEIGHT / 2.0f) * (1 << WFIX_SHIFT));
+            const int32_t und_max_x_q = (int32_t)((WIDTH - 2) << WFIX_SHIFT);
+            const int32_t und_max_y_q = (int32_t)((HEIGHT - 2) << WFIX_SHIFT);
+
+            // No stabilization for undistort: identity rotation, no y-shift
+            std::vector<int32_t> und_y_shift_q_cam(und_num_cams, 0);
+            std::vector<int16_t> und_c15_cam(und_num_cams, 32767); // cos(0) = 1.0 in Q1.15
+            std::vector<int16_t> und_s15_cam(und_num_cams, 0);     // sin(0) = 0
+            std::vector<int> und_per_cam_w_vec = { und_per_cam_w };
+
+            std::vector<std::vector<int16_t>> und_spanMin_cam_sy, und_spanMax_cam_sy;
+            std::vector<int> und_maxY0Bound_sy;
+            std::vector<Y0SyIndex> und_y0_to_sy_cam;
+
+            precompute_spans_and_bounds(
+                und_per_cam_h, und_per_cam_w_max,
+                und_base_x_q16, und_base_y_q16,
+                und_per_cam_w_vec,
+                und_y_shift_q_cam, und_c15_cam, und_s15_cam,
+                und_cx_q, und_cy_q, und_max_x_q, und_max_y_q,
+                und_spanMin_cam_sy, und_spanMax_cam_sy,
+                und_maxY0Bound_sy, und_y0_to_sy_cam);
+
+            RoiRect und_roi = compute_undistort_roi(
+                WIDTH, HEIGHT,
+                fx, fy, cx, cy,
+                fx_new, fy_new, cx_new, cy_new,
+                K1, K2, K3, P1, P2);
+
+            printf("[UNDIST ROI] x0=%d y0=%d w=%d h=%d\n", und_roi.x0, und_roi.y0, und_roi.w, und_roi.h);
+
+            // ---- Allocate panorama HW structures ----
+            // RowWindow: 1 camera, per_cam_h = HEIGHT destination rows
+            RowWindow und_rowWindow;
+            und_rowWindow.init(und_num_cams, und_per_cam_h, und_per_cam_w_vec);
+
+            const int und_out_w = und_roi.w;
+            const int und_out_h = und_roi.h;
+
+            // PanoSlicePingPong: output is cropped to valid ROI
+            PanoSlicePingPong und_panoOut;
+            und_panoOut.init(und_out_w, und_out_h, PING_PONG_PUSH_BUFFER);
+            und_panoOut.clear_active();
+
+            // Worker thread (1 camera) + barrier
+            SimpleBarrier und_barrier(und_num_cams + 1); // 1 worker + 1 main
+            std::atomic<bool> und_shutdownFlag(false);
+            std::atomic<int> und_current_y0(0);
+            std::atomic<size_t> und_peakScheduleBytes(0);
+            std::atomic<uint64_t> und_cache_ok(0), und_cache_violation(0);
+
+            const bool und_use_nn = camCfg.use_nearest_neighbor;
+
+            std::thread und_worker([&]() {
+                LineCache cache;
+                std::vector<RowRun> localRuns;
+                size_t localPeakBytes = 0;
+
+                while (true) {
+                    und_barrier.wait(); // start y0
+
+                    if (und_shutdownFlag.load(std::memory_order_acquire)) {
+                        und_barrier.wait();
+                        break;
+                    }
+
+                    int y0 = und_current_y0.load(std::memory_order_relaxed);
+                    if (y0 < 0 || y0 >= HEIGHT - 1) {
+                        und_barrier.wait();
+                        continue;
+                    }
+
+                    // 1) Build schedule (same as panorama worker)
+                    build_runs_for_y0_on_the_fly_rowptr(
+                        y0,
+                        und_per_cam_w,
+                        und_per_cam_h,
+                        und_per_cam_w_max,
+                        und_base_x_q16, und_base_y_q16,
+                        und_cx_q, und_cy_q, und_max_x_q, und_max_y_q,
+                        und_y_shift_q_cam[0],
+                        und_c15_cam[0], und_s15_cam[0],
+                        und_spanMin_cam_sy[0], und_spanMax_cam_sy[0],
+                        und_y0_to_sy_cam[0],
+                        localRuns,
+                        localPeakBytes);
+
+                    {
+                        size_t cur = und_peakScheduleBytes.load(std::memory_order_relaxed);
+                        while (localPeakBytes > cur &&
+                            !und_peakScheduleBytes.compare_exchange_weak(cur, localPeakBytes, std::memory_order_relaxed)) {}
+                    }
+
+                    // 2) Render: load 2-line strip into LineCache, scatter into RowWindow
+                    StageTimer _r(ST_RENDER);
+
+                    const unsigned char* Y0 = framesYUV[camIdx]->Y + (size_t)y0 * (size_t)WIDTH;
+                    const unsigned char* U0 = framesYUV[camIdx]->U + (size_t)y0 * (size_t)(WIDTH / 2);
+                    const unsigned char* V0 = framesYUV[camIdx]->V + (size_t)y0 * (size_t)(WIDTH / 2);
+                    const unsigned char* Y1 = framesYUV[camIdx]->Y + (size_t)(y0 + 1) * (size_t)WIDTH;
+                    const unsigned char* U1 = framesYUV[camIdx]->U + (size_t)(y0 + 1) * (size_t)(WIDTH / 2);
+                    const unsigned char* V1 = framesYUV[camIdx]->V + (size_t)(y0 + 1) * (size_t)(WIDTH / 2);
+
+                    cache.loadRowPtr(0, Y0, U0, V0, y0);
+                    cache.loadRowPtr(1, Y1, U1, V1, y0 + 1);
+
+                    const int cwCam = und_per_cam_w / 2;
+                    uint64_t okLocal = 0, vioLocal = 0;
+
+                    for (const RowRun& r : localRuns) {
+                        if (r.sy >= (uint16_t)und_per_cam_h) continue;
+
+                        int slot = und_rowWindow.allocate_slot_for_sy((int)r.sy);
+                        if (slot < 0) continue;
+
+                        unsigned char* dstY = und_rowWindow.rowY(slot);
+                        unsigned char* dstU = und_rowWindow.rowU(slot);
+                        unsigned char* dstV = und_rowWindow.rowV(slot);
+
+                        int32_t ax0 = r.ax0_q16;
+                        int32_t ay0 = r.ay0_q16;
+                        int32_t dax = ((int32_t)r.dax_q12_4) << DRUN_TO_Q16;
+                        int32_t day = ((int32_t)r.day_q12_4) << DRUN_TO_Q16;
+
+                        int ox0 = (int)r.ox0;
+                        int len = (int)r.len;
+                        if (ox0 < 0 || ox0 >= und_per_cam_w) continue;
+                        if (len <= 0) continue;
+                        if (ox0 + len > und_per_cam_w) len = und_per_cam_w - ox0;
+
+                        for (int i = 0; i < len; ++i) {
+                            int ox = ox0 + i;
+
+                            int32_t ax_q = ax0 + (int32_t)((int64_t)i * dax);
+                            int32_t ay_q = ay0 + (int32_t)((int64_t)i * day);
+
+                            int y_chk = (ay_q >> WFIX_SHIFT);
+                            if (y_chk != y0) { vioLocal++; continue; }
+                            okLocal++;
+
+                            int x0 = (ax_q >> WFIX_SHIFT);
+                            if ((unsigned)x0 >= (unsigned)(WIDTH - 1)) continue;
+
+                            if (und_use_nn) {
+                                dstY[ox] = cache.Y[0].data()[x0];
+                            } else {
+                                uint32_t wx = (uint32_t)(ax_q & 0xFFFF);
+                                uint32_t wy = (uint32_t)(ay_q & 0xFFFF);
+                                uint32_t W_x0 = 65536u - wx;
+                                uint32_t W_y0 = 65536u - wy;
+                                uint32_t W_y1 = wy;
+
+                                uint32_t W00 = (uint32_t)(((uint64_t)W_x0 * W_y0) >> 16);
+                                uint32_t W10 = (uint32_t)(((uint64_t)wx * W_y0) >> 16);
+                                uint32_t W01 = (uint32_t)(((uint64_t)W_x0 * W_y1) >> 16);
+                                uint32_t W11 = (uint32_t)(((uint64_t)wx * W_y1) >> 16);
+
+                                const unsigned char* p0Y = cache.Y[0].data() + x0;
+                                const unsigned char* p1Y = cache.Y[1].data() + x0;
+                                dstY[ox] = sat_u8((int)((p0Y[0] * W00 + p0Y[1] * W10 + p1Y[0] * W01 + p1Y[1] * W11) >> 16));
+                            }
+
+                            int32_t ax_ch_q = ax_q >> 1;
+                            int xch0 = (ax_ch_q >> WFIX_SHIFT);
+                            if ((unsigned)xch0 >= (unsigned)((WIDTH / 2) - 1)) continue;
+
+                            int cidx = ox >> 1;
+                            if ((unsigned)cidx < (unsigned)cwCam) {
+                                if (und_use_nn) {
+                                    dstU[cidx] = cache.U[0].data()[xch0];
+                                    dstV[cidx] = cache.V[0].data()[xch0];
+                                } else {
+                                    uint32_t wx_ch = (uint32_t)(ax_ch_q & 0xFFFF);
+                                    uint32_t wy = (uint32_t)(ay_q & 0xFFFF);
+                                    uint32_t Wcx0 = 65536u - wx_ch;
+                                    uint32_t W_y0 = 65536u - wy;
+                                    uint32_t W_y1 = wy;
+
+                                    uint32_t Wc00 = (uint32_t)(((uint64_t)Wcx0 * W_y0) >> 16);
+                                    uint32_t Wc10 = (uint32_t)(((uint64_t)wx_ch * W_y0) >> 16);
+                                    uint32_t Wc01 = (uint32_t)(((uint64_t)Wcx0 * W_y1) >> 16);
+                                    uint32_t Wc11 = (uint32_t)(((uint64_t)wx_ch * W_y1) >> 16);
+
+                                    const unsigned char* p0U = cache.U[0].data() + xch0;
+                                    const unsigned char* p1U = cache.U[1].data() + xch0;
+                                    const unsigned char* p0V = cache.V[0].data() + xch0;
+                                    const unsigned char* p1V = cache.V[1].data() + xch0;
+
+                                    dstU[cidx] = sat_u8((int)((p0U[0] * Wc00 + p0U[1] * Wc10 + p1U[0] * Wc01 + p1U[1] * Wc11) >> 16));
+                                    dstV[cidx] = sat_u8((int)((p0V[0] * Wc00 + p0V[1] * Wc10 + p1V[0] * Wc01 + p1V[1] * Wc11) >> 16));
+                                }
+                            }
+                        }
+                    }
+
+                    und_cache_ok.fetch_add(okLocal, std::memory_order_relaxed);
+                    und_cache_violation.fetch_add(vioLocal, std::memory_order_relaxed);
+
+                    und_barrier.wait(); // end y0
+                }
+            });
+
+            printf("\n===== UNDISTORT: PANORAMA HW PIPELINE (1 cam, %d frames) =====\n", NUM_FRAMES);
+
+            std::vector<double> frame_ms(NUM_FRAMES, 0.0);
+            auto total_t0 = std::chrono::high_resolution_clock::now();
+
+            for (int f = 0; f < NUM_FRAMES; ++f) {
+                reset_stats();
+                und_cache_ok.store(0);
+                und_cache_violation.store(0);
+                und_peakScheduleBytes.store(0);
+
+                und_rowWindow.reset_mappings();
+
+                // Clear DDR output (same as panorama)
+                std::fill(und_panoOut.ddrY.begin(), und_panoOut.ddrY.end(), (unsigned char)0);
+                std::fill(und_panoOut.ddrU.begin(), und_panoOut.ddrU.end(), (unsigned char)128);
+                std::fill(und_panoOut.ddrV.begin(), und_panoOut.ddrV.end(), (unsigned char)128);
+                MEM_WRITE((uint64_t)und_panoOut.ddrY.size() + (uint64_t)und_panoOut.ddrU.size() + (uint64_t)und_panoOut.ddrV.size());
+
+                und_panoOut.active = 0;
+                und_panoOut.started = false;
+                und_panoOut.base_py = -1;
+                und_panoOut.fill = 0;
+                und_panoOut.clear_active();
+
+                auto frame_t0 = std::chrono::high_resolution_clock::now();
+
+                // Streaming emit (same as panorama main loop)
+                std::vector<unsigned char> row_ready((size_t)und_per_cam_h, 0);
+                int sy_out = 0;
+
+                for (int y0 = 0; y0 < HEIGHT - 1; ++y0) {
+                    und_current_y0.store(y0, std::memory_order_relaxed);
+                    und_barrier.wait(); // start worker
+                    und_barrier.wait(); // wait done
+
+                    // Mark destination rows whose last source dependency is this y0
+                    for (int sy = 0; sy < und_per_cam_h; ++sy) {
+                        if (und_maxY0Bound_sy[sy] == y0) row_ready[sy] = 1;
+                    }
+
+                    // Emit completed rows: RowWindow → PanoSlicePingPong → DDR
+                    // For undistort: 1 camera, no blend, direct copy from RowWindow cam 0
+                    while (sy_out < und_per_cam_h && row_ready[sy_out]) {
+                        if (sy_out < und_roi.y0 || sy_out >= und_roi.y0 + und_out_h) {
+                            und_rowWindow.free_sy(sy_out);
+                            row_ready[sy_out] = 0;
+                            sy_out++;
+                            continue;
+                        }
+
+                        int py = sy_out - und_roi.y0;
+                        unsigned char* dstY = nullptr;
+                        unsigned char* dstU = nullptr;
+                        unsigned char* dstV = nullptr;
+
+                        if (und_panoOut.begin_row(py, dstY, dstU, dstV)) {
+                            int slot = und_rowWindow.sy_to_slot[sy_out];
+                            if (slot >= 0) {
+                                StageTimer _b(ST_BLEND);
+                                const unsigned char* srcY = und_rowWindow.rowY(slot) + und_roi.x0;
+                                const unsigned char* srcU = und_rowWindow.rowU(slot) + (und_roi.x0 / 2);
+                                const unsigned char* srcV = und_rowWindow.rowV(slot) + (und_roi.x0 / 2);
+                                memcpy(dstY, srcY, (size_t)und_out_w);
+                                memcpy(dstU, srcU, (size_t)(und_out_w / 2));
+                                memcpy(dstV, srcV, (size_t)(und_out_w / 2));
+                                MEM_READ((uint64_t)und_out_w + 2ull * (uint64_t)(und_out_w / 2));
+                                MEM_WRITE((uint64_t)und_out_w + 2ull * (uint64_t)(und_out_w / 2));
+                            } else {
+                                // Row not filled — stays at clear values (Y=0, U/V=128)
+                            }
+                            und_panoOut.end_row();
+                        }
+
+                        und_rowWindow.free_sy(sy_out);
+                        row_ready[sy_out] = 0;
+                        sy_out++;
+                    }
+                }
+
+                // Emit remaining rows
+                for (int sy = sy_out; sy < und_per_cam_h; ++sy) {
+                    if (sy < und_roi.y0 || sy >= und_roi.y0 + und_out_h) {
+                        und_rowWindow.free_sy(sy);
+                        continue;
+                    }
+
+                    int py = sy - und_roi.y0;
+                    unsigned char* dstY = nullptr;
+                    unsigned char* dstU = nullptr;
+                    unsigned char* dstV = nullptr;
+
+                    if (und_panoOut.begin_row(py, dstY, dstU, dstV)) {
+                        int slot = und_rowWindow.sy_to_slot[sy];
+                        if (slot >= 0) {
+                            StageTimer _b(ST_BLEND);
+                            memcpy(dstY, und_rowWindow.rowY(slot) + und_roi.x0, (size_t)und_out_w);
+                            memcpy(dstU, und_rowWindow.rowU(slot) + (und_roi.x0 / 2), (size_t)(und_out_w / 2));
+                            memcpy(dstV, und_rowWindow.rowV(slot) + (und_roi.x0 / 2), (size_t)(und_out_w / 2));
+                            MEM_READ((uint64_t)und_out_w + 2ull * (uint64_t)(und_out_w / 2));
+                            MEM_WRITE((uint64_t)und_out_w + 2ull * (uint64_t)(und_out_w / 2));
+                        }
+                        und_panoOut.end_row();
+                    }
+                    und_rowWindow.free_sy(sy);
+                }
+
+                und_panoOut.finalize();
+
+                auto frame_t1 = std::chrono::high_resolution_clock::now();
+                double ms = std::chrono::duration<double, std::milli>(frame_t1 - frame_t0).count();
+                frame_ms[f] = ms;
+
+                // Save from DDR (same as panorama)
+                if (SAVE_EVERY_K > 0 && ((f + 1) % SAVE_EVERY_K == 0)) {
+                    YUV422Image undDDR{};
+                    undDDR.width = und_out_w;
+                    undDDR.height = und_out_h;
+                    undDDR.Y = und_panoOut.ddrY.data();
+                    undDDR.U = und_panoOut.ddrU.data();
+                    undDDR.V = und_panoOut.ddrV.data();
+
+                    std::wstring prefW = (camEO ? L"undist_eo_cam" : L"undist_ir_cam") + std::to_wstring(camIdx + 1);
+                    std::string bmpPath = SaveImageFilePath(captureDirW, prefW, f);
+                    Image* undBGR = yuv422ToBGR(&undDDR);
+                    if (undBGR) { writeBMP(bmpPath.c_str(), undBGR); printf("[Saved BMP] %s\n", bmpPath.c_str()); freeImage(undBGR); }
+                }
+            }
+
+            auto total_t1 = std::chrono::high_resolution_clock::now();
+            double total_ms = std::chrono::duration<double, std::milli>(total_t1 - total_t0).count();
+            double sum_ms = 0.0;
+            for (int i = 0; i < NUM_FRAMES; ++i) sum_ms += frame_ms[i];
+            double avg_ms = (NUM_FRAMES > 0) ? sum_ms / NUM_FRAMES : 0.0;
+            double throughput_fps = 1000.0 * NUM_FRAMES / total_ms;
+            double latency_fps = avg_ms > 0.0 ? 1000.0 / avg_ms : 0.0;
+
+            // Shutdown worker
+            und_shutdownFlag.store(true, std::memory_order_release);
+            und_current_y0.store(0, std::memory_order_relaxed);
+            und_barrier.wait();
+            und_barrier.wait();
+            if (und_worker.joinable()) und_worker.join();
+
+            // Memory report (same format as panorama)
+            size_t undPeakSched = und_peakScheduleBytes.load(std::memory_order_relaxed);
+            print_internal_memory_report_v17(und_num_cams, WIDTH, WIDTH, HEIGHT, und_per_cam_w_vec, undPeakSched, ACTIVE_BUFFER, PING_PONG_PUSH_BUFFER);
+
+            printf("\n===== MULTI-FRAME SUMMARY (UNDISTORT) =====\n");
+            printf("Frames: %d\n", NUM_FRAMES);
+            printf("Avg latency per frame: %.3f ms (%.2f FPS)\n", avg_ms, latency_fps);
+            printf("Total time: %.3f ms (Throughput %.2f FPS)\n", total_ms, throughput_fps);
+
+            for (auto* fimg : framesYUV) freeYUV422ImageHeap(fimg);
+            return 0;
+        }
+
         // Per-camera target widths
         const int overlap_resized = (int)std::lround(overlap_px * resize_factor);
         const int pano_w_crop = NUM_CAMS * crop_w - (NUM_CAMS - 1) * overlap_resized;
@@ -1711,10 +2560,13 @@ int main(int argc, char** argv) {
         int per_cam_w_max = 0;
         for (int w : per_cam_w) per_cam_w_max = std::max(per_cam_w_max, w);
 
-        // Base maps (original coords) ONCE
+        // Base maps (original coords): load if present, else build and save
         std::vector<int32_t> base_x_q16, base_y_q16;
-        buildBaseMapsOriginal(comp_x_q, comp_y_q, resized_w, resized_h, crop_x0, crop_y0, crop_w, crop_h,
-            per_cam_w_max, resize_factor, base_x_q16, base_y_q16);
+        if (!loadBaseMapsQ16(base_x_q16, base_y_q16, per_cam_w_max, crop_h, exePath, mapPrefix)) {
+            buildBaseMapsOriginal(comp_x_q, comp_y_q, resized_w, resized_h, crop_x0, crop_y0, crop_w, crop_h,
+                per_cam_w_max, resize_factor, base_x_q16, base_y_q16);
+            saveBaseMapsQ16(base_x_q16, base_y_q16, exePath, mapPrefix);
+        }
 
         // Feather alpha
         const int cw_out = TARGET_W / 2;
@@ -1747,7 +2599,9 @@ int main(int argc, char** argv) {
         std::wstring captureDirW = CAPTURE_DIR_W;
         CreateDirectoryW(captureDirW.c_str(), NULL);
 
-        // Row window
+        // Row window (fixed size for FPGA - sized for worst case)
+        printf("[CONFIG] Using fixed ACTIVE_BUFFER=%d (FPGA constraint), PING_PONG_PUSH_BUFFER=%d\n", ACTIVE_BUFFER, PING_PONG_PUSH_BUFFER);
+
         RowWindow rowWindow;
         rowWindow.init(NUM_CAMS, per_cam_h, per_cam_w);
 
@@ -1755,14 +2609,30 @@ int main(int argc, char** argv) {
         SimpleBarrier rowBarrier(NUM_CAMS + 1);
         std::atomic<bool> shutdownFlag(false);
         std::atomic<int> current_y0(0);
+        std::atomic<int> render_cam_turn(0);
+
+        // Interpolation mode (shared)
+        const bool use_nn_interp = camCfg.use_nearest_neighbor;
 
         // Shared per-frame cam params (read-only during y0 loop)
         std::vector<int32_t> y_shift_q_cam(NUM_CAMS, 0);
         std::vector<int16_t> c15_cam(NUM_CAMS, 0);
         std::vector<int16_t> s15_cam(NUM_CAMS, 0);
 
+        std::vector<int> cam_x0(NUM_CAMS, 0);
+        std::vector<int> cam_x0_c(NUM_CAMS, 0);
+        for (int cam = 1; cam < NUM_CAMS; ++cam) {
+            cam_x0[cam] = cam_x0[cam - 1] + per_cam_w[cam - 1] - overlap_target;
+        }
+        for (int cam = 0; cam < NUM_CAMS; ++cam) {
+            cam_x0_c[cam] = cam_x0[cam] / 2;
+        }
+
         // Shared spans per frame
         std::vector<std::vector<int16_t>> spanMin_cam_sy, spanMax_cam_sy;
+
+        // Reverse index: y0 -> sy rows (per cam, flat-encoded)
+        std::vector<Y0SyIndex> y0_to_sy_cam;
 
         // Cache hit counters
         std::atomic<uint64_t> cache_ok(0), cache_violation(0);
@@ -1811,6 +2681,7 @@ int main(int argc, char** argv) {
                         y_shift_q_cam[cam],
                         c15_cam[cam], s15_cam[cam],
                         spanMin_cam_sy[cam], spanMax_cam_sy[cam],
+                        y0_to_sy_cam[cam],
                         localRuns,
                         localPeakBytes
                     );
@@ -1824,8 +2695,12 @@ int main(int argc, char** argv) {
                         }
                     }
 
-                    // 2) Render using 2-line cache
+                    // 2) Render using 2-line cache (cam-ordered into shared RowWindow)
                     StageTimer _r(ST_RENDER);
+
+                    while (render_cam_turn.load(std::memory_order_acquire) != cam) {
+                        std::this_thread::yield();
+                    }
 
                     const unsigned char* Y0 = framesYUV[cam]->Y + (size_t)y0 * (size_t)WIDTH;
                     const unsigned char* U0 = framesYUV[cam]->U + (size_t)y0 * (size_t)(WIDTH / 2);
@@ -1850,9 +2725,9 @@ int main(int argc, char** argv) {
                         int slot = rowWindow.allocate_slot_for_sy((int)r.sy);
                         if (slot < 0) continue; // bounded buffer: drop
 
-                        unsigned char* dstY = rowWindow.rowY(cam, slot);
-                        unsigned char* dstU = rowWindow.rowU(cam, slot);
-                        unsigned char* dstV = rowWindow.rowV(cam, slot);
+                        unsigned char* dstY = rowWindow.rowY(slot);
+                        unsigned char* dstU = rowWindow.rowU(slot);
+                        unsigned char* dstV = rowWindow.rowV(slot);
 
                         int32_t ax0 = r.ax0_q16;
                         int32_t ay0 = r.ay0_q16;
@@ -1878,54 +2753,100 @@ int main(int argc, char** argv) {
                             int x0 = (ax_q >> WFIX_SHIFT);
                             if ((unsigned)x0 >= (unsigned)(WIDTH - 1)) continue;
 
-                            uint32_t wx = (uint32_t)(ax_q & 0xFFFF);
-                            uint32_t wy = (uint32_t)(ay_q & 0xFFFF);
+                            int dst_x = cam_x0[cam] + ox;
+                            if ((unsigned)dst_x >= (unsigned)TARGET_W) continue;
 
-                            uint32_t W_x0 = 65536u - wx;
-                            uint32_t W_x1 = wx;
-                            uint32_t W_y0 = 65536u - wy;
-                            uint32_t W_y1 = wy;
+                            unsigned char y_val = 0;
+                            if (use_nn_interp) {
+                                const unsigned char* p0Y = cache.Y[0].data() + x0;
+                                y_val = p0Y[0];
+                            } else {
+                                uint32_t wx = (uint32_t)(ax_q & 0xFFFF);
+                                uint32_t wy = (uint32_t)(ay_q & 0xFFFF);
 
-                            uint32_t W00 = (uint32_t)(((uint64_t)W_x0 * W_y0) >> 16);
-                            uint32_t W10 = (uint32_t)(((uint64_t)W_x1 * W_y0) >> 16);
-                            uint32_t W01 = (uint32_t)(((uint64_t)W_x0 * W_y1) >> 16);
-                            uint32_t W11 = (uint32_t)(((uint64_t)W_x1 * W_y1) >> 16);
+                                uint32_t W_x0 = 65536u - wx;
+                                uint32_t W_x1 = wx;
+                                uint32_t W_y0 = 65536u - wy;
+                                uint32_t W_y1 = wy;
 
-                            const unsigned char* p0Y = cache.Y[0].data() + x0;
-                            const unsigned char* p2Y = cache.Y[1].data() + x0;
+                                uint32_t W00 = (uint32_t)(((uint64_t)W_x0 * W_y0) >> 16);
+                                uint32_t W10 = (uint32_t)(((uint64_t)W_x1 * W_y0) >> 16);
+                                uint32_t W01 = (uint32_t)(((uint64_t)W_x0 * W_y1) >> 16);
+                                uint32_t W11 = (uint32_t)(((uint64_t)W_x1 * W_y1) >> 16);
 
-                            int Y_val = (int)((p0Y[0] * W00 + p0Y[1] * W10 + p2Y[0] * W01 + p2Y[1] * W11) >> 16);
-                            dstY[ox] = sat_u8(Y_val);
+                                const unsigned char* p0Y = cache.Y[0].data() + x0;
+                                const unsigned char* p2Y = cache.Y[1].data() + x0;
+
+                                int Y_val = (int)((p0Y[0] * W00 + p0Y[1] * W10 + p2Y[0] * W01 + p2Y[1] * W11) >> 16);
+                                y_val = sat_u8(Y_val);
+                            }
+
+                            if (cam == 0 || ox >= overlap_target) {
+                                dstY[dst_x] = y_val;
+                            } else {
+                                unsigned a = alphaY[std::min(ox, (int)alphaY.size() - 1)];
+                                unsigned prev = dstY[dst_x];
+                                dstY[dst_x] = (unsigned char)((prev * (65536u - a) + y_val * a) >> 16);
+                            }
 
                             int32_t ax_ch_q = ax_q >> 1;
                             int xch0 = (ax_ch_q >> WFIX_SHIFT);
                             if ((unsigned)xch0 >= (unsigned)((WIDTH / 2) - 1)) continue;
 
-                            uint32_t wx_ch = (uint32_t)(ax_ch_q & 0xFFFF);
-                            uint32_t Wcx0 = 65536u - wx_ch;
-                            uint32_t Wcx1 = wx_ch;
-
-                            uint32_t Wc00 = (uint32_t)(((uint64_t)Wcx0 * W_y0) >> 16);
-                            uint32_t Wc10 = (uint32_t)(((uint64_t)Wcx1 * W_y0) >> 16);
-                            uint32_t Wc01 = (uint32_t)(((uint64_t)Wcx0 * W_y1) >> 16);
-                            uint32_t Wc11 = (uint32_t)(((uint64_t)Wcx1 * W_y1) >> 16);
-
-                            const unsigned char* p0U = cache.U[0].data() + xch0;
-                            const unsigned char* p2U = cache.U[1].data() + xch0;
-
-                            const unsigned char* p0V = cache.V[0].data() + xch0;
-                            const unsigned char* p2V = cache.V[1].data() + xch0;
-
-                            int U_val = (int)((p0U[0] * Wc00 + p0U[1] * Wc10 + p2U[0] * Wc01 + p2U[1] * Wc11) >> 16);
-                            int V_val = (int)((p0V[0] * Wc00 + p0V[1] * Wc10 + p2V[0] * Wc01 + p2V[1] * Wc11) >> 16);
-
                             int cidx = ox >> 1;
                             if ((unsigned)cidx < (unsigned)cwCam) {
-                                dstU[cidx] = sat_u8(U_val);
-                                dstV[cidx] = sat_u8(V_val);
+                                int dst_c = cam_x0_c[cam] + cidx;
+                                if ((unsigned)dst_c >= (unsigned)(TARGET_W / 2)) continue;
+
+                                unsigned char u_val = 0;
+                                unsigned char v_val = 0;
+                                if (use_nn_interp) {
+                                    const unsigned char* p0U = cache.U[0].data() + xch0;
+                                    const unsigned char* p0V = cache.V[0].data() + xch0;
+                                    u_val = p0U[0];
+                                    v_val = p0V[0];
+                                } else {
+                                    uint32_t wx_ch = (uint32_t)(ax_ch_q & 0xFFFF);
+                                    uint32_t Wcx0 = 65536u - wx_ch;
+                                    uint32_t Wcx1 = wx_ch;
+
+                                    uint32_t wy = (uint32_t)(ay_q & 0xFFFF);
+                                    uint32_t W_y0 = 65536u - wy;
+                                    uint32_t W_y1 = wy;
+
+                                    uint32_t Wc00 = (uint32_t)(((uint64_t)Wcx0 * W_y0) >> 16);
+                                    uint32_t Wc10 = (uint32_t)(((uint64_t)Wcx1 * W_y0) >> 16);
+                                    uint32_t Wc01 = (uint32_t)(((uint64_t)Wcx0 * W_y1) >> 16);
+                                    uint32_t Wc11 = (uint32_t)(((uint64_t)Wcx1 * W_y1) >> 16);
+
+                                    const unsigned char* p0U = cache.U[0].data() + xch0;
+                                    const unsigned char* p2U = cache.U[1].data() + xch0;
+
+                                    const unsigned char* p0V = cache.V[0].data() + xch0;
+                                    const unsigned char* p2V = cache.V[1].data() + xch0;
+
+                                    int U_val = (int)((p0U[0] * Wc00 + p0U[1] * Wc10 + p2U[0] * Wc01 + p2U[1] * Wc11) >> 16);
+                                    int V_val = (int)((p0V[0] * Wc00 + p0V[1] * Wc10 + p2V[0] * Wc01 + p2V[1] * Wc11) >> 16);
+
+                                    u_val = sat_u8(U_val);
+                                    v_val = sat_u8(V_val);
+                                }
+
+                                if (cam == 0 || cidx >= (overlap_target / 2)) {
+                                    dstU[dst_c] = u_val;
+                                    dstV[dst_c] = v_val;
+                                } else {
+                                    unsigned a = alphaC[std::min(cidx, (int)alphaC.size() - 1)];
+                                    unsigned uprev = dstU[dst_c];
+                                    unsigned vprev = dstV[dst_c];
+                                    dstU[dst_c] = (unsigned char)((uprev * (65536u - a) + u_val * a) >> 16);
+                                    dstV[dst_c] = (unsigned char)((vprev * (65536u - a) + v_val * a) >> 16);
+                                }
                             }
                         }
                     }
+
+                    render_cam_turn.fetch_add(1, std::memory_order_release);
 
                     cache_ok.fetch_add(okLocal, std::memory_order_relaxed);
                     cache_violation.fetch_add(vioLocal, std::memory_order_relaxed);
@@ -1937,14 +2858,65 @@ int main(int argc, char** argv) {
 
         // pano slice/DDR output
         PanoSlicePingPong panoOut;
-        panoOut.init(TARGET_W, TARGET_H, WINDOW_H);
+        panoOut.init(TARGET_W, TARGET_H, PING_PONG_PUSH_BUFFER);
         panoOut.clear_active();
 
         const int ypad = (TARGET_H - per_cam_h) / 2;
 
+        // IMU -> per cam (constant across frames for static test images)
+        for (int cam = 0; cam < NUM_CAMS; ++cam) {
+            float roll_cam = 0.0f, pitch_cam = 0.0f, yaw_cam_deg = 0.0f;
+            convert_rpy_sensor_to_cam(
+                roll_Sensor, pitch_Sensor,
+                (cam < (int)yaw_off.size() ? yaw_off[cam] : 0.0f),
+                (cam < (int)pit_off.size() ? pit_off[cam] : 0.0f),
+                (cam < (int)rol_off.size() ? rol_off[cam] : 0.0f),
+                &roll_cam, &pitch_cam, &yaw_cam_deg
+            );
+
+            int y_shift_px = (int)std::lround(PITCH_TO_TRANSLATION_FACTOR * pitch_cam);
+            y_shift_q_cam[cam] = (int32_t)y_shift_px << WFIX_SHIFT;
+
+            int16_t c15 = 0, s15 = 0;
+            get_cos_sin_q15(-roll_cam, &c15, &s15);
+            c15_cam[cam] = c15;
+            s15_cam[cam] = s15;
+        }
+
+        // Precompute spans and global maxY0Bound per sy (one-time, constant across frames)
+        std::vector<int> maxY0Bound_sy;
+        precompute_spans_and_bounds(
+            per_cam_h, per_cam_w_max,
+            base_x_q16, base_y_q16,
+            per_cam_w,
+            y_shift_q_cam,
+            c15_cam, s15_cam,
+            cx_q, cy_q, max_x_q, max_y_q,
+            spanMin_cam_sy, spanMax_cam_sy,
+            maxY0Bound_sy,
+            y0_to_sy_cam
+        );
+
+        // Print geometry info once
+        printf("[GEOMETRY] WIDTH=%d HEIGHT=%d resized=%dx%d crop=%dx%d @ (%d,%d)\n",
+               WIDTH, HEIGHT, resized_w, resized_h, crop_w, crop_h, crop_x0, crop_y0);
+        printf("[GEOMETRY] per_cam_h=%d per_cam_w_max=%d TARGET=%dx%d ypad=%d\n",
+               per_cam_h, per_cam_w_max, TARGET_W, TARGET_H, ypad);
+
+        int invalidBoundCount = 0;
+        for (int sy = 0; sy < per_cam_h; ++sy) {
+            if (maxY0Bound_sy[sy] < 0) invalidBoundCount++;
+        }
+        if (invalidBoundCount > 0) {
+            printf("[WARNING] %d destination rows have no valid y0 mapping (will be black)\n", invalidBoundCount);
+        }
+
         // Timing
+        size_t globalPeakScheduleBytes = 0;
         std::vector<double> frame_ms(NUM_FRAMES, 0.0);
         auto total_t0 = std::chrono::high_resolution_clock::now();
+
+        printf("\n===== PANORAMA: %d frames =====\n", NUM_FRAMES);
 
         for (int f = 0; f < NUM_FRAMES; ++f) {
             reset_stats();
@@ -1966,40 +2938,6 @@ int main(int argc, char** argv) {
             panoOut.clear_active();
 
             auto frame_t0 = std::chrono::high_resolution_clock::now();
-            printf("\n[Frame %d] start\n", f);
-
-            // IMU -> per cam
-            for (int cam = 0; cam < NUM_CAMS; ++cam) {
-                float roll_cam = 0.0f, pitch_cam = 0.0f, yaw_cam_deg = 0.0f;
-                convert_rpy_sensor_to_cam(
-                    roll_Sensor, pitch_Sensor,
-                    (cam < (int)yaw_off.size() ? yaw_off[cam] : 0.0f),
-                    (cam < (int)pit_off.size() ? pit_off[cam] : 0.0f),
-                    (cam < (int)rol_off.size() ? rol_off[cam] : 0.0f),
-                    &roll_cam, &pitch_cam, &yaw_cam_deg
-                );
-
-                int y_shift_px = (int)std::lround(PITCH_TO_TRANSLATION_FACTOR * pitch_cam);
-                y_shift_q_cam[cam] = (int32_t)y_shift_px << WFIX_SHIFT;
-
-                int16_t c15 = 0, s15 = 0;
-                get_cos_sin_q15(-roll_cam, &c15, &s15);
-                c15_cam[cam] = c15;
-                s15_cam[cam] = s15;
-            }
-
-            // Precompute spans and global maxY0Bound per sy (one-time per frame)
-            std::vector<int> maxY0Bound_sy;
-            precompute_spans_and_bounds(
-                per_cam_h, per_cam_w_max,
-                base_x_q16, base_y_q16,
-                per_cam_w,
-                y_shift_q_cam,
-                c15_cam, s15_cam,
-                cx_q, cy_q, max_x_q, max_y_q,
-                spanMin_cam_sy, spanMax_cam_sy,
-                maxY0Bound_sy
-            );
 
             // Streaming-safe emit logic
             std::vector<unsigned char> row_ready((size_t)per_cam_h, 0);
@@ -2008,6 +2946,7 @@ int main(int argc, char** argv) {
             // Source-driven execution over y0 (main thread just coordinates)
             for (int y0 = 0; y0 < HEIGHT - 1; ++y0) {
                 current_y0.store(y0, std::memory_order_relaxed);
+                render_cam_turn.store(0, std::memory_order_release);
                 rowBarrier.wait(); // start workers (they build schedule + render)
                 rowBarrier.wait(); // wait done
 
@@ -2064,15 +3003,9 @@ int main(int argc, char** argv) {
 
             panoOut.finalize();
 
-            uint64_t ok = cache_ok.load(std::memory_order_relaxed);
-            uint64_t vio = cache_violation.load(std::memory_order_relaxed);
-            printf("[CACHE] ok=%llu violation=%llu\n", (unsigned long long)ok, (unsigned long long)vio);
-
+            // Track peak schedule bytes across all frames
             size_t peakScheduleBytes = peakScheduleBytesAtomic.load(std::memory_order_relaxed);
-            printf("[MEM] Peak per-y0 schedule bytes (per-cam max observed): %.2f KB (%.2f MB)\n",
-                peakScheduleBytes / 1024.0, peakScheduleBytes / (1024.0 * 1024.0));
-
-            print_internal_memory_report_v17(NUM_CAMS, WIDTH, TARGET_W, TARGET_H, per_cam_w, peakScheduleBytes, WINDOW_H);
+            if (peakScheduleBytes > globalPeakScheduleBytes) globalPeakScheduleBytes = peakScheduleBytes;
 
             // Save
             if (SAVE_EVERY_K > 0 && ((f + 1) % SAVE_EVERY_K == 0)) {
@@ -2083,28 +3016,22 @@ int main(int argc, char** argv) {
                 panoDDR.U = panoOut.ddrU.data();
                 panoDDR.V = panoOut.ddrV.data();
 
-                std::string yuvPath = SaveYUVFilePath(captureDirW, L"panorama_v17_onfly_parallel_sched_ddr_pingpong_yuv422", f);
+                std::string yuvPath = SaveYUVFilePath(captureDirW, L"panorama_v17", f);
                 if (writeYUV422(yuvPath.c_str(), &panoDDR)) printf("[Saved YUV] %s\n", yuvPath.c_str());
-                else printf("[ERROR] writeYUV422 failed for frame %d\n", f);
 
-                std::string bmpPath = SaveImageFilePath(captureDirW, L"panorama_v17_onfly_parallel_sched_ddr_pingpong_yuv422", f);
+                std::string bmpPath = SaveImageFilePath(captureDirW, L"panorama_v17", f);
                 Image* panoBGR = yuv422ToBGR(&panoDDR);
                 if (panoBGR) {
                     writeBMP(bmpPath.c_str(), panoBGR);
                     printf("[Saved BMP] %s\n", bmpPath.c_str());
                     freeImage(panoBGR);
                 }
-                else {
-                    printf("[ERROR] yuv422ToBGR failed for frame %d\n", f);
-                }
             }
 
             auto frame_t1 = std::chrono::high_resolution_clock::now();
             double ms = std::chrono::duration<double, std::milli>(frame_t1 - frame_t0).count();
             frame_ms[f] = ms;
-            printf("[Frame %d] time %.3f ms (%.2f FPS)\n", f, ms, 1000.0 / ms);
-
-            print_stats_summary("PROFILING SUMMARY (MT-V17 OnFly (parallel sched+render) + RowWindow + DDR Slice PingPong, YUV422 end-to-end)");
+            print_stats_summary("PROFILING SUMMARY (PANORAMA)");
         }
 
         auto total_t1 = std::chrono::high_resolution_clock::now();
@@ -2116,7 +3043,10 @@ int main(int argc, char** argv) {
         double avg_ms = (NUM_FRAMES > 0) ? sum_ms / NUM_FRAMES : 0.0;
         double latency_fps = avg_ms > 0.0 ? 1000.0 / avg_ms : 0.0;
 
-        printf("\n===== MULTI-FRAME SUMMARY (MT-V17) =====\n");
+        // Internal memory report (once)
+        print_internal_memory_report_v17(NUM_CAMS, WIDTH, TARGET_W, TARGET_H, per_cam_w, globalPeakScheduleBytes, ACTIVE_BUFFER, PING_PONG_PUSH_BUFFER);
+
+        printf("\n===== MULTI-FRAME SUMMARY (PANORAMA) =====\n");
         printf("Frames: %d\n", NUM_FRAMES);
         printf("Avg latency per frame: %.3f ms (%.2f FPS)\n", avg_ms, latency_fps);
         printf("Total time: %.3f ms (Throughput %.2f FPS)\n", total_ms, throughput_fps);
