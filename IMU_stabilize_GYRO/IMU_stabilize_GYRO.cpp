@@ -275,7 +275,6 @@ static Image* yuv422ToBGR(const YUV422Image* src) {
 
             int Uc = rowU[cidx];
             int Vc = rowV[cidx];
-            if (Uc == 0 && Vc == 0) { Uc = 128; Vc = 128; }
             int U = Uc - 128;
             int V = Vc - 128;
 
@@ -659,7 +658,8 @@ static void applyCameraConfig(const CameraConfig& cfg) {
     panorama_crop_width_scale = cfg.pano_crop_w;
 
     resize_factor = cfg.resize_factor;
-    PITCH_TO_TRANSLATION_FACTOR = cfg.pitch_to_translation_factor;
+    const float inv_resize_for_pitch = (std::fabs(resize_factor) > 1.0e-6f) ? (1.0f / resize_factor) : 1.0f;
+    PITCH_TO_TRANSLATION_FACTOR = cfg.pitch_to_translation_factor * inv_resize_for_pitch;
     YAW_TO_TRANSLATION_FACTOR   = cfg.yaw_to_translation_factor;
 
     overlap_px = cfg.overlap_px;
@@ -2020,28 +2020,23 @@ int main(int argc, char** argv) {
 
         // IMU / stabilization - read from sensor-specific section for test data
         // (In real-time operation, there's one IMU for both sensors, but test images were captured at different orientations)
-        auto clamp5 = [&](float v) { return v > 5.0f ? 5.0f : (v < -5.0f ? -5.0f : v); };
         const wchar_t* orientSec = isEO ? L"eo_orientation" : L"ir_orientation";
         
         // Try sensor-specific section first, then fall back to legacy [Sensor_Orientation]
         bool StabilizationIni = paramIni.ReadBoolean(orientSec, L"stabilization", 
                                     paramIni.ReadBoolean(L"Sensor_Orientation", L"stabilization", true));
         if (StabilizationIni) {
-            roll_Sensor = clamp5(paramIni.ReadFloat(orientSec, L"roll", 
-                                    paramIni.ReadFloat(L"Sensor_Orientation", L"roll", 0.0f)));
-            pitch_Sensor = clamp5(paramIni.ReadFloat(orientSec, L"pitch", 
-                                    paramIni.ReadFloat(L"Sensor_Orientation", L"pitch", 0.0f)));
-            yaw_Sensor = clamp5(paramIni.ReadFloat(orientSec, L"yaw", 
-                                    paramIni.ReadFloat(L"Sensor_Orientation", L"yaw", 0.0f)));
+            // Read raw values first without clamping
+            roll_Sensor = paramIni.ReadFloat(orientSec, L"roll", 
+                                    paramIni.ReadFloat(L"Sensor_Orientation", L"roll", 0.0f));
+            pitch_Sensor = paramIni.ReadFloat(orientSec, L"pitch", 
+                                    paramIni.ReadFloat(L"Sensor_Orientation", L"pitch", 0.0f));
+            yaw_Sensor = paramIni.ReadFloat(orientSec, L"yaw", 
+                                    paramIni.ReadFloat(L"Sensor_Orientation", L"yaw", 0.0f));
         }
         else {
             roll_Sensor = pitch_Sensor = yaw_Sensor = 0.0f;
         }
-        
-        printf("[ORIENTATION] Using %s: roll=%.2f pitch=%.2f yaw=%.2f stabilization=%s\n",
-               isEO ? "eo_orientation" : "ir_orientation",
-               roll_Sensor, pitch_Sensor, yaw_Sensor,
-               StabilizationIni ? "true" : "false");
 
         // Mode-based stabilization override
         if (mode == MODE_EO_PANO_NO_STAB || mode == MODE_IR_PANO_NO_STAB || !isPanorama) {
@@ -2089,6 +2084,33 @@ int main(int argc, char** argv) {
         if (yaw_off.empty() && imuIniPtr) yaw_off = imuIniPtr->ReadFloatArray(L"offset", L"yaw");
         if (pit_off.empty() && imuIniPtr) pit_off = imuIniPtr->ReadFloatArray(L"offset", L"pitch");
         if (rol_off.empty() && imuIniPtr) rol_off = imuIniPtr->ReadFloatArray(L"offset", L"roll");
+
+        // Clamp logic: compute maximum per-camera angle, scaling IMU sensor data if > 5.0
+        if (roll_Sensor != 0.0f || pitch_Sensor != 0.0f || yaw_Sensor != 0.0f) {
+            float max_cam_angle = 0.0f;
+            for (int cam = 0; cam < NUM_CAMS; ++cam) {
+                float r_cam = 0.0f, p_cam = 0.0f, y_cam = 0.0f;
+                convert_rpy_sensor_to_cam(
+                    roll_Sensor, pitch_Sensor,
+                    (cam < (int)yaw_off.size() ? yaw_off[cam] : 0.0f),
+                    (cam < (int)pit_off.size() ? pit_off[cam] : 0.0f),
+                    (cam < (int)rol_off.size() ? rol_off[cam] : 0.0f),
+                    &r_cam, &p_cam, &y_cam
+                );
+                max_cam_angle = std::max({max_cam_angle, std::abs(r_cam), std::abs(p_cam)});
+            }
+
+            if (max_cam_angle > 5.0f) {
+                float scale = 5.0f / max_cam_angle;
+                roll_Sensor *= scale;
+                pitch_Sensor *= scale;
+                yaw_Sensor *= scale;
+                printf("[ORIENTATION] Max camera angle %.2f > 5.0. Scaled global sensor by %.3f\n", max_cam_angle, scale);
+            }
+        }
+
+        printf("[ORIENTATION] Final Sensor: roll=%.2f pitch=%.2f yaw=%.2f stabilization=%s\n",
+               roll_Sensor, pitch_Sensor, yaw_Sensor, StabilizationIni ? "true" : "false");
 
         logln("........Processing (MT-V19 FPGA Model: ON-FLY y0 buckets (parallel) + RowWindow + 2-Line Cache + DDR Slice PingPong)........");
 
@@ -2782,12 +2804,28 @@ int main(int argc, char** argv) {
                             }
 
                             if (cam == 0 || ox >= overlap_target) {
-                                dstY[dst_x] = y_val;
+                                // Fade-out on right edge for cameras that have a neighbor to the right
+                                int right_dist = wCam - 1 - ox; // distance from right edge
+                                if (cam < NUM_CAMS - 1 && right_dist < overlap_target) {
+                                    int complement_idx = std::min(overlap_target - 1 - right_dist, (int)alphaY.size() - 1);
+                                    unsigned a_right = 65535u - alphaY[complement_idx];
+                                    y_val = (unsigned char)(((unsigned)y_val * a_right) >> 16);
+                                    unsigned prev = dstY[dst_x];
+                                    dstY[dst_x] = sat_u8((int)prev + (int)y_val);
+                                } else {
+                                    dstY[dst_x] = y_val;
+                                }
                             } else {
                                 unsigned a = alphaY[std::min(ox, (int)alphaY.size() - 1)];
+                                unsigned scaled = ((unsigned)y_val * a) >> 16;
                                 unsigned prev = dstY[dst_x];
-                                dstY[dst_x] = (unsigned char)((prev * (65536u - a) + y_val * a) >> 16);
+                                dstY[dst_x] = sat_u8((int)prev + (int)scaled);
                             }
+
+                            // Only write chroma on even ox to avoid double-accumulation
+                            // (each chroma sample covers a pixel pair; writing on both
+                            //  even and odd ox causes the blend contribution to be added twice)
+                            if ((ox & 1) != 0) continue;
 
                             int32_t ax_ch_q = ax_q >> 1;
                             int xch0 = (ax_ch_q >> WFIX_SHIFT);
@@ -2832,15 +2870,34 @@ int main(int argc, char** argv) {
                                     v_val = sat_u8(V_val);
                                 }
 
-                                if (cam == 0 || cidx >= (overlap_target / 2)) {
-                                    dstU[dst_c] = u_val;
-                                    dstV[dst_c] = v_val;
+                                int overlapC = overlap_target / 2;
+                                int u_centered = (int)u_val - 128;
+                                int v_centered = (int)v_val - 128;
+
+                                if (cam == 0 || cidx >= overlapC) {
+                                    // Fade-out on right edge for chroma
+                                    int right_cidx = cwCam - 1 - cidx;
+                                    if (cam < NUM_CAMS - 1 && right_cidx < overlapC) {
+                                        int complement_cidx = std::min(overlapC - 1 - right_cidx, (int)alphaC.size() - 1);
+                                        unsigned a_right = 65535u - alphaC[complement_cidx];
+                                        int u_sc = (u_centered * (int)a_right) >> 16;
+                                        int v_sc = (v_centered * (int)a_right) >> 16;
+                                        int uprev = (int)dstU[dst_c] - 128;
+                                        int vprev = (int)dstV[dst_c] - 128;
+                                        dstU[dst_c] = sat_u8(uprev + u_sc + 128);
+                                        dstV[dst_c] = sat_u8(vprev + v_sc + 128);
+                                    } else {
+                                        dstU[dst_c] = u_val;
+                                        dstV[dst_c] = v_val;
+                                    }
                                 } else {
                                     unsigned a = alphaC[std::min(cidx, (int)alphaC.size() - 1)];
-                                    unsigned uprev = dstU[dst_c];
-                                    unsigned vprev = dstV[dst_c];
-                                    dstU[dst_c] = (unsigned char)((uprev * (65536u - a) + u_val * a) >> 16);
-                                    dstV[dst_c] = (unsigned char)((vprev * (65536u - a) + v_val * a) >> 16);
+                                    int u_sc = (u_centered * (int)a) >> 16;
+                                    int v_sc = (v_centered * (int)a) >> 16;
+                                    int uprev = (int)dstU[dst_c] - 128;
+                                    int vprev = (int)dstV[dst_c] - 128;
+                                    dstU[dst_c] = sat_u8(uprev + u_sc + 128);
+                                    dstV[dst_c] = sat_u8(vprev + v_sc + 128);
                                 }
                             }
                         }
@@ -2873,6 +2930,8 @@ int main(int argc, char** argv) {
                 (cam < (int)rol_off.size() ? rol_off[cam] : 0.0f),
                 &roll_cam, &pitch_cam, &yaw_cam_deg
             );
+
+            printf("[CAMERA %d] Computed Angles: roll=%.2f, pitch=%.2f, yaw=%.2f\n", cam, roll_cam, pitch_cam, yaw_cam_deg);
 
             int y_shift_px = (int)std::lround(PITCH_TO_TRANSLATION_FACTOR * pitch_cam);
             y_shift_q_cam[cam] = (int32_t)y_shift_px << WFIX_SHIFT;
