@@ -8,7 +8,9 @@
 
 #include <Windows.h>
 #include <Shlwapi.h>
+#include <Commdlg.h>
 #pragma comment(lib, "Shlwapi.lib")
+#pragma comment(lib, "Comdlg32.lib")
 
 #include <cstdio>
 #include <cstdlib>
@@ -35,13 +37,8 @@
 #endif
 
 // ===================== Global switches =====================
-#ifndef NUM_FRAMES
-#define NUM_FRAMES          1
-#endif
-
-#ifndef SAVE_EVERY_K
-#define SAVE_EVERY_K        1   // 0 = save none; 1 = save all; 30 = every 30th
-#endif
+int NUM_FRAMES = 1;
+int SAVE_EVERY_K = 1;
 
 #ifndef SCANLINE_BUFFER
 #define SCANLINE_BUFFER     2   // hard constraint
@@ -191,7 +188,7 @@ static YUV422Image* rgbToYUV422(const Image* src) {
 
     const int w = src->width;
     const int h = src->height;
-    const int cw = w / 2;
+    const int cw = (w + 1) / 2;
 
     YUV422Image* yuv = (YUV422Image*)malloc(sizeof(YUV422Image));
     if (!yuv) return nullptr;
@@ -250,7 +247,7 @@ static Image* yuv422ToBGR(const YUV422Image* src) {
 
     const int w = src->width;
     const int h = src->height;
-    const int cw = w / 2;
+    const int cw = (w + 1) / 2;
 
     Image* img = (Image*)malloc(sizeof(Image));
     if (!img) return nullptr;
@@ -387,17 +384,36 @@ static int writeBMP(const char* filename, const Image* img) {
 }
 
 static int writeYUV422(const char* filename, const YUV422Image* img) {
-    StageTimer _t(ST_IO);
-    FILE* fp = fopen(filename, "wb");
-    if (!fp) return 0;
-    const int w = img->width;
-    const int h = img->height;
-    const int cw = w / 2;
+StageTimer _t(ST_IO);
+FILE* fp = fopen(filename, "wb");
+if (!fp) return 0;
+const int w = img->width;
+const int h = img->height;
+const int cw = (w + 1) / 2;
     fwrite(img->Y, 1, (size_t)w * h, fp); MEM_WRITE((size_t)w * h);
     fwrite(img->U, 1, (size_t)cw * h, fp); MEM_WRITE((size_t)cw * h);
     fwrite(img->V, 1, (size_t)cw * h, fp); MEM_WRITE((size_t)cw * h);
     fclose(fp);
     return 1;
+}
+
+// ===================== Prompt helpers =====================
+static std::string PromptUserForFile(const char* title, const char* filter) {
+    char filename[MAX_PATH] = "";
+    OPENFILENAMEA ofn;
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = NULL;
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile = filename;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrTitle = title;
+    ofn.Flags = OFN_DONTADDTORECENT | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+
+    if (GetOpenFileNameA(&ofn)) {
+        return std::string(filename);
+    }
+    return "";
 }
 
 // ===================== Path helpers =====================
@@ -415,6 +431,64 @@ static std::string WStringToUtf8(const std::wstring& w) {
     std::string r(n, 0);
     WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), &r[0], n, NULL, NULL);
     return r;
+}
+
+#include <shobjidl.h>
+
+static std::vector<std::string> PromptUserForMultipleFiles(const char* title, const char* filter) {
+    std::vector<std::string> files;
+    char filename[MAX_PATH * 50] = {0};
+    OPENFILENAMEA ofn;
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = NULL;
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile = filename;
+    ofn.nMaxFile = sizeof(filename);
+    ofn.lpstrTitle = title;
+    ofn.Flags = OFN_DONTADDTORECENT | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR | OFN_ALLOWMULTISELECT | OFN_EXPLORER;
+
+    if (GetOpenFileNameA(&ofn)) {
+        char* p = filename;
+        std::string dir = p;
+        p += dir.length() + 1;
+        if (*p == '\0') {
+            files.push_back(dir);
+        } else {
+            while (*p) {
+                std::string filepath = dir + "\\" + p;
+                files.push_back(filepath);
+                p += strlen(p) + 1;
+            }
+        }
+    }
+    return files;
+}
+
+static std::string PromptUserForFolder(const char* title) {
+    std::string selectedFolder = "";
+    IFileDialog *pfd;
+    if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pfd)))) {
+        DWORD dwOptions;
+        if (SUCCEEDED(pfd->GetOptions(&dwOptions))) {
+            pfd->SetOptions(dwOptions | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+        }
+        std::wstring wtitle = StringToWString(title);
+        pfd->SetTitle(wtitle.c_str());
+        if (SUCCEEDED(pfd->Show(NULL))) {
+            IShellItem *psi;
+            if (SUCCEEDED(pfd->GetResult(&psi))) {
+                PWSTR pszPath;
+                if (SUCCEEDED(psi->GetDisplayName(SIGDN_FILESYSPATH, &pszPath))) {
+                    selectedFolder = WStringToUtf8(pszPath);
+                    CoTaskMemFree(pszPath);
+                }
+                psi->Release();
+            }
+        }
+        pfd->Release();
+    }
+    return selectedFolder;
 }
 
 #define CAPTURE_DIR_W L"C:\\SVNProjects\\IMU_Stabilize_V40\\x64\\Debug\\Capture"
@@ -1397,6 +1471,8 @@ static RoiRect compute_undistort_roi(
             x1++;
         } else if (x0 > 0) {
             x0--;
+        } else {
+            x1--;
         }
     }
 
@@ -1962,8 +2038,126 @@ static void buildUndistBaseMapsOriginal(
     printf("[INFO] Undistort base maps built (Q16.16, %dx%d, border-replicate).\r\n", w, h);
 }
 
+// ===================== Mode Selection GUI =====================
+static int g_selectedModeVal = 0x01;
+static HWND g_hComboMode = NULL;
+static bool g_modeDlgDone = false;
+
+static LRESULT CALLBACK ModeDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_CREATE: {
+        HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        HWND hStat = CreateWindowW(L"STATIC", L"Select Output Mode:", WS_CHILD | WS_VISIBLE, 15, 15, 300, 20, hwnd, NULL, NULL, NULL);
+        SendMessageW(hStat, WM_SETFONT, (WPARAM)hFont, FALSE);
+
+        g_hComboMode = CreateWindowW(L"COMBOBOX", NULL, CBS_DROPDOWNLIST | WS_CHILD | WS_VISIBLE | WS_VSCROLL, 15, 40, 300, 300, hwnd, (HMENU)100, NULL, NULL);
+        SendMessageW(g_hComboMode, WM_SETFONT, (WPARAM)hFont, FALSE);
+
+        struct ModeOpt { int v; const wchar_t* n; };
+        ModeOpt opts[] = {
+            {0x00, L"0x00 : Blackout"},
+            {0x01, L"0x01 : EO panorama + stabilization"},
+            {0x02, L"0x02 : IR panorama + stabilization"},
+            {0x03, L"0x03 : EO panorama (no stabilization)"},
+            {0x06, L"0x06 : IR panorama (no stabilization)"},
+            {0x07, L"0x07 : EO undistorted cam 0"},
+            {0x08, L"0x08 : EO undistorted cam 1"},
+            {0x09, L"0x09 : EO undistorted cam 2"},
+            {0x0A, L"0x0A : EO undistorted cam 3"},
+            {0x0B, L"0x0B : EO undistorted cam 4"},
+            {0x0C, L"0x0C : EO undistorted cam 5"},
+            {0x0D, L"0x0D : IR undistorted cam 0"},
+            {0x0E, L"0x0E : IR undistorted cam 1"},
+            {0x0F, L"0x0F : IR undistorted cam 2"},
+            {0x10, L"0x10 : IR undistorted cam 3"},
+            {0x11, L"0x11 : IR undistorted cam 4"},
+            {0x12, L"0x12 : IR undistorted cam 5"},
+            {0x13, L"0x13 : Status indication"}
+        };
+
+        for (auto& op : opts) {
+            int idx = (int)SendMessageW(g_hComboMode, CB_ADDSTRING, 0, (LPARAM)op.n);
+            SendMessageW(g_hComboMode, CB_SETITEMDATA, idx, op.v);
+        }
+
+        HWND hBtn = CreateWindowW(L"BUTTON", L"OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 115, 80, 100, 30, hwnd, (HMENU)IDOK, NULL, NULL);
+        SendMessageW(hBtn, WM_SETFONT, (WPARAM)hFont, FALSE);
+        break;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL) {
+            if (LOWORD(wParam) == IDOK) {
+                int idx = (int)SendMessageW(g_hComboMode, CB_GETCURSEL, 0, 0);
+                if (idx != CB_ERR) {
+                    g_selectedModeVal = (int)SendMessageW(g_hComboMode, CB_GETITEMDATA, idx, 0);
+                }
+            }
+            g_modeDlgDone = true;
+            DestroyWindow(hwnd);
+        }
+        break;
+    case WM_DESTROY:
+        g_modeDlgDone = true;
+        PostThreadMessage(GetCurrentThreadId(), WM_NULL, 0, 0);
+        break;
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        break;
+    default:
+        return DefWindowProc(hwnd, msg, wParam, lParam);
+    }
+    return 0;
+}
+
+static int PromptUserForModeDialog(int defaultMode) {
+    WNDCLASSW wc = { 0 };
+    wc.lpfnWndProc = ModeDialogProc;
+    wc.hInstance = GetModuleHandle(NULL);
+    wc.lpszClassName = L"ModeSelectDlgClass";
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    RegisterClassW(&wc);
+
+    g_modeDlgDone = false;
+    g_selectedModeVal = defaultMode;
+
+    int width = 350;
+    int height = 160;
+    int screenW = GetSystemMetrics(SM_CXSCREEN);
+    int screenH = GetSystemMetrics(SM_CYSCREEN);
+
+    HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, wc.lpszClassName, L"Select Output Mode",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        (screenW - width) / 2, (screenH - height) / 2, width, height,
+        NULL, NULL, wc.hInstance, NULL);
+
+    if (hwnd) {
+        int count = (int)SendMessageW(g_hComboMode, CB_GETCOUNT, 0, 0);
+        bool found = false;
+        for (int i = 0; i < count; i++) {
+            if ((int)SendMessageW(g_hComboMode, CB_GETITEMDATA, i, 0) == defaultMode) {
+                SendMessageW(g_hComboMode, CB_SETCURSEL, i, 0);
+                found = true;
+                break;
+            }
+        }
+        if (!found && count > 0) SendMessageW(g_hComboMode, CB_SETCURSEL, 1, 0); // fallback
+        SetFocus(g_hComboMode);
+    }
+
+    MSG msg;
+    while (!g_modeDlgDone && GetMessage(&msg, NULL, 0, 0)) {
+        if (!IsDialogMessage(hwnd, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+    }
+    UnregisterClassW(wc.lpszClassName, wc.hInstance);
+    return g_selectedModeVal;
+}
+
 // ===================== Main =====================
 int main(int argc, char** argv) {
+    HRESULT hrCoInit = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     try {
         build_angle_lut();
 
@@ -1971,27 +2165,42 @@ int main(int argc, char** argv) {
         GetModuleFileNameW(NULL, wpath, MAX_PATH);
         std::filesystem::path exePath(wpath);
 
-        std::filesystem::path imuIniPath = pick_imu_ini(exePath, argc, argv);
-        std::filesystem::path paramsIniPath = pick_params_ini(exePath, argc, argv);
-
         printf("[PATH] exe        : %s\n", exePath.string().c_str());
-        printf("[PATH] imu ini    : %s\n", imuIniPath.string().c_str());
-        printf("[PATH] params ini : %s\n", paramsIniPath.string().c_str());
 
-        if (!file_exists(paramsIniPath)) {
-            printf("[FATAL] parameters.ini not found. Place it next to exe or pass argv[2].\n");
+        std::string userIniStr = PromptUserForFile("Select Parameters INI File", "INI Files (*.ini)\0*.ini\0All Files (*.*)\0*.*\0");
+        if (userIniStr.empty()) {
+            printf("[FATAL] No INI file selected. Exiting.\n");
             return 1;
         }
+        std::filesystem::path paramsIniPath(StringToWString(userIniStr));
+
+        if (!file_exists(paramsIniPath)) {
+            printf("[FATAL] Selected parameters INI file could not be found.\n");
+            return 1;
+        }
+
+        printf("[PATH] params ini : %s\n", paramsIniPath.string().c_str());
+
+        // Keep standard fallback paths for imu configs if needed by the code
+        std::filesystem::path imuIniPath = paramsIniPath.parent_path() / L"imu.ini";
         bool imuIniAvailable = file_exists(imuIniPath);
 
         // Read parameters (unified file)
         INIManager paramIni(paramsIniPath);
 
+        NUM_FRAMES = paramIni.ReadInteger(L"output", L"num_frames", NUM_FRAMES);
+        SAVE_EVERY_K = paramIni.ReadInteger(L"output", L"save_every_k", SAVE_EVERY_K);
+
         int modeVal = paramIni.ReadInteger(L"output", L"mode", MODE_EO_PANO_STAB);
+
+        modeVal = PromptUserForModeDialog(modeVal);
+        printf("[INFO] Selected Option Mode from GUI: 0x%02X\n", modeVal);
+
         OutputMode mode = (OutputMode)modeVal;
 
         bool isEO = true;
         bool isPanorama = true;
+        int camIdx = -1;
         switch (mode) {
         case MODE_EO_PANO_STAB:
         case MODE_EO_PANO_NO_STAB:
@@ -2000,8 +2209,8 @@ int main(int argc, char** argv) {
         case MODE_IR_PANO_NO_STAB:
             isEO = false; isPanorama = true; break;
         default:
-            if (mode >= MODE_EO_UNDIST_CAM1 && mode <= MODE_EO_UNDIST_CAM6) { isEO = true; isPanorama = false; break; }
-            if (mode >= MODE_IR_UNDIST_CAM1 && mode <= MODE_IR_UNDIST_CAM6) { isEO = false; isPanorama = false; break; }
+            if (mode >= MODE_EO_UNDIST_CAM1 && mode <= MODE_EO_UNDIST_CAM6) { isEO = true; isPanorama = false; camIdx = mode - MODE_EO_UNDIST_CAM1; break; }
+            if (mode >= MODE_IR_UNDIST_CAM1 && mode <= MODE_IR_UNDIST_CAM6) { isEO = false; isPanorama = false; camIdx = mode - MODE_IR_UNDIST_CAM1; break; }
             if (mode == MODE_BLACKOUT || mode == MODE_STATUS) { isPanorama = true; isEO = true; break; }
             break;
         }
@@ -2022,11 +2231,10 @@ int main(int argc, char** argv) {
         // (In real-time operation, there's one IMU for both sensors, but test images were captured at different orientations)
         const wchar_t* orientSec = isEO ? L"eo_orientation" : L"ir_orientation";
         
-        // Try sensor-specific section first, then fall back to legacy [Sensor_Orientation]
-        bool StabilizationIni = paramIni.ReadBoolean(orientSec, L"stabilization", 
-                                    paramIni.ReadBoolean(L"Sensor_Orientation", L"stabilization", true));
-        if (StabilizationIni) {
-            // Read raw values first without clamping
+        // Mode dictates stabilization entirely now
+        bool isStabMode = (mode == MODE_EO_PANO_STAB || mode == MODE_IR_PANO_STAB);
+        
+        if (isStabMode) {
             roll_Sensor = paramIni.ReadFloat(orientSec, L"roll", 
                                     paramIni.ReadFloat(L"Sensor_Orientation", L"roll", 0.0f));
             pitch_Sensor = paramIni.ReadFloat(orientSec, L"pitch", 
@@ -2036,13 +2244,10 @@ int main(int argc, char** argv) {
         }
         else {
             roll_Sensor = pitch_Sensor = yaw_Sensor = 0.0f;
-        }
-
-        // Mode-based stabilization override
-        if (mode == MODE_EO_PANO_NO_STAB || mode == MODE_IR_PANO_NO_STAB || !isPanorama) {
-            roll_Sensor = pitch_Sensor = yaw_Sensor = 0.0f;
             printf("[ORIENTATION] Stabilization disabled by mode\n");
         }
+        
+        bool StabilizationIni = isStabMode; // assigned for informational print log alone
 
         // IMU ini (for compatibility: images/offset fallback)
         std::unique_ptr<INIManager> imuIniPtr;
@@ -2050,32 +2255,42 @@ int main(int argc, char** argv) {
             imuIniPtr = std::make_unique<INIManager>(imuIniPath);
         }
 
-        // Input files
-        std::vector<std::string> filenames; filenames.reserve(NUM_CAMS);
-        for (int i = 0; i < NUM_CAMS; ++i) {
-            std::string p = (i < (int)camCfg.filenames.size()) ? camCfg.filenames[i] : "";
-            if (p.empty() && imuIniPtr) {
-                std::wstring key = L"file_" + std::to_wstring(i);
-                p = WStringToUtf8(imuIniPtr->ReadString(L"images", key, L""));
-                p = make_abs_if_relative(p, exePath.parent_path());
+        // Input files - Prompt selection
+        std::vector<std::string> filenames;
+        while (true) {
+            filenames.clear();
+            if (isPanorama) {
+                // Request images required based on INI configs (usually stitched together per frame)
+                int required_images = NUM_CAMS;
+                char titleBuf[128];
+                snprintf(titleBuf, sizeof(titleBuf), "Select exactly %d Images for Panorama", required_images);
+                filenames = PromptUserForMultipleFiles(titleBuf, "Image Files (*.bmp;*.png;*.jpg)\0*.bmp;*.png;*.jpg\0All Files (*.*)\0*.*\0");
+                
+                if (filenames.empty()) {
+                    printf("[FATAL] Image selection cancelled.\n");
+                    return 1;
+                }
+                
+                if (filenames.size() < (size_t)required_images) {
+                    MessageBoxA(NULL, "Fewer images were selected than required for the panorama stitch. Please select all required images, or modify your INI config.", "Insufficient Images", MB_ICONERROR | MB_OK);
+                    continue;
+                }
+
+                // If more selected manually by mistake, resize to exact required count
+                filenames.resize(required_images);
+            } else {
+                std::string p = PromptUserForFile("Select Image for Selected Camera Test", "Image Files (*.bmp;*.png;*.jpg)\0*.bmp;*.png;*.jpg\0All Files (*.*)\0*.*\0");
+                if (p.empty()) {
+                    printf("[FATAL] Image selection cancelled.\n");
+                    return 1;
+                }
+                filenames.push_back(p);
             }
-            if (p.empty()) {
-                printf("[FATAL] file_%d missing in unified ini and no IMU ini fallback.\n", i);
-                return 1;
-            }
-            filenames.push_back(p);
+            break;
         }
 
-        // Validate paths (Release failure usually shows up here)
-        for (int i = 0; i < NUM_CAMS; ++i) {
-            if (filenames[i].empty()) {
-                printf("[FATAL] file_%d is empty in IMU ini. (Release exe-name.ini mismatch?)\n", i);
-                return 1;
-            }
-            if (!file_exists(std::filesystem::path(StringToWString(filenames[i])))) {
-                printf("[FATAL] file_%d not found: %s\n", i, filenames[i].c_str());
-                return 1;
-            }
+        for (size_t i = 0; i < filenames.size(); ++i) {
+            printf("[Selected] Camera %zu: %s\n", i + 1, filenames[i].c_str());
         }
 
         std::vector<float> yaw_off = camCfg.yaw_off;
@@ -2114,6 +2329,15 @@ int main(int argc, char** argv) {
 
         logln("........Processing (MT-V19 FPGA Model: ON-FLY y0 buckets (parallel) + RowWindow + 2-Line Cache + DDR Slice PingPong)........");
 
+        std::wstring captureDirW = CAPTURE_DIR_W;
+        if (SAVE_EVERY_K == 1) {
+            std::string userDir = PromptUserForFolder("Select Output Save Directory");
+            if (!userDir.empty()) {
+                captureDirW = StringToWString(userDir);
+            }
+        }
+        CreateDirectoryW(captureDirW.c_str(), NULL);
+
         // Geometry in resized space
         const int resized_w = (int)std::lround(WIDTH * resize_factor);
         const int resized_h = (int)std::lround(HEIGHT * resize_factor);
@@ -2145,19 +2369,41 @@ int main(int argc, char** argv) {
 
         // Load all camera frames and convert to YUV422 once (KEEP contiguous buffers; no cam_scan vectors)
         std::vector<YUV422Image*> framesYUV(NUM_CAMS, nullptr);
-        for (int i = 0; i < NUM_CAMS; ++i) {
-            Image* tmp = readBMP(filenames[i].c_str());
-            if (!tmp) { printf("[ERROR] Failed to load camera %d: %s\n", i, filenames[i].c_str()); return 1; }
-            printf("[INFO] Camera %d (RGB): %dx%d\n", i, tmp->width, tmp->height);
+        if (isPanorama) {
+            for (int i = 0; i < NUM_CAMS; ++i) {
+                Image* tmp = readBMP(filenames[i].c_str());
+                if (!tmp) { printf("[ERROR] Failed to load camera %d: %s\n", i, filenames[i].c_str()); return 1; }
+                printf("[INFO] Camera %d (RGB): %dx%d\n", i, tmp->width, tmp->height);
 
-            framesYUV[i] = rgbToYUV422(tmp);
-            freeImage(tmp);
-            if (!framesYUV[i]) { printf("[ERROR] Failed to convert camera %d to YUV422\n", i); return 1; }
-            printf("[INFO] Camera %d converted to YUV422: %dx%d\n", i, framesYUV[i]->width, framesYUV[i]->height);
+                framesYUV[i] = rgbToYUV422(tmp);
+                freeImage(tmp);
+                if (!framesYUV[i]) { printf("[ERROR] Failed to convert camera %d to YUV422\n", i); return 1; }
+                printf("[INFO] Camera %d converted to YUV422: %dx%d\n", i, framesYUV[i]->width, framesYUV[i]->height);
 
-            if (framesYUV[i]->width != WIDTH || framesYUV[i]->height != HEIGHT) {
-                printf("[FATAL] Camera %d dimensions mismatch. Expected %dx%d, got %dx%d\n",
-                    i, WIDTH, HEIGHT, framesYUV[i]->width, framesYUV[i]->height);
+                if (framesYUV[i]->width != WIDTH || framesYUV[i]->height != HEIGHT) {
+                    printf("[FATAL] Camera %d dimensions mismatch. Expected %dx%d, got %dx%d\n",
+                        i, WIDTH, HEIGHT, framesYUV[i]->width, framesYUV[i]->height);
+                    return 1;
+                }
+            }
+        } else {
+            if (camIdx >= 0 && camIdx < NUM_CAMS && !filenames.empty()) {
+                Image* tmp = readBMP(filenames[0].c_str());
+                if (!tmp) { printf("[ERROR] Failed to load camera: %s\n", filenames[0].c_str()); return 1; }
+                printf("[INFO] Camera %d (RGB): %dx%d\n", camIdx, tmp->width, tmp->height);
+
+                framesYUV[camIdx] = rgbToYUV422(tmp);
+                freeImage(tmp);
+                if (!framesYUV[camIdx]) { printf("[ERROR] Failed to convert camera to YUV422\n"); return 1; }
+                printf("[INFO] Camera %d converted to YUV422: %dx%d\n", camIdx, framesYUV[camIdx]->width, framesYUV[camIdx]->height);
+
+                if (framesYUV[camIdx]->width != WIDTH || framesYUV[camIdx]->height != HEIGHT) {
+                    printf("[FATAL] Camera %d dimensions mismatch. Expected %dx%d, got %dx%d\n",
+                        camIdx, WIDTH, HEIGHT, framesYUV[camIdx]->width, framesYUV[camIdx]->height);
+                    return 1;
+                }
+            } else {
+                printf("[FATAL] Invalid camera index %d or missing files.\n", camIdx);
                 return 1;
             }
         }
@@ -2166,25 +2412,13 @@ int main(int argc, char** argv) {
         //   LineCache (2-line BRAM) → RowRun schedule → RowWindow → PanoSlicePingPong → DDR
         // Differences from panorama: numCams=1, no cylindrical, no feather blend, output=WIDTHxHEIGHT
         if (!isPanorama) {
-            int camIdx = -1;
             bool camEO = isEO;
-            if (mode >= MODE_EO_UNDIST_CAM1 && mode <= MODE_EO_UNDIST_CAM6) {
-                camIdx = mode - MODE_EO_UNDIST_CAM1;
-                camEO = true;
-            }
-            else if (mode >= MODE_IR_UNDIST_CAM1 && mode <= MODE_IR_UNDIST_CAM6) {
-                camIdx = mode - MODE_IR_UNDIST_CAM1;
-                camEO = false;
-            }
 
             if (camIdx < 0 || camIdx >= NUM_CAMS) {
                 printf("[FATAL] Unsupported individual mode 0x%02X\n", modeVal);
                 for (auto* fimg : framesYUV) freeYUV422ImageHeap(fimg);
                 return 1;
             }
-
-            std::wstring captureDirW = CAPTURE_DIR_W;
-            CreateDirectoryW(captureDirW.c_str(), NULL);
 
             // ---- Build undistort base maps (same format as panorama base_x_q16/base_y_q16) ----
             // For undistortion: per_cam_w = {WIDTH}, per_cam_h = HEIGHT, numCams = 1
@@ -2528,7 +2762,7 @@ int main(int argc, char** argv) {
                     undDDR.U = und_panoOut.ddrU.data();
                     undDDR.V = und_panoOut.ddrV.data();
 
-                    std::wstring prefW = (camEO ? L"undist_eo_cam" : L"undist_ir_cam") + std::to_wstring(camIdx + 1);
+                    std::wstring prefW = (camEO ? L"undist_eo_cam" : L"undist_ir_cam") + std::to_wstring(camIdx);
                     std::string bmpPath = SaveImageFilePath(captureDirW, prefW, f);
                     Image* undBGR = yuv422ToBGR(&undDDR);
                     if (undBGR) { writeBMP(bmpPath.c_str(), undBGR); printf("[Saved BMP] %s\n", bmpPath.c_str()); freeImage(undBGR); }
@@ -2616,10 +2850,6 @@ int main(int argc, char** argv) {
                 }
             }
         }
-
-        // Capture dir
-        std::wstring captureDirW = CAPTURE_DIR_W;
-        CreateDirectoryW(captureDirW.c_str(), NULL);
 
         // Row window (fixed size for FPGA - sized for worst case)
         printf("[CONFIG] Using fixed ACTIVE_BUFFER=%d (FPGA constraint), PING_PONG_PUSH_BUFFER=%d\n", ACTIVE_BUFFER, PING_PONG_PUSH_BUFFER);
@@ -3075,9 +3305,6 @@ int main(int argc, char** argv) {
                 panoDDR.U = panoOut.ddrU.data();
                 panoDDR.V = panoOut.ddrV.data();
 
-                std::string yuvPath = SaveYUVFilePath(captureDirW, L"panorama_v17", f);
-                if (writeYUV422(yuvPath.c_str(), &panoDDR)) printf("[Saved YUV] %s\n", yuvPath.c_str());
-
                 std::string bmpPath = SaveImageFilePath(captureDirW, L"panorama_v17", f);
                 Image* panoBGR = yuv422ToBGR(&panoDDR);
                 if (panoBGR) {
@@ -3120,14 +3347,17 @@ int main(int argc, char** argv) {
         // Cleanup
         for (auto* fimg : framesYUV) freeYUV422ImageHeap(fimg);
 
+        if (SUCCEEDED(hrCoInit)) CoUninitialize();
         return 0;
     }
     catch (const std::exception& e) {
         printf("[FATAL] exception: %s\n", e.what());
+        if (SUCCEEDED(hrCoInit)) CoUninitialize();
         return 1;
     }
     catch (...) {
         printf("[FATAL] unknown exception\n");
+        if (SUCCEEDED(hrCoInit)) CoUninitialize();
         return 1;
     }
 }
