@@ -150,6 +150,17 @@ static inline void print_stats_summary(const char* header) {
 static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 static inline unsigned char sat_u8(int v) { return (v < 0) ? 0 : (v > 255 ? 255 : (unsigned char)v); }
 static inline uint64_t ceil_div_u64(uint64_t a, uint64_t b) { return (a + b - 1) / b; }
+static inline int32_t deg_to_centi(float deg) { return (int32_t)std::lround((double)deg * 100.0); }
+static inline float centi_to_deg(int32_t centi) { return (float)centi * 0.01f; }
+static inline int32_t float_to_q16(float v) { return (int32_t)std::lround((double)v * 65536.0); }
+static inline float q16_to_float(int32_t q16) { return (float)q16 / 65536.0f; }
+
+static inline int32_t div_round_i64(int64_t num, int64_t den)
+{
+    if (den == 0) return 0;
+    if (num >= 0) return (int32_t)((num + den / 2) / den);
+    return (int32_t)((num - den / 2) / den);
+}
 
 static inline uint64_t yuv422_bytes(int w, int h) {
     return (uint64_t)w * (uint64_t)h * 2ull;
@@ -584,9 +595,15 @@ static float cylindrical_H_fov_deg = 77.0f, cylindrical_V_fov_deg = 51.3f;
 static float panorama_crop_height_scale = 0.70f, panorama_crop_width_scale = 0.70f;
 static float resize_factor = 0.5f;
 static float PITCH_TO_TRANSLATION_FACTOR = -17.44153917818162f, YAW_TO_TRANSLATION_FACTOR = 17.84f;
-static float roll_Sensor = 0.0f, pitch_Sensor = 0.0f, yaw_Sensor = 0.0f;
+static int32_t panorama_crop_height_scale_q16 = (int32_t)(0.70f * 65536.0f + 0.5f);
+static int32_t panorama_crop_width_scale_q16 = (int32_t)(0.70f * 65536.0f + 0.5f);
+static int32_t resize_factor_q16 = (int32_t)(0.5f * 65536.0f + 0.5f);
+static int32_t PITCH_TO_TRANSLATION_FACTOR_q16 = (int32_t)(-17.44153917818162f * 65536.0f);
+static int32_t YAW_TO_TRANSLATION_FACTOR_q16 = (int32_t)(17.84f * 65536.0f + 0.5f);
+static int32_t roll_Sensor_centi = 0, pitch_Sensor_centi = 0, yaw_Sensor_centi = 0;
 static int   TARGET_W = 3840, TARGET_H = 480;
 static float feather_strength = 1.0f;
+static int32_t feather_strength_q16 = (1 << 16);
 
 // ===================== Mode / Config =====================
 enum OutputMode : int {
@@ -624,31 +641,91 @@ struct CameraConfig {
     float p2 = -0.002416f;
 
     float resize_factor = 0.5f;
+    int32_t resize_factor_q16 = (int32_t)(0.5f * 65536.0f + 0.5f);
     float cyl_h_fov = 77.0f;
     float cyl_v_fov = 51.3f;
 
     float pano_crop_h = 0.70f;
     float pano_crop_w = 0.70f;
+    int32_t pano_crop_h_q16 = (int32_t)(0.70f * 65536.0f + 0.5f);
+    int32_t pano_crop_w_q16 = (int32_t)(0.70f * 65536.0f + 0.5f);
 
     bool use_nearest_neighbor = false;
 
     float pitch_to_translation_factor = -17.44f;
     float yaw_to_translation_factor   = 17.84f;
+    int32_t pitch_to_translation_factor_q16 = (int32_t)(-17.44f * 65536.0f);
+    int32_t yaw_to_translation_factor_q16 = (int32_t)(17.84f * 65536.0f + 0.5f);
 
     int   overlap_px = 100;
     float feather_strength = 1.0f;
+    int32_t feather_strength_q16 = (1 << 16);
 
     int   pano_width = 3840;
     int   pano_height = 480;
 
     // offsets
-    std::vector<float> yaw_off;
-    std::vector<float> pitch_off;
-    std::vector<float> roll_off;
+    std::vector<int32_t> yaw_off;
+    std::vector<int32_t> pitch_off;
+    std::vector<int32_t> roll_off;
 
     // image files
     std::vector<std::string> filenames;
 };
+
+static int32_t readAngleCenti(INIManager& ini, const wchar_t* section, const wchar_t* keyBase, int32_t defaultCenti)
+{
+    // Prefer human-readable floating degree keys; quantize immediately.
+    if (ini.HasKey(section, keyBase)) {
+        const float defaultDeg = centi_to_deg(defaultCenti);
+        return deg_to_centi(ini.ReadFloat(section, keyBase, defaultDeg));
+    }
+
+    const std::wstring keyCenti = std::wstring(keyBase) + L"_centi";
+    if (ini.HasKey(section, keyCenti)) {
+        return (int32_t)ini.ReadInteger(section, keyCenti, (int)defaultCenti);
+    }
+
+    const std::wstring keyCdeg = std::wstring(keyBase) + L"_cdeg";
+    if (ini.HasKey(section, keyCdeg)) {
+        return (int32_t)ini.ReadInteger(section, keyCdeg, (int)defaultCenti);
+    }
+
+    return defaultCenti;
+}
+
+static int32_t readAngleCentiWithFallback(INIManager& ini, const wchar_t* primarySection,
+    const wchar_t* fallbackSection, const wchar_t* keyBase, int32_t defaultCenti)
+{
+    int32_t fb = readAngleCenti(ini, fallbackSection, keyBase, defaultCenti);
+    return readAngleCenti(ini, primarySection, keyBase, fb);
+}
+
+static std::vector<int32_t> readAngleArrayCenti(INIManager& ini, const wchar_t* section, const wchar_t* keyBase)
+{
+    // Prefer human-readable floating degree arrays; quantize immediately.
+    if (ini.HasKey(section, keyBase)) {
+        std::vector<float> valsDeg = ini.ReadFloatArray(section, keyBase);
+        std::vector<int32_t> valsCenti;
+        valsCenti.reserve(valsDeg.size());
+        for (float v : valsDeg) valsCenti.push_back(deg_to_centi(v));
+        return valsCenti;
+    }
+
+    const std::wstring keyCenti = std::wstring(keyBase) + L"_centi";
+    if (ini.HasKey(section, keyCenti)) {
+        const std::vector<int> vals = ini.ReadIntegerArray(section, keyCenti);
+        return std::vector<int32_t>(vals.begin(), vals.end());
+    }
+
+    const std::wstring keyCdeg = std::wstring(keyBase) + L"_cdeg";
+    if (ini.HasKey(section, keyCdeg)) {
+        const std::vector<int> vals = ini.ReadIntegerArray(section, keyCdeg);
+        return std::vector<int32_t>(vals.begin(), vals.end());
+    }
+
+    return {};
+}
 
 static CameraConfig loadCameraConfig(INIManager& ini, bool isEO, const std::filesystem::path& baseDir) {
     CameraConfig cfg;
@@ -677,26 +754,32 @@ static CameraConfig loadCameraConfig(INIManager& ini, bool isEO, const std::file
     cfg.p2 = ini.ReadFloat(camSec, L"p2", cfg.p2);
 
     cfg.resize_factor = ini.ReadFloat(camSec, L"resize_factor", cfg.resize_factor);
+    cfg.resize_factor_q16 = float_to_q16(cfg.resize_factor);
     cfg.cyl_h_fov = ini.ReadFloat(camSec, L"cylindrical_H_fov_deg", cfg.cyl_h_fov);
     cfg.cyl_v_fov = ini.ReadFloat(camSec, L"cylindrical_V_fov_deg", cfg.cyl_v_fov);
 
     cfg.pano_crop_h = ini.ReadFloat(camSec, L"panorama_crop_height_scale", cfg.pano_crop_h);
     cfg.pano_crop_w = ini.ReadFloat(camSec, L"panorama_crop_width_scale", cfg.pano_crop_w);
+    cfg.pano_crop_h_q16 = float_to_q16(cfg.pano_crop_h);
+    cfg.pano_crop_w_q16 = float_to_q16(cfg.pano_crop_w);
 
     cfg.pitch_to_translation_factor = ini.ReadFloat(camSec, L"pitch_to_translation_factor", cfg.pitch_to_translation_factor);
     cfg.yaw_to_translation_factor   = ini.ReadFloat(camSec, L"yaw_to_translation_factor", cfg.yaw_to_translation_factor);
+    cfg.pitch_to_translation_factor_q16 = float_to_q16(cfg.pitch_to_translation_factor);
+    cfg.yaw_to_translation_factor_q16 = float_to_q16(cfg.yaw_to_translation_factor);
 
     cfg.overlap_px = ini.ReadInteger(camSec, L"overlap_px", cfg.overlap_px);
     cfg.feather_strength = ini.ReadFloat(camSec, L"feather_strength", cfg.feather_strength);
+    cfg.feather_strength_q16 = float_to_q16(cfg.feather_strength);
 
     cfg.pano_width = ini.ReadInteger(camSec, L"pano_width", cfg.pano_width);
     cfg.pano_height = ini.ReadInteger(camSec, L"pano_height", cfg.pano_height);
 
     cfg.use_nearest_neighbor = ini.ReadBoolean(camSec, L"use_nearest_neighbor", cfg.use_nearest_neighbor);
 
-    cfg.yaw_off = ini.ReadFloatArray(offSec, L"yaw");
-    cfg.pitch_off = ini.ReadFloatArray(offSec, L"pitch");
-    cfg.roll_off = ini.ReadFloatArray(offSec, L"roll");
+    cfg.yaw_off = readAngleArrayCenti(ini, offSec, L"yaw");
+    cfg.pitch_off = readAngleArrayCenti(ini, offSec, L"pitch");
+    cfg.roll_off = readAngleArrayCenti(ini, offSec, L"roll");
 
     cfg.filenames.reserve(cfg.num_cams);
     for (int i = 0; i < cfg.num_cams; ++i) {
@@ -730,45 +813,95 @@ static void applyCameraConfig(const CameraConfig& cfg) {
 
     panorama_crop_height_scale = cfg.pano_crop_h;
     panorama_crop_width_scale = cfg.pano_crop_w;
+    panorama_crop_height_scale_q16 = cfg.pano_crop_h_q16;
+    panorama_crop_width_scale_q16 = cfg.pano_crop_w_q16;
 
     resize_factor = cfg.resize_factor;
+    resize_factor_q16 = cfg.resize_factor_q16;
+    if (resize_factor_q16 == 0) resize_factor_q16 = (1 << 16);
+
+    PITCH_TO_TRANSLATION_FACTOR_q16 = div_round_i64((int64_t)cfg.pitch_to_translation_factor_q16 << 16, resize_factor_q16);
+    YAW_TO_TRANSLATION_FACTOR_q16 = cfg.yaw_to_translation_factor_q16;
+
     const float inv_resize_for_pitch = (std::fabs(resize_factor) > 1.0e-6f) ? (1.0f / resize_factor) : 1.0f;
     PITCH_TO_TRANSLATION_FACTOR = cfg.pitch_to_translation_factor * inv_resize_for_pitch;
     YAW_TO_TRANSLATION_FACTOR   = cfg.yaw_to_translation_factor;
 
     overlap_px = cfg.overlap_px;
     feather_strength = cfg.feather_strength;
+    feather_strength_q16 = cfg.feather_strength_q16;
 
     TARGET_W = cfg.pano_width;
     TARGET_H = cfg.pano_height;
 }
 
-// ===================== Angle LUT (±5°, 0.25°) Q1.15 =====================
+// ===================== Angle LUTs =====================
 struct AngleLUTEntry { int16_t c; int16_t s; };
-static std::vector<AngleLUTEntry> ANG_LUT;
+static std::vector<AngleLUTEntry> ANG_LUT;               // [-5,5] step 0.25 deg (legacy roll LUT)
+static std::vector<AngleLUTEntry> ANG_CENTI_LUT;         // [0,35999] step 0.01 deg
+static std::vector<int16_t> ATAN_RATIO_CENTI_LUT;        // atan(r), r in [0,1], centi-deg
+static const int ATAN_RATIO_LUT_SIZE = 4096;
 
 static inline void build_angle_lut() {
-    if (!ANG_LUT.empty()) return;
+    if (!ANG_LUT.empty() && !ANG_CENTI_LUT.empty() && !ATAN_RATIO_CENTI_LUT.empty()) return;
     StageTimer _t(ST_LUT);
-    const float minDeg = -5.0f, maxDeg = 5.0f, step = 0.25f;
-    int N = (int)std::lround((maxDeg - minDeg) / step) + 1;
-    ANG_LUT.resize(N);
-    for (int i = 0; i < N; ++i) {
-        float deg = minDeg + i * step;
-        float rad = deg * (float)M_PI / 180.0f;
-        int16_t c = (int16_t)std::lroundf(cosf(rad) * 32767.0f);
-        int16_t s = (int16_t)std::lroundf(sinf(rad) * 32767.0f);
-        ANG_LUT[i] = { c, s };
+    if (ANG_LUT.empty()) {
+        const float minDeg = -5.0f, maxDeg = 5.0f, step = 0.25f;
+        int N = (int)std::lround((maxDeg - minDeg) / step) + 1;
+        ANG_LUT.resize(N);
+        for (int i = 0; i < N; ++i) {
+            float deg = minDeg + i * step;
+            float rad = deg * (float)M_PI / 180.0f;
+            int16_t c = (int16_t)std::lroundf(cosf(rad) * 32767.0f);
+            int16_t s = (int16_t)std::lroundf(sinf(rad) * 32767.0f);
+            ANG_LUT[i] = { c, s };
+        }
+    }
+
+    if (ANG_CENTI_LUT.empty()) {
+        ANG_CENTI_LUT.resize(36000);
+        for (int i = 0; i < 36000; ++i) {
+            double deg = (double)i * 0.01;
+            double rad = deg * M_PI / 180.0;
+            int16_t c = (int16_t)std::lround(std::cos(rad) * 32767.0);
+            int16_t s = (int16_t)std::lround(std::sin(rad) * 32767.0);
+            ANG_CENTI_LUT[(size_t)i] = { c, s };
+        }
+    }
+
+    if (ATAN_RATIO_CENTI_LUT.empty()) {
+        ATAN_RATIO_CENTI_LUT.resize((size_t)ATAN_RATIO_LUT_SIZE + 1);
+        for (int i = 0; i <= ATAN_RATIO_LUT_SIZE; ++i) {
+            double ratio = (double)i / (double)ATAN_RATIO_LUT_SIZE;
+            int16_t centi = (int16_t)std::lround(std::atan(ratio) * 18000.0 / M_PI);
+            ATAN_RATIO_CENTI_LUT[(size_t)i] = centi;
+        }
     }
 }
 
 static inline void get_cos_sin_q15(float deg, int16_t* c, int16_t* s) {
+    if (ANG_LUT.empty()) build_angle_lut();
     float idxf = (deg + 5.0f) / 0.25f;
     int idx = (int)std::lround(idxf);
     if (idx < 0) idx = 0;
     if (idx >= (int)ANG_LUT.size()) idx = (int)ANG_LUT.size() - 1;
     *c = ANG_LUT[idx].c;
     *s = ANG_LUT[idx].s;
+}
+
+static inline int32_t wrap_centi_360(int32_t centi)
+{
+    int32_t v = centi % 36000;
+    return (v < 0) ? (v + 36000) : v;
+}
+
+static inline void get_cos_sin_q15_centi(int32_t centi, int16_t* c, int16_t* s)
+{
+    if (ANG_CENTI_LUT.empty()) build_angle_lut();
+    int32_t idx = wrap_centi_360(centi);
+    const AngleLUTEntry& e = ANG_CENTI_LUT[(size_t)idx];
+    *c = e.c;
+    *s = e.s;
 }
 
 // ===================== Maps (Q12.4) =====================
@@ -1028,56 +1161,146 @@ static void composeCylWithUndistQ(
 }
 
 // ===================== IMU sensor -> camera =====================
-static void convert_rpy_sensor_to_cam(double roll_sys1, double pitch_sys1,
-    double yaw_offset, double pitch_offset, double roll_offset,
-    float* roll_deg_out, float* pitch_deg_out, float* yaw_deg_out)
+static inline int32_t clamp_q15_from_q30(int64_t v_q30)
 {
-    double rr = roll_sys1 * M_PI / 180.0;
-    double pp = pitch_sys1 * M_PI / 180.0;
-    double ror = roll_offset * M_PI / 180.0;
-    double por = pitch_offset * M_PI / 180.0;
-    double yor = yaw_offset * M_PI / 180.0;
+    int64_t q15 = (v_q30 + (1ll << 14)) >> 15;
+    if (q15 > 32767) q15 = 32767;
+    if (q15 < -32768) q15 = -32768;
+    return (int32_t)q15;
+}
 
-    double Rx[3][3] = { {1,0,0},{0,cos(rr),-sin(rr)},{0,sin(rr),cos(rr)} };
-    double Ry[3][3] = { {cos(pp),0,sin(pp)},{0,1,0},{-sin(pp),0,cos(pp)} };
-    double R_sys1[3][3];
-    for (int i = 0; i < 3; ++i)
-        for (int j = 0; j < 3; ++j)
-            R_sys1[i][j] = Rx[i][0] * Ry[0][j] + Rx[i][1] * Ry[1][j] + Rx[i][2] * Ry[2][j];
-
-    double Rr[3][3] = { {1,0,0},{0,cos(ror),-sin(ror)},{0,sin(ror),cos(ror)} };
-    double Rp[3][3] = { {cos(por),0,sin(por)},{0,1,0},{-sin(por),0,cos(por)} };
-    double Rz[3][3] = { {cos(yor),-sin(yor),0},{sin(yor),cos(yor),0},{0,0,1} };
-
-    double Rt[3][3];
-    for (int i = 0; i < 3; ++i)
-        for (int j = 0; j < 3; ++j)
-            Rt[i][j] = Rz[i][0] * Rp[0][j] + Rz[i][1] * Rp[1][j] + Rz[i][2] * Rp[2][j];
-
-    double Roff[3][3];
-    for (int i = 0; i < 3; ++i)
-        for (int j = 0; j < 3; ++j)
-            Roff[i][j] = Rt[i][0] * Rr[0][j] + Rt[i][1] * Rr[1][j] + Rt[i][2] * Rr[2][j];
-
-    double R[3][3];
-    for (int i = 0; i < 3; ++i)
-        for (int j = 0; j < 3; ++j)
-            R[i][j] = R_sys1[i][0] * Roff[0][j] + R_sys1[i][1] * Roff[1][j] + R_sys1[i][2] * Roff[2][j];
-
-    double pitchX = asin(-R[2][0]);
-    double cy_ = cos(pitchX);
-    double rollX, yawX;
-    if (fabs(cy_) > 1e-6) {
-        rollX = atan2(R[2][1], R[2][2]);
-        yawX = atan2(R[1][0], R[0][0]);
+static inline void matmul_q15(const int32_t A[3][3], const int32_t B[3][3], int32_t O[3][3])
+{
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            int64_t acc_q30 =
+                (int64_t)A[i][0] * B[0][j] +
+                (int64_t)A[i][1] * B[1][j] +
+                (int64_t)A[i][2] * B[2][j];
+            O[i][j] = clamp_q15_from_q30(acc_q30);
+        }
     }
-    else {
-        rollX = 0;
-        yawX = atan2(-R[0][1], R[1][1]);
+}
+
+static uint32_t isqrt_u64(uint64_t x)
+{
+    uint64_t res = 0;
+    uint64_t bit = 1ull << 62;
+    while (bit > x) bit >>= 2;
+    while (bit != 0) {
+        if (x >= res + bit) {
+            x -= res + bit;
+            res = (res >> 1) + bit;
+        } else {
+            res >>= 1;
+        }
+        bit >>= 2;
     }
-    *roll_deg_out = (float)(rollX * 180.0 / M_PI);
-    *pitch_deg_out = (float)(pitchX * 180.0 / M_PI);
-    *yaw_deg_out = (float)(yawX * 180.0 / M_PI);
+    return (uint32_t)res;
+}
+
+static int32_t atan2_centi_q15(int32_t y_q15, int32_t x_q15)
+{
+    if (ATAN_RATIO_CENTI_LUT.empty()) build_angle_lut();
+    if (y_q15 == 0 && x_q15 == 0) return 0;
+
+    int64_t ay = std::llabs((long long)y_q15);
+    int64_t ax = std::llabs((long long)x_q15);
+    int32_t base = 0;
+
+    if (ax == 0) {
+        base = 9000;
+    } else if (ay <= ax) {
+        int idx = (int)((ay * ATAN_RATIO_LUT_SIZE + (ax / 2)) / ax);
+        idx = clampi(idx, 0, ATAN_RATIO_LUT_SIZE);
+        base = ATAN_RATIO_CENTI_LUT[(size_t)idx];
+    } else {
+        int idx = (int)((ax * ATAN_RATIO_LUT_SIZE + (ay / 2)) / ay);
+        idx = clampi(idx, 0, ATAN_RATIO_LUT_SIZE);
+        base = 9000 - ATAN_RATIO_CENTI_LUT[(size_t)idx];
+    }
+
+    if (x_q15 >= 0) return (y_q15 >= 0) ? base : -base;
+    return (y_q15 >= 0) ? (18000 - base) : (base - 18000);
+}
+
+static int32_t asin_centi_q15(int32_t v_q15)
+{
+    int32_t v = clampi(v_q15, -32767, 32767);
+    int64_t vv_q30 = (int64_t)v * (int64_t)v;
+    int64_t one_q30 = (1ll << 30);
+    int64_t rem_q30 = one_q30 - vv_q30;
+    if (rem_q30 < 0) rem_q30 = 0;
+    int32_t cos_q15 = (int32_t)isqrt_u64((uint64_t)rem_q30);
+    return atan2_centi_q15(v, cos_q15);
+}
+
+static void convert_rpy_sensor_to_cam_centi(int32_t roll_sys1_centi, int32_t pitch_sys1_centi,
+    int32_t yaw_offset_centi, int32_t pitch_offset_centi, int32_t roll_offset_centi,
+    int32_t* roll_centi_out, int32_t* pitch_centi_out, int32_t* yaw_centi_out)
+{
+    int16_t c_rr, s_rr, c_pp, s_pp;
+    int16_t c_ror, s_ror, c_por, s_por, c_yor, s_yor;
+
+    get_cos_sin_q15_centi(roll_sys1_centi, &c_rr, &s_rr);
+    get_cos_sin_q15_centi(pitch_sys1_centi, &c_pp, &s_pp);
+    get_cos_sin_q15_centi(roll_offset_centi, &c_ror, &s_ror);
+    get_cos_sin_q15_centi(pitch_offset_centi, &c_por, &s_por);
+    get_cos_sin_q15_centi(yaw_offset_centi, &c_yor, &s_yor);
+
+    const int32_t ONE_Q15 = 32767;
+    int32_t Rx[3][3] = {
+        { ONE_Q15, 0, 0 },
+        { 0, c_rr, -s_rr },
+        { 0, s_rr, c_rr }
+    };
+    int32_t Ry[3][3] = {
+        { c_pp, 0, s_pp },
+        { 0, ONE_Q15, 0 },
+        { -s_pp, 0, c_pp }
+    };
+
+    int32_t Rr[3][3] = {
+        { ONE_Q15, 0, 0 },
+        { 0, c_ror, -s_ror },
+        { 0, s_ror, c_ror }
+    };
+    int32_t Rp[3][3] = {
+        { c_por, 0, s_por },
+        { 0, ONE_Q15, 0 },
+        { -s_por, 0, c_por }
+    };
+    int32_t Rz[3][3] = {
+        { c_yor, -s_yor, 0 },
+        { s_yor, c_yor, 0 },
+        { 0, 0, ONE_Q15 }
+    };
+
+    int32_t R_sys1[3][3], Rt[3][3], Roff[3][3], R[3][3];
+    matmul_q15(Rx, Ry, R_sys1);
+    matmul_q15(Rz, Rp, Rt);
+    matmul_q15(Rt, Rr, Roff);
+    matmul_q15(R_sys1, Roff, R);
+
+    int32_t pitch_centi = asin_centi_q15(-R[2][0]);
+
+    int16_t c_pitch = 0, s_pitch = 0;
+    get_cos_sin_q15_centi(pitch_centi, &c_pitch, &s_pitch);
+    (void)s_pitch;
+
+    int32_t roll_centi = 0;
+    int32_t yaw_centi = 0;
+    if (std::abs((int)c_pitch) > 8) {
+        roll_centi = atan2_centi_q15(R[2][1], R[2][2]);
+        yaw_centi = atan2_centi_q15(R[1][0], R[0][0]);
+    } else {
+        roll_centi = 0;
+        yaw_centi = atan2_centi_q15(-R[0][1], R[1][1]);
+    }
+
+    if (roll_centi_out) *roll_centi_out = roll_centi;
+    if (pitch_centi_out) *pitch_centi_out = pitch_centi;
+    if (yaw_centi_out) *yaw_centi_out = yaw_centi;
 }
 
 // ===================== Build per-row base maps in ORIGINAL space =====================
@@ -2235,15 +2458,12 @@ int main(int argc, char** argv) {
         bool isStabMode = (mode == MODE_EO_PANO_STAB || mode == MODE_IR_PANO_STAB);
         
         if (isStabMode) {
-            roll_Sensor = paramIni.ReadFloat(orientSec, L"roll", 
-                                    paramIni.ReadFloat(L"Sensor_Orientation", L"roll", 0.0f));
-            pitch_Sensor = paramIni.ReadFloat(orientSec, L"pitch", 
-                                    paramIni.ReadFloat(L"Sensor_Orientation", L"pitch", 0.0f));
-            yaw_Sensor = paramIni.ReadFloat(orientSec, L"yaw", 
-                                    paramIni.ReadFloat(L"Sensor_Orientation", L"yaw", 0.0f));
+            roll_Sensor_centi = readAngleCentiWithFallback(paramIni, orientSec, L"Sensor_Orientation", L"roll", 0);
+            pitch_Sensor_centi = readAngleCentiWithFallback(paramIni, orientSec, L"Sensor_Orientation", L"pitch", 0);
+            yaw_Sensor_centi = readAngleCentiWithFallback(paramIni, orientSec, L"Sensor_Orientation", L"yaw", 0);
         }
         else {
-            roll_Sensor = pitch_Sensor = yaw_Sensor = 0.0f;
+            roll_Sensor_centi = pitch_Sensor_centi = yaw_Sensor_centi = 0;
             printf("[ORIENTATION] Stabilization disabled by mode\n");
         }
         
@@ -2293,39 +2513,41 @@ int main(int argc, char** argv) {
             printf("[Selected] Camera %zu: %s\n", i + 1, filenames[i].c_str());
         }
 
-        std::vector<float> yaw_off = camCfg.yaw_off;
-        std::vector<float> pit_off = camCfg.pitch_off;
-        std::vector<float> rol_off = camCfg.roll_off;
-        if (yaw_off.empty() && imuIniPtr) yaw_off = imuIniPtr->ReadFloatArray(L"offset", L"yaw");
-        if (pit_off.empty() && imuIniPtr) pit_off = imuIniPtr->ReadFloatArray(L"offset", L"pitch");
-        if (rol_off.empty() && imuIniPtr) rol_off = imuIniPtr->ReadFloatArray(L"offset", L"roll");
+        std::vector<int32_t> yaw_off = camCfg.yaw_off;
+        std::vector<int32_t> pit_off = camCfg.pitch_off;
+        std::vector<int32_t> rol_off = camCfg.roll_off;
+        if (yaw_off.empty() && imuIniPtr) yaw_off = readAngleArrayCenti(*imuIniPtr, L"offset", L"yaw");
+        if (pit_off.empty() && imuIniPtr) pit_off = readAngleArrayCenti(*imuIniPtr, L"offset", L"pitch");
+        if (rol_off.empty() && imuIniPtr) rol_off = readAngleArrayCenti(*imuIniPtr, L"offset", L"roll");
 
         // Clamp logic: compute maximum per-camera angle, scaling IMU sensor data if > 5.0
-        if (roll_Sensor != 0.0f || pitch_Sensor != 0.0f || yaw_Sensor != 0.0f) {
-            float max_cam_angle = 0.0f;
+        if (roll_Sensor_centi != 0 || pitch_Sensor_centi != 0 || yaw_Sensor_centi != 0) {
+            int32_t max_cam_angle_centi = 0;
             for (int cam = 0; cam < NUM_CAMS; ++cam) {
-                float r_cam = 0.0f, p_cam = 0.0f, y_cam = 0.0f;
-                convert_rpy_sensor_to_cam(
-                    roll_Sensor, pitch_Sensor,
-                    (cam < (int)yaw_off.size() ? yaw_off[cam] : 0.0f),
-                    (cam < (int)pit_off.size() ? pit_off[cam] : 0.0f),
-                    (cam < (int)rol_off.size() ? rol_off[cam] : 0.0f),
-                    &r_cam, &p_cam, &y_cam
+                int32_t r_cam_c = 0, p_cam_c = 0, y_cam_c = 0;
+                convert_rpy_sensor_to_cam_centi(
+                    roll_Sensor_centi, pitch_Sensor_centi,
+                    (cam < (int)yaw_off.size() ? yaw_off[cam] : 0),
+                    (cam < (int)pit_off.size() ? pit_off[cam] : 0),
+                    (cam < (int)rol_off.size() ? rol_off[cam] : 0),
+                    &r_cam_c, &p_cam_c, &y_cam_c
                 );
-                max_cam_angle = std::max({max_cam_angle, std::abs(r_cam), std::abs(p_cam)});
+                (void)y_cam_c;
+                max_cam_angle_centi = std::max({ max_cam_angle_centi, std::abs(r_cam_c), std::abs(p_cam_c) });
             }
 
-            if (max_cam_angle > 5.0f) {
-                float scale = 5.0f / max_cam_angle;
-                roll_Sensor *= scale;
-                pitch_Sensor *= scale;
-                yaw_Sensor *= scale;
-                printf("[ORIENTATION] Max camera angle %.2f > 5.0. Scaled global sensor by %.3f\n", max_cam_angle, scale);
+            if (max_cam_angle_centi > 500) {
+                roll_Sensor_centi = div_round_i64((int64_t)roll_Sensor_centi * 500, max_cam_angle_centi);
+                pitch_Sensor_centi = div_round_i64((int64_t)pitch_Sensor_centi * 500, max_cam_angle_centi);
+                yaw_Sensor_centi = div_round_i64((int64_t)yaw_Sensor_centi * 500, max_cam_angle_centi);
+                printf("[ORIENTATION] Max camera angle %d.%02d > 5.0. Scaled global sensor by %d/%d\n",
+                    max_cam_angle_centi / 100, std::abs(max_cam_angle_centi % 100), 500, max_cam_angle_centi);
             }
         }
 
         printf("[ORIENTATION] Final Sensor: roll=%.2f pitch=%.2f yaw=%.2f stabilization=%s\n",
-               roll_Sensor, pitch_Sensor, yaw_Sensor, StabilizationIni ? "true" : "false");
+               centi_to_deg(roll_Sensor_centi), centi_to_deg(pitch_Sensor_centi), centi_to_deg(yaw_Sensor_centi),
+               StabilizationIni ? "true" : "false");
 
         logln("........Processing (MT-V19 FPGA Model: ON-FLY y0 buckets (parallel) + RowWindow + 2-Line Cache + DDR Slice PingPong)........");
 
@@ -2339,10 +2561,10 @@ int main(int argc, char** argv) {
         CreateDirectoryW(captureDirW.c_str(), NULL);
 
         // Geometry in resized space
-        const int resized_w = (int)std::lround(WIDTH * resize_factor);
-        const int resized_h = (int)std::lround(HEIGHT * resize_factor);
-        const int crop_w = (int)std::lround(resized_w * panorama_crop_width_scale);
-        const int crop_h = (int)std::lround(resized_h * panorama_crop_height_scale);
+        const int resized_w = div_round_i64((int64_t)WIDTH * resize_factor_q16, 1ll << 16);
+        const int resized_h = div_round_i64((int64_t)HEIGHT * resize_factor_q16, 1ll << 16);
+        const int crop_w = div_round_i64((int64_t)resized_w * panorama_crop_width_scale_q16, 1ll << 16);
+        const int crop_h = div_round_i64((int64_t)resized_h * panorama_crop_height_scale_q16, 1ll << 16);
         const int crop_x0 = (resized_w - crop_w) / 2;
         const int crop_y0 = (resized_h - crop_h) / 2;
 
@@ -2437,8 +2659,8 @@ int main(int argc, char** argv) {
                 und_base_x_q16, und_base_y_q16);
 
             // ---- Precompute spans and reverse index (same as panorama) ----
-            const int32_t und_cx_q = (int32_t)((WIDTH / 2.0f) * (1 << WFIX_SHIFT));
-            const int32_t und_cy_q = (int32_t)((HEIGHT / 2.0f) * (1 << WFIX_SHIFT));
+            const int32_t und_cx_q = (int32_t)((int64_t)WIDTH << (WFIX_SHIFT - 1));
+            const int32_t und_cy_q = (int32_t)((int64_t)HEIGHT << (WFIX_SHIFT - 1));
             const int32_t und_max_x_q = (int32_t)((WIDTH - 2) << WFIX_SHIFT);
             const int32_t und_max_y_q = (int32_t)((HEIGHT - 2) << WFIX_SHIFT);
 
@@ -2798,12 +3020,13 @@ int main(int argc, char** argv) {
         }
 
         // Per-camera target widths
-        const int overlap_resized = (int)std::lround(overlap_px * resize_factor);
+        const int overlap_resized = div_round_i64((int64_t)overlap_px * resize_factor_q16, 1ll << 16);
         const int pano_w_crop = NUM_CAMS * crop_w - (NUM_CAMS - 1) * overlap_resized;
-        const double scale_x = (double)TARGET_W / (double)pano_w_crop;
+        const int SCALE_X_SHIFT = 20;
+        const int64_t scale_x_q20 = ((int64_t)TARGET_W << SCALE_X_SHIFT) / std::max(1, pano_w_crop);
 
-        int overlap_target = (int)std::llround(overlap_resized * scale_x);
-        int per_cam_w_base = (int)std::llround(crop_w * scale_x);
+        int overlap_target = div_round_i64((int64_t)overlap_resized * scale_x_q20, 1ll << SCALE_X_SHIFT);
+        int per_cam_w_base = div_round_i64((int64_t)crop_w * scale_x_q20, 1ll << SCALE_X_SHIFT);
 
         std::vector<int> per_cam_w(NUM_CAMS, per_cam_w_base);
         {
@@ -2897,8 +3120,8 @@ int main(int argc, char** argv) {
         workers.reserve(NUM_CAMS);
 
         // constants for mapping bounds
-        const int32_t cx_q = (int32_t)((WIDTH / 2.0f) * (1 << WFIX_SHIFT));
-        const int32_t cy_q = (int32_t)((HEIGHT / 2.0f) * (1 << WFIX_SHIFT));
+        const int32_t cx_q = (int32_t)((int64_t)WIDTH << (WFIX_SHIFT - 1));
+        const int32_t cy_q = (int32_t)((int64_t)HEIGHT << (WFIX_SHIFT - 1));
         const int32_t max_x_q = (int32_t)((WIDTH - 2) << WFIX_SHIFT);
         const int32_t max_y_q = (int32_t)((HEIGHT - 2) << WFIX_SHIFT);
 
@@ -3152,22 +3375,25 @@ int main(int argc, char** argv) {
 
         // IMU -> per cam (constant across frames for static test images)
         for (int cam = 0; cam < NUM_CAMS; ++cam) {
-            float roll_cam = 0.0f, pitch_cam = 0.0f, yaw_cam_deg = 0.0f;
-            convert_rpy_sensor_to_cam(
-                roll_Sensor, pitch_Sensor,
-                (cam < (int)yaw_off.size() ? yaw_off[cam] : 0.0f),
-                (cam < (int)pit_off.size() ? pit_off[cam] : 0.0f),
-                (cam < (int)rol_off.size() ? rol_off[cam] : 0.0f),
-                &roll_cam, &pitch_cam, &yaw_cam_deg
+            int32_t roll_cam_centi = 0, pitch_cam_centi = 0, yaw_cam_centi = 0;
+            convert_rpy_sensor_to_cam_centi(
+                roll_Sensor_centi, pitch_Sensor_centi,
+                (cam < (int)yaw_off.size() ? yaw_off[cam] : 0),
+                (cam < (int)pit_off.size() ? pit_off[cam] : 0),
+                (cam < (int)rol_off.size() ? rol_off[cam] : 0),
+                &roll_cam_centi, &pitch_cam_centi, &yaw_cam_centi
             );
 
+            const float roll_cam = centi_to_deg(roll_cam_centi);
+            const float pitch_cam = centi_to_deg(pitch_cam_centi);
+            const float yaw_cam_deg = centi_to_deg(yaw_cam_centi);
             printf("[CAMERA %d] Computed Angles: roll=%.2f, pitch=%.2f, yaw=%.2f\n", cam, roll_cam, pitch_cam, yaw_cam_deg);
 
-            int y_shift_px = (int)std::lround(PITCH_TO_TRANSLATION_FACTOR * pitch_cam);
+            int y_shift_px = div_round_i64((int64_t)PITCH_TO_TRANSLATION_FACTOR_q16 * pitch_cam_centi, 100ll * (1ll << 16));
             y_shift_q_cam[cam] = (int32_t)y_shift_px << WFIX_SHIFT;
 
             int16_t c15 = 0, s15 = 0;
-            get_cos_sin_q15(-roll_cam, &c15, &s15);
+            get_cos_sin_q15_centi(-roll_cam_centi, &c15, &s15);
             c15_cam[cam] = c15;
             s15_cam[cam] = s15;
         }
