@@ -12,6 +12,7 @@ public:
     float ReadFloat(const std::wstring& section, const std::wstring& key, float defaultValue);
     bool ReadBoolean(const std::wstring& section, const std::wstring& key, bool defaultValue);
     double ReadDouble(const std::wstring& section, const std::wstring& key, double defaultValue);
+    bool HasKey(const std::wstring& section, const std::wstring& key);
     bool ReadString(const std::wstring& section, const std::wstring& key, const std::wstring& defaultValue, wchar_t* result, DWORD size);
     std::wstring ReadString(const std::wstring& section, const std::wstring& key, const std::wstring& defaultValue);
 
@@ -22,6 +23,7 @@ public:
     void WriteDouble(const std::wstring& section, const std::wstring& key, double value);
 
     std::vector<float> ReadFloatArray(const std::wstring& section, const std::wstring& key);
+    std::vector<int> ReadIntegerArray(const std::wstring& section, const std::wstring& key);
 
 private:
     std::wstring m_fileName;
