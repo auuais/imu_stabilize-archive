@@ -1,0 +1,6 @@
+../Core/Src/fpga_i2c.c:6:6:fpga_i2c_init	0	static
+../Core/Src/fpga_i2c.c:13:19:fpga_is_ready	16	static
+../Core/Src/fpga_i2c.c:19:19:fpga_write_reg8	48	static
+../Core/Src/fpga_i2c.c:32:19:fpga_write_regs	32	static
+../Core/Src/fpga_i2c.c:45:19:fpga_read_reg8	32	static
+../Core/Src/fpga_i2c.c:58:19:fpga_write_read_reg8	16	static

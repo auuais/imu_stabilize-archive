@@ -1,0 +1,6 @@
+../Core/Src/imu_config.c:74:12:imu_write_reg.constprop	3
+../Core/Src/imu_config.c:33:12:imu_read_reg.constprop	4
+../Core/Src/imu_config.c:201:12:imu_read_reg_after_reset.constprop	1
+../Core/Src/imu_config.c:119:5:imu_read_config	7
+../Core/Src/imu_config.c:219:5:imu_ensure_default_profile	17
+../Core/Src/imu_config.c:347:5:imu_configure_odr_lpf	3

@@ -1,0 +1,5 @@
+../Core/Src/proto_uart.c:7:10:crc16_ccitt_false	4
+../Core/Src/proto_uart.c:19:8:cobs_encode	9
+../Core/Src/proto_uart.c:50:8:cobs_decode	11
+../Core/Src/proto_uart.c:72:8:uart_frame_build	9
+../Core/Src/proto_uart.c:106:8:uart_frame_parse	11

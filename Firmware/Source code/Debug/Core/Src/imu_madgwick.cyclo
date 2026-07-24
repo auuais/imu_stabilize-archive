@@ -1,0 +1,5 @@
+../Core/Src/imu_madgwick.c:27:6:Madgwick_Init	1
+../Core/Src/imu_madgwick.c:38:6:Madgwick_Update	2
+../Core/Src/imu_madgwick.c:123:6:Madgwick_SetSampleFreq	3
+../Core/Src/imu_madgwick.c:131:6:Madgwick_GetEuler	3
+../Core/Src/imu_madgwick.c:157:6:Madgwick_GetQuaternion	1
