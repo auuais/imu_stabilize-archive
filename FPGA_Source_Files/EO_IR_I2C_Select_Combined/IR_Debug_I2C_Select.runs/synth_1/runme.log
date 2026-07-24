@@ -1,0 +1,409 @@
+
+*** Running vivado
+    with args -log KintexTop_IR6ch_I2CSelect.vds -m64 -product Vivado -mode batch -messageDb vivado.pb -notrace -source KintexTop_IR6ch_I2CSelect.tcl
+
+
+
+****** Vivado v2025.2 (64-bit)
+  **** SW Build 6299465 on Fri Nov 14 19:35:11 GMT 2025
+  **** IP Build 6300035 on Fri Nov 14 10:48:45 MST 2025
+  **** SharedData Build 6298862 on Thu Nov 13 04:50:51 MST 2025
+  **** Start of session at: Thu Apr 16 02:59:20 2026
+    ** Copyright 1986-2022 Xilinx, Inc. All Rights Reserved.
+    ** Copyright 2022-2025 Advanced Micro Devices, Inc. All Rights Reserved.
+
+source KintexTop_IR6ch_I2CSelect.tcl -notrace
+create_project: Time (s): cpu = 00:00:11 ; elapsed = 00:00:09 . Memory (MB): peak = 526.480 ; gain = 220.730
+Command: read_checkpoint -auto_incremental -incremental E:/Xylinx/IR_Debug_I2C_Select/IR_Debug_I2C_Select.srcs/utils_1/imports/synth_1/KintexTop_IR6ch_I2CSelect.dcp
+INFO: [Vivado 12-5825] Read reference checkpoint from E:/Xylinx/IR_Debug_I2C_Select/IR_Debug_I2C_Select.srcs/utils_1/imports/synth_1/KintexTop_IR6ch_I2CSelect.dcp for incremental synthesis
+INFO: [Vivado 12-7989] Please ensure there are no constraint changes
+Command: synth_design -top KintexTop_IR6ch_I2CSelect -part xcku15p-ffve1517-2-i
+Starting synth_design
+Attempting to get a license for feature 'Synthesis' and/or device 'xcku15p'
+INFO: [Common 17-349] Got license for feature 'Synthesis' and/or device 'xcku15p'
+INFO: [Device 21-403] Loading part xcku15p-ffve1517-2-i
+INFO: [Designutils 20-5440] No compile time benefit to using incremental synthesis; A full resynthesis will be run
+INFO: [Designutils 20-4379] Flow is switching to default flow due to incremental criteria not met. If you would like to alter this behaviour and have the flow terminate instead, please set the following parameter config_implementation {autoIncr.Synth.RejectBehavior Terminate}
+INFO: [Synth 8-7079] Multithreading enabled for synth_design using a maximum of 2 processes.
+INFO: [Synth 8-7078] Launching helper process for spawning children vivado processes
+INFO: [Synth 8-7075] Helper process launched with PID 1013072
+---------------------------------------------------------------------------------
+Starting RTL Elaboration : Time (s): cpu = 00:00:07 ; elapsed = 00:00:08 . Memory (MB): peak = 2062.301 ; gain = 270.184
+---------------------------------------------------------------------------------
+INFO: [Synth 8-6157] synthesizing module 'KintexTop_IR6ch_I2CSelect' [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_IR6ch_I2CSelect_FINAL.v:15]
+INFO: [Synth 8-6157] synthesizing module 'IBUFG' [C:/AMDDesignTools/2025.2/Vivado/scripts/rt/data/unisim_comp.v:83453]
+INFO: [Synth 8-6155] done synthesizing module 'IBUFG' (0#1) [C:/AMDDesignTools/2025.2/Vivado/scripts/rt/data/unisim_comp.v:83453]
+INFO: [Synth 8-6157] synthesizing module 'IBUF' [C:/AMDDesignTools/2025.2/Vivado/scripts/rt/data/unisim_comp.v:82804]
+INFO: [Synth 8-6155] done synthesizing module 'IBUF' (0#1) [C:/AMDDesignTools/2025.2/Vivado/scripts/rt/data/unisim_comp.v:82804]
+INFO: [Synth 8-6157] synthesizing module 'BUFG' [C:/AMDDesignTools/2025.2/Vivado/scripts/rt/data/unisim_comp.v:2678]
+INFO: [Synth 8-6155] done synthesizing module 'BUFG' (0#1) [C:/AMDDesignTools/2025.2/Vivado/scripts/rt/data/unisim_comp.v:2678]
+INFO: [Synth 8-6157] synthesizing module 'Kintex_top_I2C_test' [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_IR6ch_I2CSelect_FINAL.v:435]
+	Parameter SLAVE_ADDR bound to: 7'b0110110 
+	Parameter SCLK_HZ bound to: 74250000 - type: integer 
+	Parameter POR_MS bound to: 100 - type: integer 
+WARNING: [Synth 8-693] zero replication count - replication ignored [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_IR6ch_I2CSelect_FINAL.v:485]
+INFO: [Synth 8-6157] synthesizing module 'IOBUF' [C:/AMDDesignTools/2025.2/Vivado/scripts/rt/data/unisim_comp.v:87566]
+INFO: [Synth 8-6155] done synthesizing module 'IOBUF' (0#1) [C:/AMDDesignTools/2025.2/Vivado/scripts/rt/data/unisim_comp.v:87566]
+INFO: [Synth 8-6155] done synthesizing module 'Kintex_top_I2C_test' (0#1) [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_IR6ch_I2CSelect_FINAL.v:435]
+INFO: [Synth 8-6157] synthesizing module 'Kintex_top_0cam_1ch' [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_0cam_ch1_0108.v:2]
+INFO: [Synth 8-6155] done synthesizing module 'Kintex_top_0cam_1ch' (0#1) [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_0cam_ch1_0108.v:2]
+INFO: [Synth 8-6157] synthesizing module 'Kintex_top_1cam_1ch' [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_1cam_ch1_1202.v:2]
+INFO: [Synth 8-6155] done synthesizing module 'Kintex_top_1cam_1ch' (0#1) [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_1cam_ch1_1202.v:2]
+INFO: [Synth 8-6157] synthesizing module 'Kintex_top_2cam_1ch' [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_2cam_ch1_1202.v:1]
+INFO: [Synth 8-6155] done synthesizing module 'Kintex_top_2cam_1ch' (0#1) [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_2cam_ch1_1202.v:1]
+INFO: [Synth 8-6157] synthesizing module 'Kintex_top_3cam_1ch' [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_3cam_ch1_1202.v:1]
+INFO: [Synth 8-6155] done synthesizing module 'Kintex_top_3cam_1ch' (0#1) [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_3cam_ch1_1202.v:1]
+INFO: [Synth 8-6157] synthesizing module 'Kintex_top_4cam_1ch' [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_4cam_ch1_1202.v:1]
+INFO: [Synth 8-6155] done synthesizing module 'Kintex_top_4cam_1ch' (0#1) [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_4cam_ch1_1202.v:1]
+INFO: [Synth 8-6157] synthesizing module 'Kintex_top_5cam_1ch' [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_5cam_ch1_1202.v:1]
+INFO: [Synth 8-6155] done synthesizing module 'Kintex_top_5cam_1ch' (0#1) [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_5cam_ch1_1202.v:1]
+INFO: [Synth 8-6155] done synthesizing module 'KintexTop_IR6ch_I2CSelect' (0#1) [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_IR6ch_I2CSelect_FINAL.v:15]
+WARNING: [Synth 8-6014] Unused sequential element por_cnt_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_IR6ch_I2CSelect_FINAL.v:485]
+WARNING: [Synth 8-6014] Unused sequential element cam0_f_bit_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_0cam_ch1_0108.v:123]
+WARNING: [Synth 8-6014] Unused sequential element cam0_v_bit_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_0cam_ch1_0108.v:124]
+WARNING: [Synth 8-6014] Unused sequential element cam0_h_bit_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_0cam_ch1_0108.v:125]
+WARNING: [Synth 8-6014] Unused sequential element cam0_hsync_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_0cam_ch1_0108.v:127]
+WARNING: [Synth 8-6014] Unused sequential element y_q3_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_0cam_ch1_0108.v:255]
+WARNING: [Synth 8-6014] Unused sequential element y_q2_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_0cam_ch1_0108.v:200]
+WARNING: [Synth 8-6014] Unused sequential element y_q1_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_0cam_ch1_0108.v:201]
+WARNING: [Synth 8-6014] Unused sequential element y_q0_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_0cam_ch1_0108.v:255]
+WARNING: [Synth 8-6014] Unused sequential element c_q3_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_0cam_ch1_0108.v:256]
+WARNING: [Synth 8-6014] Unused sequential element c_q2_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_0cam_ch1_0108.v:256]
+WARNING: [Synth 8-6014] Unused sequential element c_q1_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_0cam_ch1_0108.v:256]
+WARNING: [Synth 8-6014] Unused sequential element c_q0_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_0cam_ch1_0108.v:256]
+WARNING: [Synth 8-6014] Unused sequential element trs_active_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_0cam_ch1_0108.v:258]
+WARNING: [Synth 8-6014] Unused sequential element trs_cnt_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_0cam_ch1_0108.v:259]
+WARNING: [Synth 8-6014] Unused sequential element xy_8bit_reg_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_0cam_ch1_0108.v:260]
+WARNING: [Synth 8-6014] Unused sequential element y_10bit_reg_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_0cam_ch1_0108.v:262]
+WARNING: [Synth 8-6014] Unused sequential element c_10bit_reg_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_0cam_ch1_0108.v:263]
+WARNING: [Synth 8-6014] Unused sequential element cam0_y_d0_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_0cam_ch1_0108.v:86]
+WARNING: [Synth 8-6014] Unused sequential element cam1_f_bit_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_1cam_ch1_1202.v:110]
+WARNING: [Synth 8-6014] Unused sequential element cam1_v_bit_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_1cam_ch1_1202.v:111]
+WARNING: [Synth 8-6014] Unused sequential element cam1_h_bit_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_1cam_ch1_1202.v:112]
+WARNING: [Synth 8-6014] Unused sequential element cam1_hsync_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_1cam_ch1_1202.v:115]
+WARNING: [Synth 8-6014] Unused sequential element cam1_y_d0_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_1cam_ch1_1202.v:77]
+WARNING: [Synth 8-6014] Unused sequential element cam2_f_bit_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_2cam_ch1_1202.v:107]
+WARNING: [Synth 8-6014] Unused sequential element cam2_v_bit_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_2cam_ch1_1202.v:108]
+WARNING: [Synth 8-6014] Unused sequential element cam2_h_bit_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_2cam_ch1_1202.v:109]
+WARNING: [Synth 8-6014] Unused sequential element cam2_hsync_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_2cam_ch1_1202.v:112]
+WARNING: [Synth 8-6014] Unused sequential element cam2_y_d0_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_2cam_ch1_1202.v:75]
+WARNING: [Synth 8-6014] Unused sequential element cam3_f_bit_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_3cam_ch1_1202.v:103]
+WARNING: [Synth 8-6014] Unused sequential element cam3_v_bit_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_3cam_ch1_1202.v:104]
+WARNING: [Synth 8-6014] Unused sequential element cam3_h_bit_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_3cam_ch1_1202.v:105]
+WARNING: [Synth 8-6014] Unused sequential element cam3_hsync_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_3cam_ch1_1202.v:108]
+WARNING: [Synth 8-6014] Unused sequential element cam3_y_d0_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_3cam_ch1_1202.v:73]
+WARNING: [Synth 8-6014] Unused sequential element cam4_f_bit_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_4cam_ch1_1202.v:108]
+WARNING: [Synth 8-6014] Unused sequential element cam4_v_bit_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_4cam_ch1_1202.v:109]
+WARNING: [Synth 8-6014] Unused sequential element cam4_h_bit_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_4cam_ch1_1202.v:110]
+WARNING: [Synth 8-6014] Unused sequential element cam4_hsync_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_4cam_ch1_1202.v:113]
+WARNING: [Synth 8-6014] Unused sequential element cam4_y_d0_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_4cam_ch1_1202.v:76]
+WARNING: [Synth 8-6014] Unused sequential element cam5_f_bit_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_5cam_ch1_1202.v:105]
+WARNING: [Synth 8-6014] Unused sequential element cam5_v_bit_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_5cam_ch1_1202.v:106]
+WARNING: [Synth 8-6014] Unused sequential element cam5_h_bit_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_5cam_ch1_1202.v:107]
+WARNING: [Synth 8-6014] Unused sequential element cam5_hsync_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_5cam_ch1_1202.v:110]
+WARNING: [Synth 8-6014] Unused sequential element cam5_y_d0_reg was removed.  [E:/Xylinx/IR_Debug_I2C_Select/Kintex_top_5cam_ch1_1202.v:73]
+WARNING: [Synth 8-3936] Found unconnected internal register 'IRCAM0_DOUT_1d_reg' and it is trimmed from '16' to '14' bits. [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_IR6ch_I2CSelect_FINAL.v:140]
+WARNING: [Synth 8-3936] Found unconnected internal register 'IRCAM1_DOUT_1d_reg' and it is trimmed from '16' to '14' bits. [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_IR6ch_I2CSelect_FINAL.v:147]
+WARNING: [Synth 8-3936] Found unconnected internal register 'IRCAM2_DOUT_1d_reg' and it is trimmed from '16' to '14' bits. [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_IR6ch_I2CSelect_FINAL.v:154]
+WARNING: [Synth 8-3936] Found unconnected internal register 'IRCAM3_DOUT_1d_reg' and it is trimmed from '16' to '14' bits. [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_IR6ch_I2CSelect_FINAL.v:161]
+WARNING: [Synth 8-3936] Found unconnected internal register 'IRCAM4_DOUT_1d_reg' and it is trimmed from '16' to '14' bits. [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_IR6ch_I2CSelect_FINAL.v:168]
+WARNING: [Synth 8-3936] Found unconnected internal register 'IRCAM5_DOUT_1d_reg' and it is trimmed from '16' to '14' bits. [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_IR6ch_I2CSelect_FINAL.v:175]
+WARNING: [Synth 8-7129] Port FPGA_RESET in module Kintex_top_5cam_1ch is either unconnected or has no load
+WARNING: [Synth 8-7129] Port FPGA_RESET in module Kintex_top_4cam_1ch is either unconnected or has no load
+WARNING: [Synth 8-7129] Port FPGA_RESET in module Kintex_top_3cam_1ch is either unconnected or has no load
+WARNING: [Synth 8-7129] Port FPGA_RESET in module Kintex_top_2cam_1ch is either unconnected or has no load
+WARNING: [Synth 8-7129] Port FPGA_RESET in module Kintex_top_1cam_1ch is either unconnected or has no load
+WARNING: [Synth 8-7129] Port FPGA_RESET in module Kintex_top_0cam_1ch is either unconnected or has no load
+WARNING: [Synth 8-7129] Port FPGA_RESET in module Kintex_top_I2C_test is either unconnected or has no load
+WARNING: [Synth 8-7129] Port IRCAM0_DOUT[15] in module KintexTop_IR6ch_I2CSelect is either unconnected or has no load
+WARNING: [Synth 8-7129] Port IRCAM0_DOUT[14] in module KintexTop_IR6ch_I2CSelect is either unconnected or has no load
+WARNING: [Synth 8-7129] Port IRCAM1_DOUT[15] in module KintexTop_IR6ch_I2CSelect is either unconnected or has no load
+WARNING: [Synth 8-7129] Port IRCAM1_DOUT[14] in module KintexTop_IR6ch_I2CSelect is either unconnected or has no load
+WARNING: [Synth 8-7129] Port IRCAM2_DOUT[15] in module KintexTop_IR6ch_I2CSelect is either unconnected or has no load
+WARNING: [Synth 8-7129] Port IRCAM2_DOUT[14] in module KintexTop_IR6ch_I2CSelect is either unconnected or has no load
+WARNING: [Synth 8-7129] Port IRCAM3_DOUT[15] in module KintexTop_IR6ch_I2CSelect is either unconnected or has no load
+WARNING: [Synth 8-7129] Port IRCAM3_DOUT[14] in module KintexTop_IR6ch_I2CSelect is either unconnected or has no load
+WARNING: [Synth 8-7129] Port IRCAM4_DOUT[15] in module KintexTop_IR6ch_I2CSelect is either unconnected or has no load
+WARNING: [Synth 8-7129] Port IRCAM4_DOUT[14] in module KintexTop_IR6ch_I2CSelect is either unconnected or has no load
+WARNING: [Synth 8-7129] Port IRCAM5_DOUT[15] in module KintexTop_IR6ch_I2CSelect is either unconnected or has no load
+WARNING: [Synth 8-7129] Port IRCAM5_DOUT[14] in module KintexTop_IR6ch_I2CSelect is either unconnected or has no load
+---------------------------------------------------------------------------------
+Finished RTL Elaboration : Time (s): cpu = 00:00:10 ; elapsed = 00:00:11 . Memory (MB): peak = 2228.879 ; gain = 436.762
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Start Handling Custom Attributes
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Finished Handling Custom Attributes : Time (s): cpu = 00:00:11 ; elapsed = 00:00:11 . Memory (MB): peak = 2228.879 ; gain = 436.762
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Finished RTL Optimization Phase 1 : Time (s): cpu = 00:00:11 ; elapsed = 00:00:11 . Memory (MB): peak = 2228.879 ; gain = 436.762
+---------------------------------------------------------------------------------
+Netlist sorting complete. Time (s): cpu = 00:00:00 ; elapsed = 00:00:00.038 . Memory (MB): peak = 2228.879 ; gain = 0.000
+INFO: [Netlist 29-17] Analyzing 17 Unisim elements for replacement
+WARNING: [Netlist 29-432] The IBUFG primitive 'U_ircam0_pclk_ibuf' has been retargeted to an IBUF primitive only. No BUFG will be added. If a global buffer is intended, please instantiate an available global clock primitive from the current architecture.
+WARNING: [Netlist 29-432] The IBUFG primitive 'U_ircam1_pclk_ibuf' has been retargeted to an IBUF primitive only. No BUFG will be added. If a global buffer is intended, please instantiate an available global clock primitive from the current architecture.
+WARNING: [Netlist 29-432] The IBUFG primitive 'U_ircam2_pclk_ibuf' has been retargeted to an IBUF primitive only. No BUFG will be added. If a global buffer is intended, please instantiate an available global clock primitive from the current architecture.
+WARNING: [Netlist 29-432] The IBUFG primitive 'U_ircam3_pclk_ibuf' has been retargeted to an IBUF primitive only. No BUFG will be added. If a global buffer is intended, please instantiate an available global clock primitive from the current architecture.
+WARNING: [Netlist 29-432] The IBUFG primitive 'U_ircam4_pclk_ibuf' has been retargeted to an IBUF primitive only. No BUFG will be added. If a global buffer is intended, please instantiate an available global clock primitive from the current architecture.
+WARNING: [Netlist 29-432] The IBUFG primitive 'U_ircam5_pclk_ibuf' has been retargeted to an IBUF primitive only. No BUFG will be added. If a global buffer is intended, please instantiate an available global clock primitive from the current architecture.
+INFO: [Netlist 29-28] Unisim Transformation completed in 0 CPU seconds
+INFO: [Project 1-570] Preparing netlist for logic optimization
+
+Processing XDC Constraints
+Initializing timing engine
+Parsing XDC File [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_IR6ch_I2CSelect_FINAL.xdc]
+create_clock: Time (s): cpu = 00:00:07 ; elapsed = 00:00:07 . Memory (MB): peak = 2331.574 ; gain = 17.035
+Finished Parsing XDC File [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_IR6ch_I2CSelect_FINAL.xdc]
+INFO: [Project 1-236] Implementation specific constraints were found while reading constraint file [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_IR6ch_I2CSelect_FINAL.xdc]. These constraints will be ignored for synthesis but will be used in implementation. Impacted constraints are listed in the file [.Xil/KintexTop_IR6ch_I2CSelect_propImpl.xdc].
+Resolution: To avoid this warning, move constraints listed in [.Xil/KintexTop_IR6ch_I2CSelect_propImpl.xdc] to another XDC file and exclude this new file from synthesis with the used_in_synthesis property (File Properties dialog in GUI) and re-run elaboration/synthesis.
+Completed Processing XDC Constraints
+
+Netlist sorting complete. Time (s): cpu = 00:00:00 ; elapsed = 00:00:00.003 . Memory (MB): peak = 2331.574 ; gain = 0.000
+INFO: [Project 1-111] Unisim Transformation Summary:
+  A total of 17 instances were transformed.
+  BUFG => BUFGCE: 3 instances
+  IBUF => IBUF (IBUFCTRL, INBUF): 7 instances
+  IBUFG => IBUF (IBUFCTRL, INBUF): 6 instances
+  IOBUF => IOBUF (IBUFCTRL, INBUF, OBUFT): 1 instance 
+
+Constraint Validation Runtime : Time (s): cpu = 00:00:00 ; elapsed = 00:00:00.050 . Memory (MB): peak = 2331.574 ; gain = 0.000
+INFO: [Designutils 20-5440] No compile time benefit to using incremental synthesis; A full resynthesis will be run
+INFO: [Designutils 20-4379] Flow is switching to default flow due to incremental criteria not met. If you would like to alter this behaviour and have the flow terminate instead, please set the following parameter config_implementation {autoIncr.Synth.RejectBehavior Terminate}
+---------------------------------------------------------------------------------
+Finished Constraint Validation : Time (s): cpu = 00:00:29 ; elapsed = 00:00:30 . Memory (MB): peak = 2331.574 ; gain = 539.457
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Start Loading Part and Timing Information
+---------------------------------------------------------------------------------
+Loading part: xcku15p-ffve1517-2-i
+INFO: [Synth 8-6742] Reading net delay rules and data
+---------------------------------------------------------------------------------
+Finished Loading Part and Timing Information : Time (s): cpu = 00:00:29 ; elapsed = 00:00:30 . Memory (MB): peak = 2331.574 ; gain = 539.457
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Start Applying 'set_property' XDC Constraints
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Finished applying 'set_property' XDC Constraints : Time (s): cpu = 00:00:29 ; elapsed = 00:00:31 . Memory (MB): peak = 2331.574 ; gain = 539.457
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Finished RTL Optimization Phase 2 : Time (s): cpu = 00:00:30 ; elapsed = 00:00:32 . Memory (MB): peak = 2331.574 ; gain = 539.457
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Start RTL Component Statistics 
+---------------------------------------------------------------------------------
+Detailed RTL Component Info : 
++---Adders : 
+	   2 Input   22 Bit       Adders := 1     
+	   2 Input   12 Bit       Adders := 6     
+	   2 Input    8 Bit       Adders := 1     
+	   2 Input    4 Bit       Adders := 1     
+	   2 Input    3 Bit       Adders := 3     
++---Registers : 
+	               22 Bit    Registers := 1     
+	               14 Bit    Registers := 6     
+	               12 Bit    Registers := 6     
+	                8 Bit    Registers := 153   
+	                3 Bit    Registers := 1     
+	                1 Bit    Registers := 34    
++---Muxes : 
+	   2 Input   20 Bit        Muxes := 1     
+	   2 Input    8 Bit        Muxes := 6     
+	   9 Input    8 Bit        Muxes := 2     
+	   2 Input    4 Bit        Muxes := 5     
+	   2 Input    3 Bit        Muxes := 9     
+	   3 Input    3 Bit        Muxes := 1     
+	   2 Input    2 Bit        Muxes := 1     
+	   2 Input    1 Bit        Muxes := 20    
+	   9 Input    1 Bit        Muxes := 133   
+	   6 Input    1 Bit        Muxes := 1     
+---------------------------------------------------------------------------------
+Finished RTL Component Statistics 
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Start Part Resource Summary
+---------------------------------------------------------------------------------
+Part Resources:
+DSPs: 1968 (col length:264)
+BRAMs: 1968 (col length: RAMB18 264 RAMB36 132)
+---------------------------------------------------------------------------------
+Finished Part Resource Summary
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Start Cross Boundary and Area Optimization
+---------------------------------------------------------------------------------
+WARNING: [Synth 8-3917] design KintexTop_IR6ch_I2CSelect has port IEG0_DOUT[19] driven by constant 0
+WARNING: [Synth 8-3917] design KintexTop_IR6ch_I2CSelect has port IEG0_DOUT[18] driven by constant 0
+WARNING: [Synth 8-3917] design KintexTop_IR6ch_I2CSelect has port IEG0_DOUT[17] driven by constant 0
+WARNING: [Synth 8-3917] design KintexTop_IR6ch_I2CSelect has port IEG0_DOUT[16] driven by constant 0
+WARNING: [Synth 8-3917] design KintexTop_IR6ch_I2CSelect has port IEG0_DOUT[15] driven by constant 0
+WARNING: [Synth 8-3917] design KintexTop_IR6ch_I2CSelect has port IEG0_DOUT[14] driven by constant 0
+WARNING: [Synth 8-3917] design KintexTop_IR6ch_I2CSelect has port IEG0_DOUT[13] driven by constant 0
+WARNING: [Synth 8-3917] design KintexTop_IR6ch_I2CSelect has port IEG0_DOUT[12] driven by constant 0
+WARNING: [Synth 8-3917] design KintexTop_IR6ch_I2CSelect has port IEG0_DOUT[11] driven by constant 0
+WARNING: [Synth 8-3917] design KintexTop_IR6ch_I2CSelect has port IEG0_DOUT[10] driven by constant 0
+WARNING: [Synth 8-3917] design KintexTop_IR6ch_I2CSelect has port IEG0_DOUT[9] driven by constant 0
+WARNING: [Synth 8-3917] design KintexTop_IR6ch_I2CSelect has port IEG0_DOUT[8] driven by constant 0
+WARNING: [Synth 8-3917] design KintexTop_IR6ch_I2CSelect has port IEG1_DOUT[19] driven by constant 0
+WARNING: [Synth 8-3917] design KintexTop_IR6ch_I2CSelect has port IEG1_DOUT[18] driven by constant 0
+WARNING: [Synth 8-3917] design KintexTop_IR6ch_I2CSelect has port IEG1_DOUT[17] driven by constant 0
+WARNING: [Synth 8-3917] design KintexTop_IR6ch_I2CSelect has port IEG1_DOUT[16] driven by constant 0
+WARNING: [Synth 8-3917] design KintexTop_IR6ch_I2CSelect has port IEG1_DOUT[15] driven by constant 0
+WARNING: [Synth 8-3917] design KintexTop_IR6ch_I2CSelect has port IEG1_DOUT[14] driven by constant 0
+WARNING: [Synth 8-3917] design KintexTop_IR6ch_I2CSelect has port IEG1_DOUT[13] driven by constant 0
+WARNING: [Synth 8-3917] design KintexTop_IR6ch_I2CSelect has port IEG1_DOUT[12] driven by constant 0
+WARNING: [Synth 8-3917] design KintexTop_IR6ch_I2CSelect has port IEG1_DOUT[11] driven by constant 0
+WARNING: [Synth 8-3917] design KintexTop_IR6ch_I2CSelect has port IEG1_DOUT[10] driven by constant 0
+WARNING: [Synth 8-3917] design KintexTop_IR6ch_I2CSelect has port IEG1_DOUT[9] driven by constant 0
+WARNING: [Synth 8-3917] design KintexTop_IR6ch_I2CSelect has port IEG1_DOUT[8] driven by constant 0
+WARNING: [Synth 8-7129] Port FPGA_RESET in module Kintex_top_I2C_test is either unconnected or has no load
+WARNING: [Synth 8-7129] Port IRCAM0_DOUT[15] in module KintexTop_IR6ch_I2CSelect is either unconnected or has no load
+WARNING: [Synth 8-7129] Port IRCAM0_DOUT[14] in module KintexTop_IR6ch_I2CSelect is either unconnected or has no load
+WARNING: [Synth 8-7129] Port IRCAM1_DOUT[15] in module KintexTop_IR6ch_I2CSelect is either unconnected or has no load
+WARNING: [Synth 8-7129] Port IRCAM1_DOUT[14] in module KintexTop_IR6ch_I2CSelect is either unconnected or has no load
+WARNING: [Synth 8-7129] Port IRCAM2_DOUT[15] in module KintexTop_IR6ch_I2CSelect is either unconnected or has no load
+WARNING: [Synth 8-7129] Port IRCAM2_DOUT[14] in module KintexTop_IR6ch_I2CSelect is either unconnected or has no load
+WARNING: [Synth 8-7129] Port IRCAM3_DOUT[15] in module KintexTop_IR6ch_I2CSelect is either unconnected or has no load
+WARNING: [Synth 8-7129] Port IRCAM3_DOUT[14] in module KintexTop_IR6ch_I2CSelect is either unconnected or has no load
+WARNING: [Synth 8-7129] Port IRCAM4_DOUT[15] in module KintexTop_IR6ch_I2CSelect is either unconnected or has no load
+WARNING: [Synth 8-7129] Port IRCAM4_DOUT[14] in module KintexTop_IR6ch_I2CSelect is either unconnected or has no load
+WARNING: [Synth 8-7129] Port IRCAM5_DOUT[15] in module KintexTop_IR6ch_I2CSelect is either unconnected or has no load
+WARNING: [Synth 8-7129] Port IRCAM5_DOUT[14] in module KintexTop_IR6ch_I2CSelect is either unconnected or has no load
+---------------------------------------------------------------------------------
+Finished Cross Boundary and Area Optimization : Time (s): cpu = 00:00:39 ; elapsed = 00:00:41 . Memory (MB): peak = 2331.574 ; gain = 539.457
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Start Applying XDC Timing Constraints
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Finished Applying XDC Timing Constraints : Time (s): cpu = 00:00:52 ; elapsed = 00:00:55 . Memory (MB): peak = 2871.203 ; gain = 1079.086
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Start Timing Optimization
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Finished Timing Optimization : Time (s): cpu = 00:00:58 ; elapsed = 00:01:00 . Memory (MB): peak = 2970.652 ; gain = 1178.535
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Start Technology Mapping
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Finished Technology Mapping : Time (s): cpu = 00:00:58 ; elapsed = 00:01:01 . Memory (MB): peak = 2988.707 ; gain = 1196.590
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Start IO Insertion
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Start Flattening Before IO Insertion
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Finished Flattening Before IO Insertion
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Start Final Netlist Cleanup
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Finished Final Netlist Cleanup
+---------------------------------------------------------------------------------
+WARNING: [Synth 8-5410] Found another clock driver \u_i2c/u_bufg_sclk :O [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_IR6ch_I2CSelect_FINAL.v:456]
+WARNING: [Synth 8-5410] Found another clock driver U_cam0_pclk_bufg:O [E:/Xylinx/IR_Debug_I2C_Select/KintexTop_IR6ch_I2CSelect_FINAL.v:124]
+---------------------------------------------------------------------------------
+Finished IO Insertion : Time (s): cpu = 00:01:04 ; elapsed = 00:01:07 . Memory (MB): peak = 3150.754 ; gain = 1358.637
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Start Renaming Generated Instances
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Finished Renaming Generated Instances : Time (s): cpu = 00:01:04 ; elapsed = 00:01:07 . Memory (MB): peak = 3150.754 ; gain = 1358.637
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Start Rebuilding User Hierarchy
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Finished Rebuilding User Hierarchy : Time (s): cpu = 00:01:04 ; elapsed = 00:01:07 . Memory (MB): peak = 3150.754 ; gain = 1358.637
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Start Renaming Generated Ports
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Finished Renaming Generated Ports : Time (s): cpu = 00:01:04 ; elapsed = 00:01:07 . Memory (MB): peak = 3150.754 ; gain = 1358.637
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Start Handling Custom Attributes
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Finished Handling Custom Attributes : Time (s): cpu = 00:01:04 ; elapsed = 00:01:07 . Memory (MB): peak = 3150.754 ; gain = 1358.637
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Start Renaming Generated Nets
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Finished Renaming Generated Nets : Time (s): cpu = 00:01:04 ; elapsed = 00:01:07 . Memory (MB): peak = 3150.754 ; gain = 1358.637
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Start Writing Synthesis Report
+---------------------------------------------------------------------------------
+
+Report BlackBoxes: 
++-+--------------+----------+
+| |BlackBox name |Instances |
++-+--------------+----------+
++-+--------------+----------+
+
+Report Cell Usage: 
++------+-------+------+
+|      |Cell   |Count |
++------+-------+------+
+|1     |BUFG   |     6|
+|2     |CARRY8 |     3|
+|3     |LUT1   |     2|
+|4     |LUT2   |    19|
+|5     |LUT3   |    20|
+|6     |LUT4   |    28|
+|7     |LUT5   |    69|
+|8     |LUT6   |   518|
+|9     |MUXF7  |   128|
+|10    |MUXF8  |    56|
+|11    |FDRE   |  1239|
+|12    |IBUF   |   164|
+|13    |IBUFG  |     6|
+|14    |IOBUF  |     1|
+|15    |OBUF   |    81|
++------+-------+------+
+---------------------------------------------------------------------------------
+Finished Writing Synthesis Report : Time (s): cpu = 00:01:04 ; elapsed = 00:01:07 . Memory (MB): peak = 3150.754 ; gain = 1358.637
+---------------------------------------------------------------------------------
+Synthesis finished with 0 errors, 0 critical warnings and 39 warnings.
+Synthesis Optimization Runtime : Time (s): cpu = 00:00:44 ; elapsed = 00:00:57 . Memory (MB): peak = 3150.754 ; gain = 1255.941
+Synthesis Optimization Complete : Time (s): cpu = 00:01:05 ; elapsed = 00:01:07 . Memory (MB): peak = 3150.754 ; gain = 1358.637
+INFO: [Project 1-571] Translating synthesized netlist
+Netlist sorting complete. Time (s): cpu = 00:00:00 ; elapsed = 00:00:00.034 . Memory (MB): peak = 3150.754 ; gain = 0.000
+INFO: [Netlist 29-17] Analyzing 364 Unisim elements for replacement
+WARNING: [Netlist 29-432] The IBUFG primitive 'U_ircam0_pclk_ibuf' has been retargeted to an IBUF primitive only. No BUFG will be added. If a global buffer is intended, please instantiate an available global clock primitive from the current architecture.
+WARNING: [Netlist 29-432] The IBUFG primitive 'U_ircam1_pclk_ibuf' has been retargeted to an IBUF primitive only. No BUFG will be added. If a global buffer is intended, please instantiate an available global clock primitive from the current architecture.
+WARNING: [Netlist 29-432] The IBUFG primitive 'U_ircam2_pclk_ibuf' has been retargeted to an IBUF primitive only. No BUFG will be added. If a global buffer is intended, please instantiate an available global clock primitive from the current architecture.
+WARNING: [Netlist 29-432] The IBUFG primitive 'U_ircam3_pclk_ibuf' has been retargeted to an IBUF primitive only. No BUFG will be added. If a global buffer is intended, please instantiate an available global clock primitive from the current architecture.
+WARNING: [Netlist 29-432] The IBUFG primitive 'U_ircam4_pclk_ibuf' has been retargeted to an IBUF primitive only. No BUFG will be added. If a global buffer is intended, please instantiate an available global clock primitive from the current architecture.
+WARNING: [Netlist 29-432] The IBUFG primitive 'U_ircam5_pclk_ibuf' has been retargeted to an IBUF primitive only. No BUFG will be added. If a global buffer is intended, please instantiate an available global clock primitive from the current architecture.
+INFO: [Netlist 29-28] Unisim Transformation completed in 0 CPU seconds
+WARNING: [Netlist 29-101] Netlist 'KintexTop_IR6ch_I2CSelect' is not ideal for floorplanning, since the cellview 'Kintex_top_I2C_test' contains a large number of primitives.  Please consider enabling hierarchy in synthesis if you want to do floorplanning.
+INFO: [Project 1-570] Preparing netlist for logic optimization
+INFO: [Opt 31-138] Pushed 0 inverter(s) to 0 load pin(s).
+Netlist sorting complete. Time (s): cpu = 00:00:00 ; elapsed = 00:00:00.001 . Memory (MB): peak = 3150.754 ; gain = 0.000
+INFO: [Project 1-111] Unisim Transformation Summary:
+  A total of 177 instances were transformed.
+  BUFG => BUFGCE: 6 instances
+  IBUF => IBUF (IBUFCTRL, INBUF): 164 instances
+  IBUFG => IBUF (IBUFCTRL, INBUF): 6 instances
+  IOBUF => IOBUF (IBUFCTRL, INBUF, OBUFT): 1 instance 
+
+Synth Design complete | Checksum: dc74a07d
+INFO: [Common 17-83] Releasing license: Synthesis
+48 Infos, 122 Warnings, 0 Critical Warnings and 0 Errors encountered.
+synth_design completed successfully
+synth_design: Time (s): cpu = 00:01:18 ; elapsed = 00:01:24 . Memory (MB): peak = 3150.754 ; gain = 2618.332
+Write ShapeDB Complete: Time (s): cpu = 00:00:00 ; elapsed = 00:00:00.008 . Memory (MB): peak = 3150.754 ; gain = 0.000
+INFO: [Common 17-1381] The checkpoint 'E:/Xylinx/IR_Debug_I2C_Select/IR_Debug_I2C_Select.runs/synth_1/KintexTop_IR6ch_I2CSelect.dcp' has been generated.
+INFO: [Vivado 12-24828] Executing command : report_utilization -file KintexTop_IR6ch_I2CSelect_utilization_synth.rpt -pb KintexTop_IR6ch_I2CSelect_utilization_synth.pb
+INFO: [Common 17-206] Exiting Vivado at Thu Apr 16 03:00:58 2026...

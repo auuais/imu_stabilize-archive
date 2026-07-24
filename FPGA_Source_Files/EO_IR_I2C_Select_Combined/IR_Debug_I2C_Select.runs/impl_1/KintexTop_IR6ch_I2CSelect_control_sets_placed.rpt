@@ -1,0 +1,222 @@
+Copyright 1986-2022 Xilinx, Inc. All Rights Reserved. Copyright 2022-2025 Advanced Micro Devices, Inc. All Rights Reserved.
+---------------------------------------------------------------------------------------------------------------------------------------------
+| Tool Version : Vivado v.2025.2 (win64) Build 6299465 Fri Nov 14 19:35:11 GMT 2025
+| Date         : Thu Apr 16 03:06:28 2026
+| Host         : RMachine running 64-bit major release  (build 9200)
+| Command      : report_control_sets -verbose -file KintexTop_IR6ch_I2CSelect_control_sets_placed.rpt
+| Design       : KintexTop_IR6ch_I2CSelect
+| Device       : xcku15p
+---------------------------------------------------------------------------------------------------------------------------------------------
+
+Control Set Information
+
+Table of Contents
+-----------------
+1. Summary
+2. Histogram
+3. Flip-Flop Distribution
+4. Detailed Control Set Information
+
+1. Summary
+----------
+
++----------------------------------------------------------+-------+
+|                          Status                          | Count |
++----------------------------------------------------------+-------+
+| Total control sets                                       |   144 |
+|    Minimum number of control sets                        |   144 |
+|    Addition due to synthesis replication                 |     0 |
+|    Addition due to physical synthesis replication        |     0 |
+| Unused register locations in slices containing registers |    20 |
++----------------------------------------------------------+-------+
+* Control sets can be merged at opt_design using control_set_merge or merge_equivalent_drivers
+** Run report_qor_suggestions for automated merging and remapping suggestions
+
+
+2. Histogram
+------------
+
++--------------------+-------+
+|       Fanout       | Count |
++--------------------+-------+
+| Total control sets |   144 |
+| >= 0 to < 4        |     1 |
+| >= 4 to < 6        |     1 |
+| >= 6 to < 8        |     0 |
+| >= 8 to < 10       |   128 |
+| >= 10 to < 12      |     6 |
+| >= 12 to < 14      |     1 |
+| >= 14 to < 16      |     0 |
+| >= 16              |     7 |
++--------------------+-------+
+* Control sets can be remapped at either synth_design or opt_design
+
+
+3. Flip-Flop Distribution
+-------------------------
+
++--------------+-----------------------+------------------------+-----------------+--------------+
+| Clock Enable | Synchronous Set/Reset | Asynchronous Set/Reset | Total Registers | Total Slices |
++--------------+-----------------------+------------------------+-----------------+--------------+
+| No           | No                    | No                     |             178 |           35 |
+| No           | No                    | Yes                    |               0 |            0 |
+| No           | Yes                   | No                     |              22 |            4 |
+| Yes          | No                    | No                     |            1044 |          184 |
+| Yes          | No                    | Yes                    |               0 |            0 |
+| Yes          | Yes                   | No                     |               0 |            0 |
++--------------+-----------------------+------------------------+-----------------+--------------+
+
+
+4. Detailed Control Set Information
+-----------------------------------
+
++---------------------------+-------------------------------+------------------+------------------+----------------+--------------+
+|        Clock Signal       |         Enable Signal         | Set/Reset Signal | Slice Load Count | Bel Load Count | Bels / Slice |
++---------------------------+-------------------------------+------------------+------------------+----------------+--------------+
+|  xlnx_opt_                | u_i2c/bit_cnt[2]_i_1_n_0      |                  |                1 |              3 |         3.00 |
+|  xlnx_opt_                | u_i2c/state[3]_i_1_n_0        |                  |                2 |              4 |         2.00 |
+|  xlnx_opt_                | u_i2c/regfile[0][7]_i_1_n_0   |                  |                1 |              8 |         8.00 |
+|  xlnx_opt_                | u_i2c/regfile[71][7]_i_1_n_0  |                  |                3 |              8 |         2.67 |
+|  xlnx_opt_                | u_i2c/regfile[72][7]_i_1_n_0  |                  |                3 |              8 |         2.67 |
+|  xlnx_opt_                | u_i2c/regfile[97][7]_i_1_n_0  |                  |                4 |              8 |         2.00 |
+|  xlnx_opt_                | u_i2c/regfile[77][7]_i_1_n_0  |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[91][7]_i_1_n_0  |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[69][7]_i_1_n_0  |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[70][7]_i_1_n_0  |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[68][7]_i_1_n_0  |                  |                2 |              8 |         4.00 |
+|  xlnx_opt_                | u_i2c/regfile[93][7]_i_1_n_0  |                  |                6 |              8 |         1.33 |
+|  xlnx_opt_                | u_i2c/regfile[76][7]_i_1_n_0  |                  |                6 |              8 |         1.33 |
+|  xlnx_opt_                | u_i2c/regfile[98][7]_i_1_n_0  |                  |                2 |              8 |         4.00 |
+|  xlnx_opt_                | u_i2c/regfile[99][7]_i_1_n_0  |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[100][7]_i_1_n_0 |                  |                6 |              8 |         1.33 |
+|  xlnx_opt_                | u_i2c/regfile[101][7]_i_1_n_0 |                  |                6 |              8 |         1.33 |
+|  xlnx_opt_                | u_i2c/regfile[103][7]_i_1_n_0 |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[92][7]_i_1_n_0  |                  |                6 |              8 |         1.33 |
+|  xlnx_opt_                | u_i2c/regfile[18][7]_i_1_n_0  |                  |                4 |              8 |         2.00 |
+|  xlnx_opt_                | u_i2c/regfile[102][7]_i_1_n_0 |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[104][7]_i_1_n_0 |                  |                7 |              8 |         1.14 |
+|  xlnx_opt_                | u_i2c/regfile[105][7]_i_1_n_0 |                  |                8 |              8 |         1.00 |
+|  xlnx_opt_                | u_i2c/regfile[106][7]_i_1_n_0 |                  |                6 |              8 |         1.33 |
+|  xlnx_opt_                | u_i2c/regfile[1][7]_i_1_n_0   |                  |                6 |              8 |         1.33 |
+|  xlnx_opt_                | u_i2c/regfile[24][7]_i_1_n_0  |                  |                6 |              8 |         1.33 |
+|  xlnx_opt_                | u_i2c/regfile[26][7]_i_1_n_0  |                  |                7 |              8 |         1.14 |
+|  xlnx_opt_                | u_i2c/regfile[115][7]_i_1_n_0 |                  |                6 |              8 |         1.33 |
+|  xlnx_opt_                | u_i2c/regfile[27][7]_i_1_n_0  |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[13][7]_i_1_n_0  |                  |                4 |              8 |         2.00 |
+|  xlnx_opt_                | u_i2c/regfile[109][7]_i_1_n_0 |                  |                6 |              8 |         1.33 |
+|  xlnx_opt_                | u_i2c/regfile[17][7]_i_1_n_0  |                  |                4 |              8 |         2.00 |
+|  xlnx_opt_                | u_i2c/regfile[117][7]_i_1_n_0 |                  |                6 |              8 |         1.33 |
+|  xlnx_opt_                | u_i2c/regfile[20][7]_i_1_n_0  |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[127][7]_i_1_n_0 |                  |                3 |              8 |         2.67 |
+|  xlnx_opt_                | u_i2c/regfile[31][7]_i_1_n_0  |                  |                3 |              8 |         2.67 |
+|  xlnx_opt_                | u_i2c/regfile[12][7]_i_1_n_0  |                  |                1 |              8 |         8.00 |
+|  xlnx_opt_                | u_i2c/regfile[120][7]_i_1_n_0 |                  |                6 |              8 |         1.33 |
+|  xlnx_opt_                | u_i2c/regfile[124][7]_i_1_n_0 |                  |                6 |              8 |         1.33 |
+|  xlnx_opt_                | u_i2c/regfile[22][7]_i_1_n_0  |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[25][7]_i_1_n_0  |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[23][7]_i_1_n_0  |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[30][7]_i_1_n_0  |                  |                2 |              8 |         4.00 |
+|  xlnx_opt_                | u_i2c/regfile[110][7]_i_1_n_0 |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[107][7]_i_1_n_0 |                  |                3 |              8 |         2.67 |
+|  xlnx_opt_                | u_i2c/regfile[111][7]_i_1_n_0 |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[10][7]_i_1_n_0  |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[113][7]_i_1_n_0 |                  |                7 |              8 |         1.14 |
+|  xlnx_opt_                | u_i2c/regfile[121][7]_i_1_n_0 |                  |                1 |              8 |         8.00 |
+|  xlnx_opt_                | u_i2c/regfile[21][7]_i_1_n_0  |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[29][7]_i_1_n_0  |                  |                3 |              8 |         2.67 |
+|  xlnx_opt_                | u_i2c/regfile[112][7]_i_1_n_0 |                  |                6 |              8 |         1.33 |
+|  xlnx_opt_                | u_i2c/regfile[14][7]_i_1_n_0  |                  |                7 |              8 |         1.14 |
+|  xlnx_opt_                | u_i2c/regfile[15][7]_i_1_n_0  |                  |                4 |              8 |         2.00 |
+|  xlnx_opt_                | u_i2c/regfile[16][7]_i_1_n_0  |                  |                4 |              8 |         2.00 |
+|  xlnx_opt_                | u_i2c/regfile[2][7]_i_1_n_0   |                  |                6 |              8 |         1.33 |
+|  xlnx_opt_                | u_i2c/regfile[28][7]_i_1_n_0  |                  |                6 |              8 |         1.33 |
+|  xlnx_opt_                | u_i2c/regfile[116][7]_i_1_n_0 |                  |                3 |              8 |         2.67 |
+|  xlnx_opt_                | u_i2c/regfile[119][7]_i_1_n_0 |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[123][7]_i_1_n_0 |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[122][7]_i_1_n_0 |                  |                2 |              8 |         4.00 |
+|  xlnx_opt_                | u_i2c/regfile[125][7]_i_1_n_0 |                  |                1 |              8 |         8.00 |
+|  xlnx_opt_                | u_i2c/regfile[118][7]_i_1_n_0 |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[114][7]_i_1_n_0 |                  |                2 |              8 |         4.00 |
+|  xlnx_opt_                | u_i2c/regfile[11][7]_i_1_n_0  |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[126][7]_i_1_n_0 |                  |                7 |              8 |         1.14 |
+|  xlnx_opt_                | u_i2c/regfile[19][7]_i_1_n_0  |                  |                6 |              8 |         1.33 |
+|  xlnx_opt_                | u_i2c/regfile[108][7]_i_1_n_0 |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[47][7]_i_1_n_0  |                  |                7 |              8 |         1.14 |
+|  xlnx_opt_                | u_i2c/regfile[54][7]_i_1_n_0  |                  |                3 |              8 |         2.67 |
+|  xlnx_opt_                | u_i2c/regfile[4][7]_i_1_n_0   |                  |                2 |              8 |         4.00 |
+|  xlnx_opt_                | u_i2c/regfile[43][7]_i_1_n_0  |                  |                4 |              8 |         2.00 |
+|  xlnx_opt_                | u_i2c/regfile[60][7]_i_1_n_0  |                  |                3 |              8 |         2.67 |
+|  xlnx_opt_                | u_i2c/regfile[53][7]_i_1_n_0  |                  |                4 |              8 |         2.00 |
+|  xlnx_opt_                | u_i2c/regfile[35][7]_i_1_n_0  |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[41][7]_i_1_n_0  |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[36][7]_i_1_n_0  |                  |                3 |              8 |         2.67 |
+|  xlnx_opt_                | u_i2c/regfile[40][7]_i_1_n_0  |                  |                4 |              8 |         2.00 |
+|  xlnx_opt_                | u_i2c/regfile[46][7]_i_1_n_0  |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[39][7]_i_1_n_0  |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[48][7]_i_1_n_0  |                  |                4 |              8 |         2.00 |
+|  xlnx_opt_                | u_i2c/regfile[34][7]_i_1_n_0  |                  |                1 |              8 |         8.00 |
+|  xlnx_opt_                | u_i2c/regfile[55][7]_i_1_n_0  |                  |                2 |              8 |         4.00 |
+|  xlnx_opt_                | u_i2c/regfile[37][7]_i_1_n_0  |                  |                3 |              8 |         2.67 |
+|  xlnx_opt_                | u_i2c/regfile[52][7]_i_1_n_0  |                  |                3 |              8 |         2.67 |
+|  xlnx_opt_                | u_i2c/regfile[57][7]_i_1_n_0  |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[58][7]_i_1_n_0  |                  |                4 |              8 |         2.00 |
+|  xlnx_opt_                | u_i2c/regfile[59][7]_i_1_n_0  |                  |                7 |              8 |         1.14 |
+|  xlnx_opt_                | u_i2c/regfile[5][7]_i_1_n_0   |                  |                2 |              8 |         4.00 |
+|  xlnx_opt_                | u_i2c/regfile[3][7]_i_1_n_0   |                  |                6 |              8 |         1.33 |
+|  xlnx_opt_                | u_i2c/regfile[33][7]_i_1_n_0  |                  |                6 |              8 |         1.33 |
+|  xlnx_opt_                | u_i2c/regfile[61][7]_i_1_n_0  |                  |                2 |              8 |         4.00 |
+|  xlnx_opt_                | u_i2c/regfile[42][7]_i_1_n_0  |                  |                6 |              8 |         1.33 |
+|  xlnx_opt_                | u_i2c/regfile[62][7]_i_1_n_0  |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[63][7]_i_1_n_0  |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[51][7]_i_1_n_0  |                  |                4 |              8 |         2.00 |
+|  xlnx_opt_                | u_i2c/regfile[65][7]_i_1_n_0  |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[66][7]_i_1_n_0  |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[38][7]_i_1_n_0  |                  |                4 |              8 |         2.00 |
+|  xlnx_opt_                | u_i2c/regfile[56][7]_i_1_n_0  |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[49][7]_i_1_n_0  |                  |                3 |              8 |         2.67 |
+|  xlnx_opt_                | u_i2c/regfile[50][7]_i_1_n_0  |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[64][7]_i_1_n_0  |                  |                3 |              8 |         2.67 |
+|  xlnx_opt_                | u_i2c/regfile[45][7]_i_1_n_0  |                  |                7 |              8 |         1.14 |
+|  xlnx_opt_                | u_i2c/regfile[44][7]_i_1_n_0  |                  |                4 |              8 |         2.00 |
+|  xlnx_opt_                | u_i2c/regfile[67][7]_i_1_n_0  |                  |                4 |              8 |         2.00 |
+|  xlnx_opt_                | u_i2c/regfile[32][7]_i_1_n_0  |                  |                3 |              8 |         2.67 |
+|  xlnx_opt_                | u_i2c/regfile[9][7]_i_1_n_0   |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[6][7]_i_1_n_0   |                  |                6 |              8 |         1.33 |
+|  xlnx_opt_                | u_i2c/regfile[74][7]_i_1_n_0  |                  |                6 |              8 |         1.33 |
+|  xlnx_opt_                | u_i2c/regfile[75][7]_i_1_n_0  |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[7][7]_i_1_n_0   |                  |                7 |              8 |         1.14 |
+|  xlnx_opt_                | u_i2c/regfile[83][7]_i_1_n_0  |                  |                4 |              8 |         2.00 |
+|  xlnx_opt_                | u_i2c/regfile[86][7]_i_1_n_0  |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[88][7]_i_1_n_0  |                  |                4 |              8 |         2.00 |
+|  xlnx_opt_                | u_i2c/regfile[85][7]_i_1_n_0  |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[79][7]_i_1_n_0  |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[78][7]_i_1_n_0  |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[89][7]_i_1_n_0  |                  |                3 |              8 |         2.67 |
+|  xlnx_opt_                | u_i2c/regfile[84][7]_i_1_n_0  |                  |                6 |              8 |         1.33 |
+|  xlnx_opt_                | u_i2c/regfile[94][7]_i_1_n_0  |                  |                7 |              8 |         1.14 |
+|  xlnx_opt_                | u_i2c/regfile[80][7]_i_1_n_0  |                  |                6 |              8 |         1.33 |
+|  xlnx_opt_                | u_i2c/regfile[90][7]_i_1_n_0  |                  |                3 |              8 |         2.67 |
+|  xlnx_opt_                | u_i2c/regfile[82][7]_i_1_n_0  |                  |                6 |              8 |         1.33 |
+|  xlnx_opt_                | u_i2c/regfile[73][7]_i_1_n_0  |                  |                4 |              8 |         2.00 |
+|  xlnx_opt_                | u_i2c/regfile[95][7]_i_1_n_0  |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[87][7]_i_1_n_0  |                  |                7 |              8 |         1.14 |
+|  xlnx_opt_                | u_i2c/regfile[96][7]_i_1_n_0  |                  |                4 |              8 |         2.00 |
+|  xlnx_opt_                | u_i2c/regfile[81][7]_i_1_n_0  |                  |                5 |              8 |         1.60 |
+|  xlnx_opt_                | u_i2c/regfile[8][7]_i_1_n_0   |                  |                6 |              8 |         1.33 |
+|  U_ircam5_pclk_ibuf/O     |                               |                  |                4 |             10 |         2.50 |
+|  U_ircam3_pclk_ibuf/O     |                               |                  |                1 |             10 |        10.00 |
+|  U_ircam0_pclk_ibuf/O     |                               |                  |                4 |             10 |         2.50 |
+|  U_ircam4_pclk_ibuf/O     |                               |                  |                4 |             10 |         2.50 |
+|  U_ircam2_pclk_ibuf/O     |                               |                  |                1 |             10 |        10.00 |
+|  U_ircam1_pclk_ibuf/O     |                               |                  |                3 |             10 |         3.33 |
+|  xlnx_opt_                | u_i2c/reg_index[7]_i_1_n_0    |                  |                9 |             13 |         1.44 |
+|  eo1_pclk_BUFG            |                               |                  |                4 |             16 |         4.00 |
+|  u_eo3/U_cam3_pclk_ibuf/O |                               |                  |                1 |             16 |        16.00 |
+|  u_eo4/U_cam4_pclk_ibuf/O |                               |                  |                5 |             16 |         3.20 |
+|  u_eo5/U_cam5_pclk_ibuf/O |                               |                  |                5 |             16 |         3.20 |
+|  eo2_pclk_BUFG            |                               |                  |                3 |             16 |         5.33 |
+|  xlnx_opt_                |                               | p_0_in           |                4 |             22 |         5.50 |
+|  xlnx_opt_                |                               |                  |               14 |             38 |         2.71 |
++---------------------------+-------------------------------+------------------+------------------+----------------+--------------+
+
+
