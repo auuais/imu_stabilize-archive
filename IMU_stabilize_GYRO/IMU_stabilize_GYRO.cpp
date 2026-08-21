@@ -29,6 +29,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <memory>
+#include <cwctype>
 
 #include "ini_manager.h"
 
@@ -535,6 +536,80 @@ static std::string SaveYUVFilePath(const std::wstring& captureDir, const std::ws
 static inline bool file_exists(const std::filesystem::path& p) {
     std::error_code ec;
     return std::filesystem::exists(p, ec);
+}
+
+static void trim_wstring(std::wstring& s) {
+    size_t begin = 0;
+    while (begin < s.size() && iswspace(s[begin])) ++begin;
+    size_t end = s.size();
+    while (end > begin && iswspace(s[end - 1])) --end;
+    s = s.substr(begin, end - begin);
+}
+
+static bool parse_demo_date(const std::wstring& raw, SYSTEMTIME& outDate) {
+    std::wstring s = raw;
+    trim_wstring(s);
+    if (s.size() != 10 || s[4] != L'-' || s[7] != L'-') return false;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (i == 4 || i == 7) continue;
+        if (s[i] < L'0' || s[i] > L'9') return false;
+    }
+
+    SYSTEMTIME candidate{};
+    candidate.wYear = (WORD)std::stoi(s.substr(0, 4));
+    candidate.wMonth = (WORD)std::stoi(s.substr(5, 2));
+    candidate.wDay = (WORD)std::stoi(s.substr(8, 2));
+
+    FILETIME ignored{};
+    if (!SystemTimeToFileTime(&candidate, &ignored)) return false;
+
+    outDate = candidate;
+    return true;
+}
+
+static bool is_local_date_after(const SYSTEMTIME& rhs) {
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    if (now.wYear != rhs.wYear) return now.wYear > rhs.wYear;
+    if (now.wMonth != rhs.wMonth) return now.wMonth > rhs.wMonth;
+    return now.wDay > rhs.wDay;
+}
+
+static bool demo_control_blocks_run(INIManager& ini, std::wstring& reason) {
+    if (!ini.ReadBoolean(L"demo_control", L"enabled", false)) {
+        return false;
+    }
+
+    std::wstring message = ini.ReadString(
+        L"demo_control",
+        L"message",
+        L"Demo period has ended. Please contact the project owner for an updated build."
+    );
+    trim_wstring(message);
+
+    if (ini.ReadBoolean(L"demo_control", L"force_disabled", false)) {
+        reason = message.empty() ? L"Demo has been disabled by configuration." : message;
+        return true;
+    }
+
+    std::wstring expiresOn = ini.ReadString(L"demo_control", L"expires_on", L"");
+    trim_wstring(expiresOn);
+    if (expiresOn.empty()) {
+        return false;
+    }
+
+    SYSTEMTIME expiryDate{};
+    if (!parse_demo_date(expiresOn, expiryDate)) {
+        reason = L"Invalid [demo_control] expires_on value. Expected YYYY-MM-DD.";
+        return true;
+    }
+
+    if (is_local_date_after(expiryDate)) {
+        reason = message.empty() ? (L"Demo period expired on " + expiresOn + L".") : message;
+        return true;
+    }
+
+    return false;
 }
 
 static std::filesystem::path pick_imu_ini(const std::filesystem::path& exePath, int argc, char** argv) {
@@ -2410,6 +2485,15 @@ int main(int argc, char** argv) {
 
         // Read parameters (unified file)
         INIManager paramIni(paramsIniPath);
+
+        std::wstring demoBlockReason;
+        if (demo_control_blocks_run(paramIni, demoBlockReason)) {
+            std::string demoBlockReasonUtf8 = WStringToUtf8(demoBlockReason);
+            printf("[DEMO] %s\n", demoBlockReasonUtf8.c_str());
+            MessageBoxW(NULL, demoBlockReason.c_str(), L"Demo Disabled", MB_ICONWARNING | MB_OK);
+            if (SUCCEEDED(hrCoInit)) CoUninitialize();
+            return 2;
+        }
 
         NUM_FRAMES = paramIni.ReadInteger(L"output", L"num_frames", NUM_FRAMES);
         SAVE_EVERY_K = paramIni.ReadInteger(L"output", L"save_every_k", SAVE_EVERY_K);
